@@ -72,6 +72,7 @@ namespace StreetRacing.Race
         private readonly VehicleCapability capability = new VehicleCapability();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
+        private readonly DrivingReference drivingReference = new DrivingReference();
         private readonly RaceDebugViz viz = new RaceDebugViz();
         private IVehicleActuator actuator;
 
@@ -82,6 +83,8 @@ namespace StreetRacing.Race
         private int lastGpsMissingLogMs = -100000;
         private int lastLostLogMs = -100000;
         private bool lastLoggedLost;
+        private int routeLostSinceMs = -1;
+        private int referenceInvalidSinceMs = -1;
 
         private float lastSpeed;
         private float lastSignedLong;
@@ -101,6 +104,11 @@ namespace StreetRacing.Race
         private int lastIntentLogMs = -100000;
         private string lastStabilityMode = "";
         private int lastStabilityEventMs = -100000;
+        private float lastRefRawKappa;
+        private float lastRefKappa;
+        private float lastRefHeadStep;
+        private int lastRefRoadClamp;
+        private string lastRefDetail = "";
         private Vector3 lastEgoFwd = new Vector3(0f, 1f, 0f);
         private float lastEgoHeading;
 
@@ -128,6 +136,8 @@ namespace StreetRacing.Race
         public float DesiredRoadSpeed => desiredRoadSpeed;
         public float CommandedSpeed => commandedSpeed;
         public string JoinState => joinState;
+        public bool TestFailed { get; private set; }
+        public string TestFailureReason { get; private set; } = "";
 
         // Join thresholds: when is PoseConnector actually needed?
         private const float JoinLatThreshM = 2.0f;
@@ -189,6 +199,15 @@ namespace StreetRacing.Race
             lastGpsMissingLogMs = -100000;
             lastLostLogMs = -100000;
             lastLoggedLost = false;
+            routeLostSinceMs = -1;
+            referenceInvalidSinceMs = -1;
+            TestFailed = false;
+            TestFailureReason = "";
+            lastRefRawKappa = 0f;
+            lastRefKappa = 0f;
+            lastRefHeadStep = 0f;
+            lastRefRoadClamp = 0;
+            lastRefDetail = "";
             TargetSpeed = 0f;
             SpeedLimit = "Cruise";
             ActualSpeed = originSpeed;
@@ -328,6 +347,15 @@ namespace StreetRacing.Race
             lastGpsMissingLogMs = -100000;
             lastLostLogMs = -100000;
             lastLoggedLost = false;
+            routeLostSinceMs = -1;
+            referenceInvalidSinceMs = -1;
+            TestFailed = false;
+            TestFailureReason = "";
+            lastRefRawKappa = 0f;
+            lastRefKappa = 0f;
+            lastRefHeadStep = 0f;
+            lastRefRoadClamp = 0;
+            lastRefDetail = "";
             TargetSpeed = 0f;
             SpeedLimit = "Cruise";
             ActualSpeed = originSpeed;
@@ -499,6 +527,36 @@ namespace StreetRacing.Race
                 }
             }
 
+            // Test-mode invariant: once localization is persistently lost,
+            // stop the experiment instead of letting Track brute-force walls.
+            // Recovery will be a separate, explicit subsystem later.
+            if (doPlan && IsGpsSource())
+            {
+                if (route.IsLost)
+                {
+                    if (routeLostSinceMs < 0) routeLostSinceMs = now;
+                    if (!TestFailed && now - routeLostSinceMs >= 1200)
+                    {
+                        TestFailed = true;
+                        TestFailureReason = $"route-lost {route.LossReason};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0};s={route.AlongS:F0}";
+                        joinState = "RouteLostHold";
+                        try { telemetry?.Event(t, "TEST_FAIL", TestFailureReason); } catch { }
+                        SendHold(egoPos, egoFwd, "RouteLostHold");
+                    }
+                }
+                else
+                {
+                    routeLostSinceMs = -1;
+                }
+
+                if (TestFailed)
+                {
+                    joinState = "RouteLostHold";
+                    SendHold(egoPos, egoFwd, "RouteLostHold");
+                    goto AfterPlan;
+                }
+            }
+
             if (now - lastCorrMs >= 200)
             {
                 lastCorrMs = now;
@@ -650,31 +708,60 @@ namespace StreetRacing.Race
             catch { }
         }
 
-        // --- TRACK: persistent GPS centerline reference.
-        // Geometry is anchored to the ROUTE (PointAtS(AlongS + s)), never
-        // rebuilt through ego. path[0] is the route center at current AlongS,
-        // so Direct's ClosestOnPath reports the TRUE cross-track error.
+        // --- TRACK: executable local road reference.
+        // GPS remains the global route/progress source, but Direct never sees
+        // its raw 5 m zig-zags. DrivingReference creates the smooth local path.
         private ManeuverCommand BuildTrack(Vector3 egoPos, float egoSpeed, float dtPlan)
         {
             float cruise = EffectiveCruise();
             float look = LookaheadM;
-            int n = Math.Max(5, Math.Min(33, (int)Math.Ceiling(look / 5f) + 1));
-            var path = new List<Vector3>(n);
-            var ss = new List<float>(n);
-            var lats = new List<float>(n);
-            for (int k = 0; k < n; k++)
+
+            // Raw GPS is only the global/topological route. Build a separate
+            // executable reference that removes short GPS zig-zags and rounds
+            // junction vertices while staying on GTA's drivable road.
+            DrivingReference.Result rr = null;
+            try { rr = drivingReference.Build(route, route.AlongS, look, egoSpeed); }
+            catch { rr = null; }
+
+            if (rr == null || !rr.Valid || rr.Path == null || rr.Path.Count < 3)
             {
-                float s = (k == n - 1) ? look : k * 5f;
-                if (s > look) s = look;
-                Vector3 rp;
-                try { rp = route.PointAtS(route.AlongS + s); }
-                catch { rp = egoPos; }
-                path.Add(rp);
-                ss.Add(s);
-                lats.Add(0f);
-                if (s >= look - 0.01f) break;
+                int now = Game.GameTime;
+                lastRefDetail = rr != null ? rr.Detail : "null";
+                if (referenceInvalidSinceMs < 0)
+                {
+                    referenceInvalidSinceMs = now;
+                    try { telemetry?.Event(now - t0, "REFERENCE_INVALID", lastRefDetail); } catch { }
+                }
+                if (!TestFailed && now - referenceInvalidSinceMs >= 1000)
+                {
+                    TestFailed = true;
+                    TestFailureReason = "driving-reference-invalid;" + lastRefDetail;
+                    try { telemetry?.Event(now - t0, "TEST_FAIL", TestFailureReason); } catch { }
+                }
+                var holdPt = new Vector3(egoPos.X + lastEgoFwd.X * 12f, egoPos.Y + lastEgoFwd.Y * 12f, egoPos.Z);
+                return new ManeuverCommand
+                {
+                    Path = new List<Vector3> { egoPos, holdPt },
+                    StationS = new List<float> { 0f, 12f },
+                    SpeedProfile = new List<float> { 0f, 0f },
+                    AimPoint = holdPt,
+                    TargetSpeed = 0f,
+                    Style = style,
+                    Reason = "ReferenceInvalid",
+                    Reverse = false,
+                };
             }
-            return BuildCommandFromPath(path, ss, lats, egoSpeed, dtPlan, cruise, "Track", egoPos);
+
+            referenceInvalidSinceMs = -1;
+            lastRefRawKappa = rr.RawMaxKappa;
+            lastRefKappa = rr.MaxKappa;
+            lastRefHeadStep = rr.MaxHeadingStepDeg;
+            lastRefRoadClamp = rr.RoadConstrainedPoints;
+            lastRefDetail = rr.Detail;
+
+            var lats = new List<float>(rr.Path.Count);
+            for (int i = 0; i < rr.Path.Count; i++) lats.Add(0f);
+            return BuildCommandFromPath(rr.Path, rr.StationS, lats, egoSpeed, dtPlan, cruise, "Track", egoPos);
         }
 
         // --- JOIN: one-time pose-feasible merge, only until aligned.
@@ -915,7 +1002,9 @@ namespace StreetRacing.Race
                         $"intent={joinState};desRoad={desiredRoadSpeed:F1};cmd={commandedSpeed:F1};v={TargetSpeed:F1};lim={SpeedLimit};"
                         + $"egoHead={lastEgoHeading:F0};routeHead={route.RouteHeadingDeg:F0};"
                         + $"headErr={route.HeadingErrorDeg:F0};firstTang={c.FirstTangentErrDeg:F1};"
-                        + $"maxKappa={c.MaxKappa:F4};s={route.AlongS:F0};{route.LocDetail}");
+                        + $"maxKappa={c.MaxKappa:F4};rawGpsK={lastRefRawKappa:F4};refK={lastRefKappa:F4};"
+                        + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
+                        + $"s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }
@@ -983,9 +1072,20 @@ namespace StreetRacing.Race
                 try
                 {
                     float ld = pe.Valid ? pe.LookaheadM : RaceMath.Clamp(6f + egoSpeed * 0.7f, 8f, 28f);
-                    lookPt = route.PointAtS(route.AlongS + ld);
+                    if (hasCurrent && current.Path != null && current.Path.Count >= 2
+                        && current.StationS != null && current.StationS.Count == current.Path.Count)
+                        lookPt = PointAtLocalS(current.Path, current.StationS, ld);
+                    else
+                        lookPt = route.PointAtS(route.AlongS + ld);
                 }
                 catch { try { lookPt = hasCurrent ? current.AimPoint : egoPos; } catch { } }
+                int gear = 0;
+                int nextGear = 0;
+                float rpm = 0f;
+                try { gear = vehicle.CurrentGear; } catch { }
+                try { nextGear = vehicle.NextGear; } catch { }
+                try { rpm = vehicle.CurrentRPM; } catch { }
+
                 telemetry.Sample(t, style, joinState,
                     route.AlongS, route.Progress01, LookaheadM,
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
@@ -1020,9 +1120,31 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.ThrottlePowerActual01 : 0f,
                     pe.Valid ? pe.BrakeActual01 : 0f,
                     pe.Valid ? pe.SteerSaturationS : 0f,
-                    pe.Valid ? pe.StabilityMode : "");
+                    pe.Valid ? pe.StabilityMode : "",
+                    gear, nextGear, rpm);
             }
             catch { }
+        }
+
+        private static Vector3 PointAtLocalS(List<Vector3> path, List<float> ss, float s)
+        {
+            if (path == null || path.Count == 0) return Vector3.Zero;
+            if (ss == null || ss.Count != path.Count) return path[path.Count - 1];
+            if (s <= 0f) return path[0];
+            if (s >= ss[ss.Count - 1]) return path[path.Count - 1];
+            for (int i = 0; i < ss.Count - 1; i++)
+            {
+                if (s >= ss[i] && s <= ss[i + 1])
+                {
+                    float ds = ss[i + 1] - ss[i];
+                    float t = ds > 1e-4f ? (s - ss[i]) / ds : 0f;
+                    return new Vector3(
+                        path[i].X + (path[i + 1].X - path[i].X) * t,
+                        path[i].Y + (path[i + 1].Y - path[i].Y) * t,
+                        path[i].Z + (path[i + 1].Z - path[i].Z) * t);
+                }
+            }
+            return path[path.Count - 1];
         }
 
         private static float CurvatureOfPathAt(List<Vector3> path, int k)
