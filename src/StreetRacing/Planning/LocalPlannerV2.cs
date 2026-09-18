@@ -38,7 +38,7 @@ namespace StreetRacing
         private int planId;
 
         private const float VehicleHalfWidthM = 1.15f;
-        private const float RoadMarginM = 0.55f;
+        private const float RoadMarginM = 0.35f;
         private const float MinCandidateSpacingM = 1.15f;
 
         private struct ShapeSpec
@@ -278,7 +278,7 @@ namespace StreetRacing
             result.Detail = $"intent={Intent};lat={chosen.LateralM:F1};score={chosen.Score:F1};"
                 + $"meanV={chosen.MeanSpeed:F1};minV={chosen.MinSpeed:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"clear={chosen.MinPredClearance:F1};roadLR={leftUsable:F1}/{rightUsable:F1};shape={chosen.Shape};"
+                + $"clear={chosen.MinPredClearance:F1};roadLR={leftUsable:F1}/{rightUsable:F1};roadConf={chosen.MinRoadConfidence:F2};shape={chosen.Shape};"
                 + $"cands={SummarizeCandidates(LastCandidates)}";
 
             LastChosen = chosen;
@@ -358,10 +358,24 @@ namespace StreetRacing
                     float s = reference.StationS[i];
                     if (s > horizon) break;
                     if (s < 6f) continue; // current pinch is checked point-by-point
-                    if (i < reference.LeftRoadM.Count)
-                        ls.Add(reference.LeftRoadM[i] - VehicleHalfWidthM - RoadMarginM);
-                    if (i < reference.RightRoadM.Count)
-                        rs.Add(reference.RightRoadM[i] - VehicleHalfWidthM - RoadMarginM);
+                    float conf = i < reference.RoadConfidence.Count ? reference.RoadConfidence[i] : 0f;
+                    float l = i < reference.LeftRoadM.Count
+                        ? reference.LeftRoadM[i] - VehicleHalfWidthM - RoadMarginM
+                        : 1.8f;
+                    float rr = i < reference.RightRoadM.Count
+                        ? reference.RightRoadM[i] - VehicleHalfWidthM - RoadMarginM
+                        : 1.8f;
+
+                    // Low confidence does NOT mean narrow road. Preserve a
+                    // modest opportunity but do not use uncertain samples to
+                    // authorize a huge bold trajectory.
+                    if (conf < 0.45f)
+                    {
+                        l = RaceMath.Clamp(l, 1.4f, 2.8f);
+                        rr = RaceMath.Clamp(rr, 1.4f, 2.8f);
+                    }
+                    ls.Add(l);
+                    rs.Add(rr);
                 }
                 if (ls.Count > 0)
                 {
@@ -411,6 +425,7 @@ namespace StreetRacing
                 var path = new List<Vector3>(reference.Path.Count);
                 var ss = new List<float>(reference.Path.Count);
                 var lats = new List<float>(reference.Path.Count);
+                float minRoadConfidence = 1f;
 
                 Vector3 baseDir0 = DirectionAt(reference.Path, 0);
                 Vector3 left0 = new Vector3(-baseDir0.Y, baseDir0.X, 0f);
@@ -441,15 +456,21 @@ namespace StreetRacing
 
                     float leftAvail;
                     float rightAvail;
-                    ReferenceRoadAt(reference, baseS, out leftAvail, out rightAvail);
+                    float roadConf;
+                    ReferenceRoadAt(reference, baseS, out leftAvail, out rightAvail, out roadConf);
+                    if (roadConf < minRoadConfidence) minRoadConfidence = roadConf;
                     float leftAllow = Math.Max(0.4f, leftAvail - VehicleHalfWidthM - RoadMarginM);
                     float rightAllow = Math.Max(0.4f, rightAvail - VehicleHalfWidthM - RoadMarginM);
-                    if (lat > leftAllow + 0.05f || lat < -rightAllow - 0.05f)
+                    bool outside = lat > leftAllow + 0.05f || lat < -rightAllow - 0.05f;
+                    if (outside && roadConf >= 0.62f && shape.Name != "Center")
                     {
-                        c.RejectReason = $"road-boundary@{baseS:F0}:lat={lat:F1}/allow=-{rightAllow:F1}..{leftAllow:F1}";
+                        c.RejectReason = $"road-boundary@{baseS:F0}:lat={lat:F1}/allow=-{rightAllow:F1}..{leftAllow:F1};conf={roadConf:F2}";
                         return c;
                     }
 
+                    // The nominal reference is always a fail-soft option.
+                    // Low-confidence geometry can lower its score, but can
+                    // never declare the center path physically nonexistent.
                     path.Add(p);
                     lats.Add(lat);
                 }
@@ -550,8 +571,10 @@ namespace StreetRacing
                 {
                     float leftAvail;
                     float rightAvail;
+                    float conf;
                     ReferenceRoadAt(reference, reference.StationS[Math.Min(i, reference.StationS.Count - 1)],
-                        out leftAvail, out rightAvail);
+                        out leftAvail, out rightAvail, out conf);
+                    if (conf < minRoadConfidence) minRoadConfidence = conf;
                     float m = lats[i] >= 0f
                         ? leftAvail - VehicleHalfWidthM - Math.Abs(lats[i])
                         : rightAvail - VehicleHalfWidthM - Math.Abs(lats[i]);
@@ -572,7 +595,9 @@ namespace StreetRacing
                     + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.75f
                     - Math.Abs(shape.CharacteristicLat) * 0.55f
                     - maxKappa * 20f
-                    - firstTang * 0.08f;
+                    - firstTang * 0.08f
+                    - (1f - RaceMath.Clamp(minRoadConfidence, 0f, 1f))
+                        * Math.Abs(shape.CharacteristicLat) * 1.8f;
 
                 // Small continuity preference around the current commitment.
                 if (Math.Abs(committedLat) > 0.35f)
@@ -592,6 +617,7 @@ namespace StreetRacing
                 c.ArrivalT = predictedArrival;
                 c.AimPoint = path[path.Count - 1];
                 c.MinMarginM = roadMargin;
+                c.MinRoadConfidence = minRoadConfidence;
                 c.MaxKappa = maxKappa;
                 c.FirstTangentErrDeg = firstTang;
                 c.RouteHeadErrDeg = route != null ? route.HeadingErrorDeg : 0f;
@@ -783,10 +809,12 @@ namespace StreetRacing
         }
 
         private static void ReferenceRoadAt(
-            DrivingReference.Result reference, float s, out float left, out float right)
+            DrivingReference.Result reference, float s,
+            out float left, out float right, out float confidence)
         {
             left = 4f;
             right = 4f;
+            confidence = 0f;
             try
             {
                 if (reference.StationS.Count == 0) return;
@@ -794,6 +822,7 @@ namespace StreetRacing
                 {
                     left = reference.LeftRoadM[0];
                     right = reference.RightRoadM[0];
+                    confidence = reference.RoadConfidence.Count > 0 ? reference.RoadConfidence[0] : 0f;
                     return;
                 }
                 int last = reference.StationS.Count - 1;
@@ -801,6 +830,7 @@ namespace StreetRacing
                 {
                     left = reference.LeftRoadM[last];
                     right = reference.RightRoadM[last];
+                    confidence = last < reference.RoadConfidence.Count ? reference.RoadConfidence[last] : 0f;
                     return;
                 }
                 for (int i = 0; i < last; i++)
@@ -811,6 +841,9 @@ namespace StreetRacing
                     float t = b > a ? (s - a) / (b - a) : 0f;
                     left = reference.LeftRoadM[i] + (reference.LeftRoadM[i + 1] - reference.LeftRoadM[i]) * t;
                     right = reference.RightRoadM[i] + (reference.RightRoadM[i + 1] - reference.RightRoadM[i]) * t;
+                    float ca = i < reference.RoadConfidence.Count ? reference.RoadConfidence[i] : 0f;
+                    float cb = i + 1 < reference.RoadConfidence.Count ? reference.RoadConfidence[i + 1] : ca;
+                    confidence = ca + (cb - ca) * t;
                     return;
                 }
             }
@@ -895,7 +928,7 @@ namespace StreetRacing
                         continue;
                     }
                     string lim = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
-                    parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
+                    parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}/R{c.MinRoadConfidence:F2}");
                 }
                 return string.Join("|", parts);
             }

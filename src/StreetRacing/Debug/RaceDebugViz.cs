@@ -46,11 +46,30 @@ namespace StreetRacing.Debug
             float lookaheadM,
             float targetSpeed)
         {
+            Draw(route, corridor, traj, perception, speedPlan, null,
+                egoPos, egoFwd, egoSpeed, lookaheadM, targetSpeed);
+        }
+
+        public void Draw(
+            RaceRoute route,
+            RoadCorridor corridor,
+            TrajectoryPlanner traj,
+            Perception perception,
+            SpeedPlanner speedPlan,
+            DrivingReference.Result roadReference,
+            Vector3 egoPos,
+            Vector3 egoFwd,
+            float egoSpeed,
+            float lookaheadM,
+            float targetSpeed)
+        {
             if (!Enabled) return;
             try
             {
                 DrawRoute(route);
-                DrawCorridor(corridor);
+                if (roadReference == null)
+                    DrawCorridor(corridor);
+                DrawRoadReference(roadReference);
                 DrawCandidates(traj);
                 DrawActors(perception, egoSpeed);
                 DrawAimAndBraking(route, traj, speedPlan);
@@ -138,6 +157,46 @@ namespace StreetRacing.Debug
                     World.DrawLine(
                         new Vector3(a.RightEdge.X, a.RightEdge.Y, a.RightEdge.Z + 0.6f),
                         new Vector3(b.RightEdge.X, b.RightEdge.Y, b.RightEdge.Z + 0.6f), rightCol);
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawRoadReference(DrivingReference.Result road)
+        {
+            try
+            {
+                if (road == null || road.Path == null || road.Path.Count < 2) return;
+                for (int i = 0; i < road.Path.Count - 1; i++)
+                {
+                    Vector3 a = road.Path[i];
+                    Vector3 b = road.Path[i + 1];
+                    var d = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                    var left = new Vector3(-d.Y, d.X, 0f);
+                    float l = i < road.LeftRoadM.Count ? road.LeftRoadM[i] : 3.5f;
+                    float r = i < road.RightRoadM.Count ? road.RightRoadM[i] : 3.5f;
+                    float conf = i < road.RoadConfidence.Count ? road.RoadConfidence[i] : 0f;
+
+                    var lp = new Vector3(a.X + left.X * l, a.Y + left.Y * l, a.Z + 0.9f);
+                    var rp = new Vector3(a.X - left.X * r, a.Y - left.Y * r, a.Z + 0.9f);
+                    var center = new Vector3(a.X, a.Y, a.Z + 0.95f);
+
+                    var edgeCol = conf >= 0.70f
+                        ? System.Drawing.Color.FromArgb(220, 30, 220, 255)
+                        : conf >= 0.40f
+                            ? System.Drawing.Color.FromArgb(200, 255, 200, 40)
+                            : System.Drawing.Color.FromArgb(170, 150, 150, 150);
+
+                    World.DrawLine(center, lp, edgeCol);
+                    World.DrawLine(center, rp, edgeCol);
+
+                    if (i < road.RoadCenter.Count)
+                    {
+                        var nc = road.RoadCenter[i];
+                        World.DrawLine(center,
+                            new Vector3(nc.X, nc.Y, nc.Z + 1.0f),
+                            System.Drawing.Color.FromArgb(120, 100, 160, 255));
+                    }
                 }
             }
             catch { }

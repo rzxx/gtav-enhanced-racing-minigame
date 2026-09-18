@@ -16,7 +16,8 @@ namespace StreetRacing
         public string RejectReason; // empty = viable
         // Sampled path through the corridor (world points, ego -> aim).
         public List<Vector3> Path;
-        public float MinMarginM;    // min (halfWidth - |lat|) along path (+ = inside)
+        public float MinMarginM;    // min estimated road-edge margin along path
+        public float MinRoadConfidence; // 0 unknown .. 1 structural agreement
         public float MaxKappa;      // max path curvature rad/m
 
         // --- Joint maneuver fields: this candidate WITH its executable speed.

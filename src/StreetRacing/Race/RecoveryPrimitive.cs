@@ -128,22 +128,30 @@ namespace StreetRacing.Race
                     case Stage.Stop:
                         if (nowMs >= stopUntil)
                         {
-                            // If we have a merge behind us or are nose-into an
-                            // obstacle, back up a controlled distance first.
-                            // Otherwise go straight to Forward (no pointless reverse).
-                            bool needReverse = !haveMerge || Math.Abs(route.HeadingErrorDeg) > 60f || egoSpeed < 0.5f;
+                            // STOPPED is not evidence that reverse is needed;
+                            // Stop is literally the stage we just commanded.
+                            // Reverse only for a genuinely severe pose where
+                            // creating space is useful.
+                            bool needReverse = Math.Abs(route.HeadingErrorDeg) > 70f
+                                || route.DistToRoute > 10f;
                             if (needReverse)
                             {
                                 Current = Stage.Reverse;
                                 SinceMs = nowMs;
                                 reverseStartS = alongS;
-                                Reason = "reverse:" + mergeDetail;
+                                Reason = "reverse-severe-pose:" + mergeDetail;
+                            }
+                            else if (haveMerge)
+                            {
+                                Current = Stage.Rejoin;
+                                SinceMs = nowMs;
+                                Reason = "rejoin-direct:" + mergeDetail;
                             }
                             else
                             {
                                 Current = Stage.Forward;
                                 SinceMs = nowMs;
-                                Reason = "forward:" + mergeDetail;
+                                Reason = "forward-seek-merge:" + mergeDetail;
                             }
                         }
                         return hold;
@@ -187,24 +195,54 @@ namespace StreetRacing.Race
                                 Reason = "rejoin:" + mergeDetail;
                                 goto case Stage.Rejoin;
                             }
-                            // No merge: slow forward crawl along the nose so the
-                            // pose changes and a merge can appear. NEVER 0.
-                            float crawl = Math.Min(recCruise, 4f);
-                            var fwd = new Vector3(egoPos.X + egoFwd.X * 15f, egoPos.Y + egoFwd.Y * 15f, egoPos.Z);
-                            if ((nowMs - SinceMs) > 8000)
+                            // No merge: move TOWARD the route, not blindly along
+                            // whatever direction the nose happens to point.
+                            float crawl = Math.Min(recCruise, 3.5f);
+                            Vector3 target = route.RecoveryTarget();
+                            Vector3 toTarget = RaceMath.FlatNormalize(new Vector3(
+                                target.X - egoPos.X, target.Y - egoPos.Y, 0f));
+                            float ahead = RaceMath.FlatDot(toTarget, egoFwd);
+
+                            // If the useful route target is clearly behind us,
+                            // create space instead of driving farther away.
+                            if (ahead < -0.35f && Math.Abs(route.HeadingErrorDeg) > 45f)
                             {
-                                // Still nothing after 8 s of crawling: stay in
-                                // Forward (caller may escalate to GTA rejoin).
-                                Reason = "crawl-no-merge";
+                                Current = Stage.Reverse;
+                                SinceMs = nowMs;
+                                reverseStartS = alongS;
+                                Reason = "reverse-target-behind";
+                                goto case Stage.Reverse;
                             }
+
+                            Vector3 blended = RaceMath.FlatNormalize(new Vector3(
+                                egoFwd.X * 0.45f + toTarget.X * 0.55f,
+                                egoFwd.Y * 0.45f + toTarget.Y * 0.55f, 0f));
+                            var guide = new Vector3(
+                                egoPos.X + blended.X * 10f,
+                                egoPos.Y + blended.Y * 10f,
+                                egoPos.Z);
+                            float targetDist = RaceMath.FlatDistance(egoPos, target);
+                            var path = new List<Vector3> { egoPos, guide };
+                            var ss = new List<float> { 0f, RaceMath.FlatDistance(egoPos, guide) };
+                            if (targetDist > 12f && targetDist < 45f)
+                            {
+                                float acc = ss[ss.Count - 1] + RaceMath.FlatDistance(guide, target);
+                                path.Add(target);
+                                ss.Add(acc);
+                            }
+                            if ((nowMs - SinceMs) > 8000)
+                                Reason = "seek-merge-timeout";
+
+                            var prof = new List<float>();
+                            for (int i = 0; i < path.Count; i++) prof.Add(crawl);
                             return new ManeuverCommand
                             {
-                                Path = new List<Vector3> { egoPos, fwd },
-                                StationS = new List<float> { 0f, 15f },
-                                SpeedProfile = new List<float> { crawl, crawl },
-                                AimPoint = fwd,
+                                Path = path,
+                                StationS = ss,
+                                SpeedProfile = prof,
+                                AimPoint = path[path.Count - 1],
                                 TargetSpeed = crawl,
-                                Reason = "Recovery:Forward-Crawl",
+                                Reason = "Recovery:Forward-ToRoute",
                                 Reverse = false,
                             };
                         }

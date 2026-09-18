@@ -15,8 +15,9 @@ namespace StreetRacing
     ///
     /// This layer keeps RaceRoute untouched for global progress/localization,
     /// but low-pass filters positions over arclength to create a physically
-    /// continuous local center reference. Smoothing is constrained back toward
-    /// the raw GPS point whenever the candidate leaves GTA's drivable road.
+    /// continuous local center reference. Smoothing is geometrically bounded
+    /// around GTA's routed spine; road structure is supplied separately by
+    /// LocalRoadModel, never by a binary IS_POINT_ON_ROAD width scan.
     internal sealed class DrivingReference
     {
         internal sealed class Result
@@ -28,6 +29,11 @@ namespace StreetRacing
             // around the smoothed reference but validated around raw GPS.
             public readonly List<float> LeftRoadM = new List<float>();
             public readonly List<float> RightRoadM = new List<float>();
+            public readonly List<float> RoadConfidence = new List<float>();
+            public readonly List<string> RoadSource = new List<string>();
+            public readonly List<int> RoadLaneCount = new List<int>();
+            public readonly List<Vector3> RoadCenter = new List<Vector3>();
+            public readonly List<float> RoadHeadingDeg = new List<float>();
             public bool Valid;
             public float RawMaxKappa;
             public float MaxKappa;
@@ -40,6 +46,13 @@ namespace StreetRacing
         private const float StepM = 4f;
         private const float MinWindowM = 8f;
         private const float MaxWindowM = 16f;
+
+        private Result previousRoad;
+
+        public void Reset()
+        {
+            previousRoad = null;
+        }
 
         public Result Build(RaceRoute route, float startS, float horizonM, float speedMps)
         {
@@ -97,7 +110,7 @@ namespace StreetRacing
                     float sAbs = startS + sAhead;
                     Vector3 pRaw = raw[i];
                     Vector3 pSmooth = SmoothAt(route, sAbs, windowM);
-                    Vector3 pSafe = KeepOnRoad(pRaw, pSmooth, out bool constrained);
+                    Vector3 pSafe = KeepNearGpsSpine(pRaw, pSmooth, out bool constrained);
                     if (constrained) r.RoadConstrainedPoints++;
                     r.Path.Add(pSafe);
                 }
@@ -122,18 +135,22 @@ namespace StreetRacing
                     r.StationS.Add(acc);
                 }
 
-                MeasureRoadEnvelope(r);
+                LocalRoadModel.Populate(r);
+                StabilizeRoadTemporally(r, previousRoad);
 
                 r.MaxKappa = MaxCurvature(r.Path);
                 r.MaxHeadingStepDeg = MaxHeadingStep(r.Path);
                 r.Valid = acc >= Math.Min(18f, horizonM * 0.65f)
                     && r.LeftRoadM.Count == r.Path.Count
-                    && r.RightRoadM.Count == r.Path.Count;
+                    && r.RightRoadM.Count == r.Path.Count
+                    && r.RoadConfidence.Count == r.Path.Count;
                 float minL = Min(r.LeftRoadM);
                 float minR = Min(r.RightRoadM);
+                float minConf = Min(r.RoadConfidence);
                 r.Detail = $"window={windowM:F1};rawK={r.RawMaxKappa:F3};refK={r.MaxKappa:F3};"
                     + $"headStep={r.MaxHeadingStepDeg:F0};roadClamp={r.RoadConstrainedPoints};"
-                    + $"roadLR={minL:F1}/{minR:F1};pts={r.Path.Count}";
+                    + $"roadLR={minL:F1}/{minR:F1};roadConf={minConf:F2};pts={r.Path.Count}";
+                previousRoad = r;
                 return r;
             }
             catch (Exception ex)
@@ -143,49 +160,66 @@ namespace StreetRacing
             }
         }
 
-        private static void MeasureRoadEnvelope(Result r)
+        private static void StabilizeRoadTemporally(Result current, Result previous)
         {
-            r.LeftRoadM.Clear();
-            r.RightRoadM.Clear();
-            for (int i = 0; i < r.Path.Count; i++)
+            if (current == null || previous == null
+                || current.Path == null || previous.Path == null
+                || previous.Path.Count == 0) return;
+            try
             {
-                Vector3 dir;
-                if (i <= 0)
-                    dir = new Vector3(r.Path[1].X - r.Path[0].X, r.Path[1].Y - r.Path[0].Y, 0f);
-                else if (i >= r.Path.Count - 1)
-                    dir = new Vector3(r.Path[i].X - r.Path[i - 1].X, r.Path[i].Y - r.Path[i - 1].Y, 0f);
-                else
-                    dir = new Vector3(r.Path[i + 1].X - r.Path[i - 1].X, r.Path[i + 1].Y - r.Path[i - 1].Y, 0f);
-                dir = RaceMath.FlatNormalize(dir);
-                var left = new Vector3(-dir.Y, dir.X, 0f);
-                r.LeftRoadM.Add(ProbeRoadSide(r.Path[i], left));
-                r.RightRoadM.Add(ProbeRoadSide(r.Path[i], new Vector3(-left.X, -left.Y, 0f)));
+                for (int i = 0; i < current.Path.Count; i++)
+                {
+                    int best = -1;
+                    float bestD = 7.0f;
+                    Vector3 cd = DirectionAt(current.Path, i);
+                    float ch = RaceMath.HeadingFromVector(cd);
+                    for (int j = 0; j < previous.Path.Count; j++)
+                    {
+                        float d = RaceMath.FlatDistance(current.Path[i], previous.Path[j]);
+                        if (d >= bestD) continue;
+                        Vector3 pd = DirectionAt(previous.Path, j);
+                        float ph = RaceMath.HeadingFromVector(pd);
+                        float axis = Math.Abs(RaceMath.HeadingDiffDeg(ch, ph));
+                        axis = Math.Min(axis, Math.Abs(180f - axis));
+                        if (axis > 30f) continue;
+                        best = j;
+                        bestD = d;
+                    }
+                    if (best < 0
+                        || i >= current.RoadConfidence.Count
+                        || best >= previous.RoadConfidence.Count
+                        || i >= current.LeftRoadM.Count
+                        || best >= previous.LeftRoadM.Count) continue;
+
+                    float nc = current.RoadConfidence[i];
+                    float pc = previous.RoadConfidence[best];
+                    float alpha = nc >= 0.72f ? 0.72f : nc >= 0.45f ? 0.48f : 0.24f;
+                    if (pc < 0.35f && nc > pc) alpha = 0.80f;
+
+                    current.LeftRoadM[i] =
+                        previous.LeftRoadM[best] * (1f - alpha) + current.LeftRoadM[i] * alpha;
+                    current.RightRoadM[i] =
+                        previous.RightRoadM[best] * (1f - alpha) + current.RightRoadM[i] * alpha;
+
+                    // Confidence itself should not spike from a weak sample.
+                    if (nc < pc)
+                        current.RoadConfidence[i] = pc * (1f - alpha) + nc * alpha;
+                }
             }
+            catch { }
         }
 
-        private static float ProbeRoadSide(Vector3 center, Vector3 side)
+        private static Vector3 DirectionAt(IList<Vector3> path, int i)
         {
-            // The reference point itself has already been constrained onto the
-            // drivable road. Sweep outward in the reference frame. A short
-            // single off-road hole does not terminate the sweep immediately
-            // (junction markings/bridge quirks can flicker IS_POINT_ON_ROAD).
-            float lastGood = 0.75f;
-            int misses = 0;
-            for (float d = 0.5f; d <= 10f; d += 0.5f)
-            {
-                var p = new Vector3(center.X + side.X * d, center.Y + side.Y * d, center.Z);
-                if (IsOnRoad(p))
-                {
-                    lastGood = d;
-                    misses = 0;
-                }
-                else
-                {
-                    misses++;
-                    if (misses >= 2) break;
-                }
-            }
-            return RaceMath.Clamp(lastGood, 0.75f, 10f);
+            Vector3 d;
+            if (i <= 0)
+                d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+            else if (i >= path.Count - 1)
+                d = new Vector3(path[i].X - path[i - 1].X, path[i].Y - path[i - 1].Y, 0f);
+            else
+                d = new Vector3(path[i + 1].X - path[i - 1].X, path[i + 1].Y - path[i - 1].Y, 0f);
+            if (RaceMath.FlatLength(d) < 0.2f) return new Vector3(0f, 1f, 0f);
+            return RaceMath.FlatNormalize(d);
         }
 
         private static float Min(List<float> xs)
@@ -217,44 +251,23 @@ namespace StreetRacing
             return new Vector3(x / sw, y / sw, z / sw);
         }
 
-        private static Vector3 KeepOnRoad(Vector3 raw, Vector3 smooth, out bool constrained)
+        private static Vector3 KeepNearGpsSpine(Vector3 raw, Vector3 smooth, out bool constrained)
         {
+            // GPS is topology, but it is still a far more reliable statement
+            // that "a road exists here" than a one-frame IS_POINT_ON_ROAD
+            // boolean. Allow smoothing to round/kink-filter the route while
+            // bounding how far it may cut away from GTA's own routed spine.
             constrained = false;
-            if (IsOnRoad(smooth)) return smooth;
+            float d = RaceMath.FlatDistance(raw, smooth);
+            const float MaxOffsetM = 3.5f;
+            if (d <= MaxOffsetM) return smooth;
 
-            // The averaged corner may cut the inside sidewalk/building. Walk
-            // it back toward GTA's GPS point until it is on drivable road.
             constrained = true;
-            float[] blends = { 0.75f, 0.50f, 0.25f, 0f };
-            foreach (float t in blends)
-            {
-                var p = new Vector3(
-                    raw.X + (smooth.X - raw.X) * t,
-                    raw.Y + (smooth.Y - raw.Y) * t,
-                    raw.Z + (smooth.Z - raw.Z) * t);
-                if (IsOnRoad(p)) return p;
-            }
-            return raw;
-        }
-
-        private static bool IsOnRoad(Vector3 p)
-        {
-            try
-            {
-                if (Function.Call<bool>(Hash.IS_POINT_ON_ROAD, p.X, p.Y, p.Z, 0))
-                    return true;
-            }
-            catch
-            {
-                // If the native is unavailable, do not reject the smoothing
-                // layer entirely; raw GTA GPS remains the fallback below.
-                return true;
-            }
-            try
-            {
-                return Function.Call<bool>(Hash.IS_POINT_ON_ROAD, p.X, p.Y, p.Z - 1f, 0);
-            }
-            catch { return true; }
+            float t = MaxOffsetM / Math.Max(d, 0.01f);
+            return new Vector3(
+                raw.X + (smooth.X - raw.X) * t,
+                raw.Y + (smooth.Y - raw.Y) * t,
+                raw.Z + (smooth.Z - raw.Z) * t);
         }
 
         private static float MaxCurvature(List<Vector3> path)
