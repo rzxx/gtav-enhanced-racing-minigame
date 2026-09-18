@@ -28,6 +28,11 @@ namespace StreetRacing
             // around the smoothed reference but validated around raw GPS.
             public readonly List<float> LeftRoadM = new List<float>();
             public readonly List<float> RightRoadM = new List<float>();
+            public readonly List<float> RoadConfidence = new List<float>();
+            public readonly List<string> RoadSource = new List<string>();
+            public readonly List<int> RoadLaneCount = new List<int>();
+            public readonly List<Vector3> RoadCenter = new List<Vector3>();
+            public readonly List<float> RoadHeadingDeg = new List<float>();
             public bool Valid;
             public float RawMaxKappa;
             public float MaxKappa;
@@ -122,18 +127,20 @@ namespace StreetRacing
                     r.StationS.Add(acc);
                 }
 
-                MeasureRoadEnvelope(r);
+                LocalRoadModel.Populate(r);
 
                 r.MaxKappa = MaxCurvature(r.Path);
                 r.MaxHeadingStepDeg = MaxHeadingStep(r.Path);
                 r.Valid = acc >= Math.Min(18f, horizonM * 0.65f)
                     && r.LeftRoadM.Count == r.Path.Count
-                    && r.RightRoadM.Count == r.Path.Count;
+                    && r.RightRoadM.Count == r.Path.Count
+                    && r.RoadConfidence.Count == r.Path.Count;
                 float minL = Min(r.LeftRoadM);
                 float minR = Min(r.RightRoadM);
+                float minConf = Min(r.RoadConfidence);
                 r.Detail = $"window={windowM:F1};rawK={r.RawMaxKappa:F3};refK={r.MaxKappa:F3};"
                     + $"headStep={r.MaxHeadingStepDeg:F0};roadClamp={r.RoadConstrainedPoints};"
-                    + $"roadLR={minL:F1}/{minR:F1};pts={r.Path.Count}";
+                    + $"roadLR={minL:F1}/{minR:F1};roadConf={minConf:F2};pts={r.Path.Count}";
                 return r;
             }
             catch (Exception ex)
@@ -141,51 +148,6 @@ namespace StreetRacing
                 r.Detail = "exc:" + ex.Message;
                 return r;
             }
-        }
-
-        private static void MeasureRoadEnvelope(Result r)
-        {
-            r.LeftRoadM.Clear();
-            r.RightRoadM.Clear();
-            for (int i = 0; i < r.Path.Count; i++)
-            {
-                Vector3 dir;
-                if (i <= 0)
-                    dir = new Vector3(r.Path[1].X - r.Path[0].X, r.Path[1].Y - r.Path[0].Y, 0f);
-                else if (i >= r.Path.Count - 1)
-                    dir = new Vector3(r.Path[i].X - r.Path[i - 1].X, r.Path[i].Y - r.Path[i - 1].Y, 0f);
-                else
-                    dir = new Vector3(r.Path[i + 1].X - r.Path[i - 1].X, r.Path[i + 1].Y - r.Path[i - 1].Y, 0f);
-                dir = RaceMath.FlatNormalize(dir);
-                var left = new Vector3(-dir.Y, dir.X, 0f);
-                r.LeftRoadM.Add(ProbeRoadSide(r.Path[i], left));
-                r.RightRoadM.Add(ProbeRoadSide(r.Path[i], new Vector3(-left.X, -left.Y, 0f)));
-            }
-        }
-
-        private static float ProbeRoadSide(Vector3 center, Vector3 side)
-        {
-            // The reference point itself has already been constrained onto the
-            // drivable road. Sweep outward in the reference frame. A short
-            // single off-road hole does not terminate the sweep immediately
-            // (junction markings/bridge quirks can flicker IS_POINT_ON_ROAD).
-            float lastGood = 0.75f;
-            int misses = 0;
-            for (float d = 0.5f; d <= 10f; d += 0.5f)
-            {
-                var p = new Vector3(center.X + side.X * d, center.Y + side.Y * d, center.Z);
-                if (IsOnRoad(p))
-                {
-                    lastGood = d;
-                    misses = 0;
-                }
-                else
-                {
-                    misses++;
-                    if (misses >= 2) break;
-                }
-            }
-            return RaceMath.Clamp(lastGood, 0.75f, 10f);
         }
 
         private static float Min(List<float> xs)
