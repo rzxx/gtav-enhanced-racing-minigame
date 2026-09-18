@@ -34,6 +34,7 @@ namespace StreetRacing
         private int commitUntilMs;
         private int commitStartedMs;
         private string committedIntent = "Track";
+        private string committedShape = "";
         private int planId;
 
         private const float VehicleHalfWidthM = 1.15f;
@@ -61,6 +62,7 @@ namespace StreetRacing
             commitUntilMs = 0;
             commitStartedMs = 0;
             committedIntent = "Track";
+            committedShape = "";
             planId = 0;
             LastCandidates.Clear();
             LastChosen = new TrajectoryCandidate();
@@ -136,7 +138,9 @@ namespace StreetRacing
                 return result;
             }
 
-            int committedIndex = FindClosestIndex(LastCandidates, committedLat);
+            int committedIndex = !string.IsNullOrEmpty(committedShape)
+                ? FindShapeIndex(LastCandidates, committedShape)
+                : FindClosestIndex(LastCandidates, committedLat);
             bool activeCommit = Math.Abs(committedLat) > 0.35f && nowMs < commitUntilMs;
             if (activeCommit && committedIndex >= 0)
             {
@@ -170,7 +174,11 @@ namespace StreetRacing
             {
                 float speedGain = chosen.MeanSpeed - center.MeanSpeed;
                 float targetGain = chosen.TargetSpeed - center.TargetSpeed;
+                float scoreGain = chosen.Score - center.Score;
+                bool apexChoice = chosen.Shape != null && chosen.Shape.StartsWith("Apex");
                 bool worthPassing = speedGain >= 2.0f || targetGain >= 2.5f
+                    || scoreGain >= 7.0f
+                    || (apexChoice && scoreGain >= 3.0f)
                     || (center.MinSpeed < 3f && chosen.MinSpeed > 6f);
                 if (!worthPassing)
                 {
@@ -186,6 +194,7 @@ namespace StreetRacing
                     || Math.Abs(chosen.LateralM - committedLat) > 0.75f)
                 {
                     committedLat = chosen.LateralM;
+                    committedShape = chosen.Shape ?? "";
                     commitStartedMs = nowMs;
                     commitUntilMs = nowMs + (chosen.Shape != null && chosen.Shape.StartsWith("Apex") ? 1100 : 1800);
                     if (chosen.Shape != null && chosen.Shape.StartsWith("Apex"))
@@ -207,6 +216,7 @@ namespace StreetRacing
                 if (minCommitSatisfied)
                 {
                     committedLat = 0f;
+                    committedShape = "";
                     committedIntent = "Return";
                     commitUntilMs = nowMs + 700;
                 }
@@ -228,7 +238,9 @@ namespace StreetRacing
             // execution agree after a commitment transition.
             if (Math.Abs(committedLat) > 0.35f)
             {
-                int ci = FindClosestIndex(LastCandidates, committedLat);
+                int ci = !string.IsNullOrEmpty(committedShape)
+                    ? FindShapeIndex(LastCandidates, committedShape)
+                    : FindClosestIndex(LastCandidates, committedLat);
                 if (ci >= 0 && string.IsNullOrEmpty(LastCandidates[ci].RejectReason))
                     chosen = LastCandidates[ci];
             }
@@ -822,15 +834,24 @@ namespace StreetRacing
                     var c = candidates[i];
                     if (!string.IsNullOrEmpty(c.RejectReason))
                     {
-                        parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:X({c.RejectReason})");
+                        parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:X({c.RejectReason})");
                         continue;
                     }
                     string lim = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
-                    parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
+                    parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
                 }
                 return string.Join("|", parts);
             }
             catch { return "?"; }
+        }
+
+        private static int FindShapeIndex(IList<TrajectoryCandidate> candidates, string shape)
+        {
+            if (string.IsNullOrEmpty(shape)) return -1;
+            for (int i = 0; i < candidates.Count; i++)
+                if (string.Equals(candidates[i].Shape, shape, StringComparison.Ordinal))
+                    return i;
+            return -1;
         }
 
         private static int FindClosestIndex(IList<TrajectoryCandidate> candidates, float lat)
