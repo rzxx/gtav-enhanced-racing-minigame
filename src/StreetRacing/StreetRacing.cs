@@ -1,0 +1,236 @@
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+using GTA;
+using GTA.Math;
+using GTA.Native;
+using GTA.UI;
+
+namespace StreetRacing
+{
+    public class StreetRacing : Script
+    {
+        private readonly StreetRacingConfig cfg;
+        private RaceState state = RaceState.Idle;
+        private readonly OpponentDriver ai = new OpponentDriver();
+
+        private Vehicle oppVehicle;
+        private Ped oppDriver;
+        private Vector3 finish = Vector3.Zero;
+        private Blip finishBlip;
+
+        private int raceStartTime;
+        private int lastHudTime;
+        private int cooldownUntil;
+        private int lastHonkAttempt;
+        private bool hornWasDown;
+        private bool wasLeading;
+
+        public StreetRacing()
+        {
+            cfg = StreetRacingConfig.Load();
+            Interval = 50;
+            Tick += OnTick;
+            KeyDown += OnKeyDown;
+            Aborted += OnAborted;
+            Notification.PostTicker("StreetRacing loaded: honk at a driver ahead to race.", false, false);
+        }
+
+        private void OnKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == cfg.CancelKey && state == RaceState.Racing)
+            {
+                EndRace("Race cancelled.");
+            }
+        }
+
+        private void OnTick(object sender, EventArgs e)
+        {
+            switch (state)
+            {
+                case RaceState.Idle:
+                    TickIdle();
+                    break;
+                case RaceState.Racing:
+                    TickRacing();
+                    break;
+                case RaceState.Cooldown:
+                    if (Game.GameTime >= cooldownUntil)
+                    {
+                        state = RaceState.Idle;
+                    }
+                    break;
+            }
+        }
+
+        private void TickIdle()
+        {
+            bool down = false;
+            try
+            {
+                down = Game.IsControlPressed(GTA.Control.VehicleHorn);
+            }
+            catch
+            {
+            }
+            bool rising = down && !hornWasDown;
+            hornWasDown = down;
+            if (!rising || Game.GameTime - lastHonkAttempt < cfg.HonkDebounceMs)
+            {
+                return;
+            }
+            lastHonkAttempt = Game.GameTime;
+
+            if (!OpponentPicker.TryPick(cfg.MaxChallengeRange, out var vehicle, out var driver))
+            {
+                return; // silent: honking in empty traffic should do nothing
+            }
+
+            var player = Game.Player.Character;
+            var origin = player.CurrentVehicle.Position;
+            var heading = player.CurrentVehicle.ForwardVector;
+            if (!FinishPicker.TryPick(origin, heading, cfg.MinDistance, cfg.MaxDistance, out var spot))
+            {
+                Notification.PostTicker("No road ahead for a finish line. Try facing open road.", false, false);
+                return;
+            }
+
+            oppVehicle = vehicle;
+            oppDriver = driver;
+            finish = spot;
+
+            try
+            {
+                finishBlip?.Delete();
+                finishBlip = World.CreateBlip(finish);
+                finishBlip.Sprite = BlipSprite.Standard;
+                finishBlip.Color = BlipColor.Yellow;
+                finishBlip.IsShortRange = false;
+                finishBlip.ShowRoute = true;
+                finishBlip.Name = "Race Finish";
+            }
+            catch
+            {
+            }
+
+            ai.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, cfg.RetaskIntervalMs, cfg.StuckTimeoutMs);
+            raceStartTime = Game.GameTime;
+            lastHudTime = 0;
+            wasLeading = true;
+            state = RaceState.Racing;
+            Notification.PostTicker("Challenge accepted! First to the ~y~yellow marker~s~ wins.", false, false);
+        }
+
+        private void TickRacing()
+        {
+            var player = Game.Player.Character;
+            if (player == null || !player.Exists() || player.IsDead)
+            {
+                EndRace("You died. Race over.");
+                return;
+            }
+            if (!ai.Valid())
+            {
+                EndRace("Rival is out (wrecked / gone). Race over.");
+                return;
+            }
+            if (Game.GameTime - raceStartTime > cfg.RaceTimeoutMs)
+            {
+                EndRace("Race timed out. Nobody got there.");
+                return;
+            }
+
+            ai.OnTick();
+            DrawFinish();
+
+            var youAt = player.IsInVehicle() ? player.CurrentVehicle.Position : player.Position;
+            float dYou = FinishPicker.FlatDistance(youAt, finish);
+            float dOpp = FinishPicker.FlatDistance(oppVehicle.Position, finish);
+
+            if (dYou < cfg.FinishRadius || dOpp < cfg.FinishRadius)
+            {
+                EndRace(dYou <= dOpp
+                    ? $"~g~You win!~s~ {Math.Max(0, (int)dOpp)}m ahead of your rival."
+                    : $"~r~You lose.~s~ Rival beat you by {Math.Max(0, (int)dYou)}m.");
+                return;
+            }
+
+            if (Game.GameTime - lastHudTime > 1000)
+            {
+                lastHudTime = Game.GameTime;
+                bool leading = dYou <= dOpp;
+                string msg = leading
+                    ? $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~g~you lead"
+                    : $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~r~rival leads";
+                if (leading != wasLeading)
+                {
+                    wasLeading = leading;
+                }
+                try
+                {
+                    GTA.UI.Screen.ShowSubtitle(msg);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void DrawFinish()
+        {
+            try
+            {
+                World.DrawMarker(
+                    MarkerType.Cylinder,
+                    finish + new Vector3(0f, 0f, 1f),
+                    new Vector3(0f, 0f, 0f),
+                    new Vector3(0f, 0f, 0f),
+                    new Vector3(cfg.FinishRadius * 0.6f, cfg.FinishRadius * 0.6f, 6f),
+                    Color.FromArgb(200, 255, 200, 0));
+            }
+            catch
+            {
+            }
+        }
+
+        private void EndRace(string message)
+        {
+            try
+            {
+                ai.Stop();
+            }
+            catch
+            {
+            }
+            try
+            {
+                finishBlip?.Delete();
+            }
+            catch
+            {
+            }
+            finishBlip = null;
+            Notification.PostTicker(message, false, false);
+            cooldownUntil = Game.GameTime + cfg.CooldownMs;
+            state = RaceState.Cooldown;
+        }
+
+        private void OnAborted(object sender, EventArgs e)
+        {
+            try
+            {
+                ai.Stop();
+            }
+            catch
+            {
+            }
+            try
+            {
+                finishBlip?.Delete();
+            }
+            catch
+            {
+            }
+        }
+    }
+}

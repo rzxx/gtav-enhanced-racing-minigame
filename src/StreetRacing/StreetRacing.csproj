@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>StreetRacing</AssemblyName>
+    <RootNamespace>StreetRacing</RootNamespace>
+    <!-- Override with: dotnet build -p:GtaEnhancedDir="D:\path\to\game" -->
+    <GtaEnhancedDir Condition="'$(GtaEnhancedDir)' == ''">D:\SteamLibrary\steamapps\common\Grand Theft Auto V Enhanced</GtaEnhancedDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets .NET 8 SDK target .NET Framework 4.8 without VS installed -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="ScriptHookVDotNet3">
+      <HintPath>$(GtaEnhancedDir)\ScriptHookVDotNet3.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
