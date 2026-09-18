@@ -649,7 +649,8 @@ namespace StreetRacing.Race
                     bool poseRecovered = false;
                     try
                     {
-                        poseRecovered = !route.IsLost
+                        poseRecovered = recovery.Current == RecoveryPrimitive.Stage.Rejoin
+                            && !route.IsLost
                             && Math.Abs(route.Lateral) < 2.0f
                             && Math.Abs(route.HeadingErrorDeg) < 12f
                             && (now - recoveryEnteredMs) > 500;
