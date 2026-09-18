@@ -64,6 +64,15 @@ namespace StreetRacing.Control
         private float lastThr;
         private float lastBrk;
 
+        // Control-rate vehicle state. Vehicle.Speed is unsigned, which hid the
+        // most important failure in the last tests: a car travelling backwards
+        // was treated as healthy forward motion. Keep body-frame velocity and
+        // yaw response inside the actuator where the commands are produced.
+        private bool hasControlKin;
+        private int lastControlMs;
+        private float lastControlHeading;
+        private int steerSaturatedSinceMs;
+
         public void Attach(Ped driver, Vehicle vehicle, float cruise, int style, int refreshMs, int stuckMs)
         {
             this.driver = driver;
@@ -93,6 +102,10 @@ namespace StreetRacing.Control
             lastSteer = 0f;
             lastThr = 0f;
             lastBrk = 0f;
+            hasControlKin = false;
+            lastControlMs = 0;
+            lastControlHeading = 0f;
+            steerSaturatedSinceMs = 0;
         }
 
         public void SetPlan(Vector3 aimPoint, float targetSpeed, int style, string reason)
@@ -187,16 +200,50 @@ namespace StreetRacing.Control
         public bool OnTick(bool forceReissue, string tacticalName)
         {
             if (!HasPlan || !Valid() || !hasManeuver) return false;
+
             Vector3 egoPos;
+            Vector3 egoVel;
+            Vector3 egoFwd;
             float egoHeading;
             float egoSpeed;
+            int now;
             try
             {
+                now = Game.GameTime;
                 egoPos = vehicle.Position;
+                egoVel = vehicle.Velocity;
                 egoHeading = vehicle.Heading;
                 egoSpeed = vehicle.Speed;
+                egoFwd = RaceMath.FlatNormalize(new Vector3(vehicle.ForwardVector.X, vehicle.ForwardVector.Y, 0f));
             }
             catch { return false; }
+
+            // --- Body-frame motion. GTA Vehicle.Speed is magnitude-only.
+            var egoLeft = new Vector3(-egoFwd.Y, egoFwd.X, 0f);
+            var flatVel = new Vector3(egoVel.X, egoVel.Y, 0f);
+            float signedLong = RaceMath.FlatDot(flatVel, egoFwd);
+            float lateralVel = RaceMath.FlatDot(flatVel, egoLeft);
+            float slipDeg = 0f;
+            try
+            {
+                if (RaceMath.FlatLength(flatVel) > 1f)
+                    slipDeg = (float)(Math.Atan2(lateralVel, Math.Max(Math.Abs(signedLong), 0.5f)) * 180.0 / Math.PI);
+            }
+            catch { }
+
+            float dt = 0.05f;
+            float yawRateDegS = 0f;
+            if (hasControlKin)
+            {
+                try
+                {
+                    dt = (now - lastControlMs) / 1000f;
+                    if (dt < 0.015f) dt = 0.015f;
+                    if (dt > 0.2f) dt = 0.2f;
+                    yawRateDegS = RaceMath.HeadingDiffDeg(egoHeading, lastControlHeading) / dt;
+                }
+                catch { dt = 0.05f; yawRateDegS = 0f; }
+            }
 
             // --- Locate ego on the selected path.
             float sEgo;
@@ -209,8 +256,11 @@ namespace StreetRacing.Control
             }
             catch { return false; }
 
+            var cum = StationSToCumulative(cmd);
+
             // Local speed-dependent lookahead on the SELECTED path.
-            float ld = 6f + egoSpeed * 0.7f;
+            float forwardSpeed = Math.Max(0f, signedLong);
+            float ld = 6f + forwardSpeed * 0.7f;
             ld = RaceMath.Clamp(ld, 8f, 28f);
             Vector3 lookPt;
             float lookS;
@@ -218,7 +268,7 @@ namespace StreetRacing.Control
             try
             {
                 lookS = sEgo + ld;
-                lookPt = PointAtS(cmd.Path, StationSToCumulative(cmd), lookS);
+                lookPt = PointAtS(cmd.Path, cum, lookS);
                 lookSpeed = SpeedAtS(cmd, sEgo);
             }
             catch
@@ -228,7 +278,9 @@ namespace StreetRacing.Control
                 lookSpeed = CurrentCruise;
             }
 
-            // --- Lateral: pure pursuit to the local lookahead point.
+            // --- Lateral: current geometric follower, now with rate limiting
+            // and explicit stability observation. Controller V2 will replace
+            // this law after the benchmark tells us which failure modes dominate.
             var to = new Vector3(lookPt.X - egoPos.X, lookPt.Y - egoPos.Y, 0f);
             float distToLook = RaceMath.FlatLength(to);
             float desiredHeading = distToLook > 1f
@@ -236,9 +288,7 @@ namespace StreetRacing.Control
                 : pathHeading;
             float headErr = RaceMath.HeadingDiffDeg(desiredHeading, egoHeading);
 
-            // Pure-pursuit curvature -> wheel angle (wheelbase ~2.7 m).
-            float alphaDeg = headErr;
-            float alphaRad = alphaDeg * (float)Math.PI / 180f;
+            float alphaRad = headErr * (float)Math.PI / 180f;
             float wheelbase = 2.7f;
             float steerPursuit = 0f;
             if (distToLook > 1f)
@@ -246,75 +296,162 @@ namespace StreetRacing.Control
                 float kappa = 2f * (float)Math.Sin(alphaRad) / Math.Max(distToLook, 3f);
                 steerPursuit = (float)(Math.Atan(wheelbase * kappa) * 180.0 / Math.PI);
             }
-            // Blend pursuit angle with heading error for low-speed authority,
-            // plus a small cross-track correction so we rejoin after slides.
-            // SIGN (pinned by DirectDiag: +steer = left; crossTrack + = left):
-            // left-of-path (+cross) must steer right (negative), hence minus.
-            float steerDeg = steerPursuit * 1.4f + headErr * 0.35f - crossTrack * 1.1f;
-            // Speed-scheduled clamp (authority falls with speed).
-            if (egoSpeed > 25f) steerDeg = RaceMath.Clamp(steerDeg, -18f, 18f);
-            else if (egoSpeed > 15f) steerDeg = RaceMath.Clamp(steerDeg, -24f, 24f);
-            else steerDeg = RaceMath.Clamp(steerDeg, -32f, 32f);
 
-            // Explicit reverse ONLY: commanded by the recovery primitive via
-            // ManeuverCommand.Reverse. Never infer from heading error here —
-            // a maneuver that commanded zero speed must hold position, not
-            // back into traffic because the route is sideways.
+            float steerDeg = steerPursuit * 1.4f + headErr * 0.35f - crossTrack * 1.1f;
+            float steerLimit = egoSpeed > 25f ? 18f : (egoSpeed > 15f ? 24f : 32f);
+            steerDeg = RaceMath.Clamp(steerDeg, -steerLimit, steerLimit);
+
             bool reversing = false;
             try { reversing = cmd.Reverse; } catch { reversing = false; }
             if (reversing) steerDeg = -steerDeg;
 
+            // Do not teleport the steering rack between opposite locks.
+            float steerRateDegS = egoSpeed > 20f ? 90f : (egoSpeed > 10f ? 120f : 180f);
+            float maxSteerStep = steerRateDegS * dt;
+            if (hasControlKin)
+                steerDeg = RaceMath.Clamp(steerDeg, lastSteer - maxSteerStep, lastSteer + maxSteerStep);
+
+            // Curvature/yaw target is telemetry for this pass. It becomes an
+            // explicit feedback term in Controller V2.
+            float desiredYawRateDegS = 0f;
+            try
+            {
+                float kappaPath = CurvatureAtS(cmd.Path, cum, sEgo + ld * 0.5f);
+                desiredYawRateDegS = forwardSpeed * kappaPath * 180f / (float)Math.PI;
+            }
+            catch { }
+
+            bool steerSaturated = Math.Abs(steerDeg) >= steerLimit * 0.92f
+                && (Math.Abs(headErr) > 12f || Math.Abs(crossTrack) > 1.5f);
+            if (steerSaturated)
+            {
+                if (steerSaturatedSinceMs <= 0) steerSaturatedSinceMs = now;
+            }
+            else
+            {
+                steerSaturatedSinceMs = 0;
+            }
+            float steerSatS = steerSaturatedSinceMs > 0 ? (now - steerSaturatedSinceMs) / 1000f : 0f;
+
+            bool reverseMotion = !reversing && signedLong < -1.0f;
+            bool wrongYawResponse = !reversing
+                && egoSpeed > 5f
+                && Math.Abs(steerDeg) > 8f
+                && Math.Abs(yawRateDegS) > 8f
+                && steerDeg * yawRateDegS < 0f
+                && (Math.Abs(headErr) > 20f || Math.Abs(slipDeg) > 10f);
+            bool unstable = !reversing && (
+                reverseMotion
+                || (egoSpeed > 7f && Math.Abs(slipDeg) > 22f)
+                || (egoSpeed > 6f && Math.Abs(headErr) > 70f)
+                || (steerSatS > 0.7f && (Math.Abs(headErr) > 30f || Math.Abs(slipDeg) > 12f))
+                || wrongYawResponse);
+            bool watch = !unstable && !reversing && (
+                (egoSpeed > 7f && Math.Abs(slipDeg) > 12f)
+                || Math.Abs(headErr) > 35f
+                || steerSatS > 0.30f);
+
+            string stabilityMode = reverseMotion ? "ReverseMotion" : (unstable ? "Unstable" : (watch ? "Watch" : "Normal"));
+
             try { vehicle.SteeringAngle = steerDeg; } catch { }
             try { vehicle.SteeringScale = 1f; } catch { }
 
-            // --- Longitudinal: PI on LOCAL planned speed error.
-            float speedErr = lookSpeed - egoSpeed;
-            float dt = 0.05f; // 20 Hz script tick
+            // --- Longitudinal: use SIGNED forward speed, not Vehicle.Speed.
+            // This prevents backwards/sliding motion from masquerading as
+            // successful forward velocity.
+            float controlSpeed = reversing ? Math.Abs(signedLong) : Math.Max(0f, signedLong);
+            float speedErr = lookSpeed - controlSpeed;
             speedInt = RaceMath.Clamp(speedInt + speedErr * dt, -6f, 6f);
             float u = speedErr * 0.35f + speedInt * 0.12f;
-
-            bool stalled = egoSpeed < 1.5f && lookSpeed > 3f;
+            bool stalled = controlSpeed < 1.5f && lookSpeed > 3f;
 
             float thr = 0f;
             float brk = 0f;
+            if (reversing)
+            {
+                thr = -0.6f;
+            }
+            else if (u >= 0f)
+            {
+                thr = RaceMath.Clamp(u, stalled ? 0.8f : 0f, 1f);
+                if (stalled && thr < 0.8f) thr = 0.8f;
+            }
+            else
+            {
+                brk = RaceMath.Clamp(-u, 0.15f, 1f);
+                if (lookSpeed < 0.5f && controlSpeed > 1f) brk = 1f;
+            }
+
+            if (!reversing)
+            {
+                // Even before Controller V2, never combine full lock with full
+                // throttle. This is deliberately conservative: the supervisor
+                // removes energy when the geometric follower is losing authority.
+                float steerFrac = steerLimit > 1f ? Math.Abs(steerDeg) / steerLimit : 0f;
+                if (egoSpeed > 8f)
+                {
+                    float steeringThrottleCap = RaceMath.Clamp(1f - 0.55f * steerFrac, 0.35f, 1f);
+                    if (thr > steeringThrottleCap) thr = steeringThrottleCap;
+                }
+
+                if (watch)
+                {
+                    if (thr > 0.30f) thr = 0.30f;
+                    speedInt *= 0.9f;
+                }
+                if (unstable)
+                {
+                    thr = 0f;
+                    speedInt *= 0.5f;
+                    // Heavy braking while sideways can make a slide worse.
+                    // Brake firmly only for actual backwards motion; otherwise
+                    // use a modest stabilizing brake when mostly aligned.
+                    if (reverseMotion)
+                        brk = Math.Max(brk, 0.60f);
+                    else if (Math.Abs(slipDeg) < 18f && signedLong > 7f)
+                        brk = Math.Max(brk, 0.25f);
+                    else
+                        brk = Math.Max(brk, 0.05f);
+                }
+            }
+
             try
             {
                 if (reversing)
                 {
-                    // Explicit recovery reverse: controlled, never inferred.
-                    try { vehicle.Throttle = -0.6f; } catch { }
-                    try { vehicle.ThrottlePower = -0.6f; } catch { }
-                    try { vehicle.BrakePower = 0f; } catch { }
-                    try { vehicle.IsHandbrakeForcedOn = false; } catch { }
-                    thr = -0.6f;
-                }
-                else if (u >= 0f)
-                {
-                    thr = RaceMath.Clamp(u, stalled ? 0.8f : 0f, 1f);
-                    if (stalled && thr < 0.8f) thr = 0.8f;
-                    try { vehicle.Throttle = thr; } catch { }
-                    try { vehicle.ThrottlePower = thr; } catch { }
-                    try { vehicle.BrakePower = 0f; } catch { }
-                    try { vehicle.IsHandbrakeForcedOn = false; } catch { }
+                    vehicle.Throttle = thr;
+                    vehicle.ThrottlePower = thr;
+                    vehicle.BrakePower = 0f;
+                    vehicle.IsHandbrakeForcedOn = false;
+                    brk = 0f;
                 }
                 else
                 {
-                    try { vehicle.Throttle = 0f; } catch { }
-                    try { vehicle.ThrottlePower = 0f; } catch { }
-                    brk = RaceMath.Clamp(-u, 0.15f, 1f);
-                    if (lookSpeed < 0.5f && egoSpeed > 1f) brk = 1f;
-                    try { vehicle.BrakePower = brk; } catch { }
-                    try { vehicle.IsHandbrakeForcedOn = lookSpeed < 0.5f && egoSpeed < 3f; }
-                    catch { }
+                    vehicle.Throttle = thr;
+                    vehicle.ThrottlePower = thr;
+                    vehicle.BrakePower = brk;
+                    vehicle.IsHandbrakeForcedOn = lookSpeed < 0.5f && controlSpeed < 3f;
                 }
             }
             catch { }
 
+            float steerActual = steerDeg;
+            float thrActual = thr;
+            float thrPowerActual = thr;
+            float brkActual = brk;
+            try { steerActual = vehicle.SteeringAngle; } catch { }
+            try { thrActual = vehicle.Throttle; } catch { }
+            try { thrPowerActual = vehicle.ThrottlePower; } catch { }
+            try { brkActual = vehicle.BrakePower; } catch { }
+
             lastSteer = steerDeg;
             lastThr = thr;
             lastBrk = brk;
+            lastControlHeading = egoHeading;
+            lastControlMs = now;
+            hasControlKin = true;
 
-            var e = new PathFollowingError
+            LastError = new PathFollowingError
             {
                 Valid = true,
                 LateralErrM = crossTrack,
@@ -327,8 +464,18 @@ namespace StreetRacing.Control
                 LocalTargetMps = lookSpeed,
                 LookaheadM = ld,
                 PlanId = planId,
+                SignedLongMps = signedLong,
+                LateralVelMps = lateralVel,
+                SlipDeg = slipDeg,
+                YawRateDegS = yawRateDegS,
+                DesiredYawRateDegS = desiredYawRateDegS,
+                SteerActualDeg = steerActual,
+                ThrottleActual01 = thrActual,
+                ThrottlePowerActual01 = thrPowerActual,
+                BrakeActual01 = brkActual,
+                SteerSaturationS = steerSatS,
+                StabilityMode = stabilityMode,
             };
-            LastError = e;
 
             ReissueCount++;
             return true;
@@ -469,6 +616,27 @@ namespace StreetRacing.Control
                 return c.SpeedProfile[c.SpeedProfile.Count - 1];
             }
             catch { return c.TargetSpeed; }
+        }
+
+        private static float CurvatureAtS(System.Collections.Generic.List<Vector3> path,
+            System.Collections.Generic.List<float> cum, float s)
+        {
+            try
+            {
+                if (path == null || path.Count < 3 || cum == null || cum.Count != path.Count) return 0f;
+                float ds = 4f;
+                var p0 = PointAtS(path, cum, Math.Max(0f, s - ds));
+                var p1 = PointAtS(path, cum, s);
+                var p2 = PointAtS(path, cum, Math.Min(cum[cum.Count - 1], s + ds));
+                var d0 = new Vector3(p1.X - p0.X, p1.Y - p0.Y, 0f);
+                var d1 = new Vector3(p2.X - p1.X, p2.Y - p1.Y, 0f);
+                float l0 = RaceMath.FlatLength(d0);
+                float l1 = RaceMath.FlatLength(d1);
+                if (l0 < 0.5f || l1 < 0.5f) return 0f;
+                float dhRad = RaceMath.SignedAngleDeg(d0, d1) * (float)Math.PI / 180f;
+                return dhRad / Math.Max((l0 + l1) * 0.5f, 1f);
+            }
+            catch { return 0f; }
         }
 
         /// Deterministic steering-sign guard (no game natives).
