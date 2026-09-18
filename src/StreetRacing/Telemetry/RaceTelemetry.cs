@@ -31,7 +31,7 @@ namespace StreetRacing
     ///   GPS_ROUTE / TACTIC / ROUTE_LOST / ROUTE_FOUND /
     ///   RECOVERY / IMPACT / TELEPORT / HARD_BRAKE / CTRL / ACTUATOR /
     ///   PLAN (planner changes incl. firstTangErr/maxKappa/routeHead/egoHead) /
-    ///   PATH_ERR (controller errors + outputs)
+    ///   PATH_ERR (controller errors + outputs) / STABILITY (mode transitions)
     internal sealed class RaceTelemetry
     {
         private readonly StreamWriter samples;
