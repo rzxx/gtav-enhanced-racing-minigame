@@ -23,13 +23,17 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// Explicitly DISABLED by construction for this milestone:
-    ///   lateral traffic avoidance / passing (FOLLOW/PASS) /
-    ///   player race tactics / candidate trajectory scoring / seven lateral
-    ///   choices / Crashed state / ImpactClassifier-driven behavior /
+    /// Local Planner V1 is ENABLED after the initial join:
+    ///   several pose-continuous lateral candidates inside RoadCorridor,
+    ///   world-space actor prediction per candidate, path+speed scoring, and
+    ///   short commitment/hysteresis for PASS_LEFT / PASS_RIGHT / RETURN.
+    ///
+    /// Still disabled:
+    ///   semantic lane graph / oncoming-lane classification / player tactics /
+    ///   Crashed state / ImpactClassifier-driven behavior /
     ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
-    ///   StraightFallback. Perception affects longitudinal speed only: the
-    ///   driver may follow/stop, but cannot change lanes to avoid or pass yet.
+    ///   StraightFallback. V1 may move laterally around traffic, but still
+    ///   treats the measured road corridor as one drivable surface.
     ///
     /// Speed separation (the recursive bug this fixes):
     ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
@@ -75,6 +79,7 @@ namespace StreetRacing.Race
         // now constrains the SPEED profile of that exact path so the driver can
         // follow/stop for traffic instead of physically rear-ending it.
         private readonly Perception perception = new Perception();
+        private readonly LocalPlannerV1 localPlanner = new LocalPlannerV1();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
         private readonly DrivingReference drivingReference = new DrivingReference();
@@ -173,6 +178,7 @@ namespace StreetRacing.Race
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
             try { perception.Reset(); } catch { }
+            try { localPlanner.Reset(); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -262,8 +268,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;passing=OFF");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -331,6 +337,7 @@ namespace StreetRacing.Race
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
             try { perception.Reset(); } catch { }
+            try { localPlanner.Reset(); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -418,8 +425,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;passing=OFF;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -593,8 +600,8 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            // Observe-only traffic/world scan. Nothing from Perception is
-            // allowed to alter the maneuver in this pass.
+            // Persistent world perception feeds Local Planner V1. Actor
+            // prediction is evaluated per candidate in world space.
             try
             {
                 if (IsGpsSource())
@@ -810,9 +817,93 @@ namespace StreetRacing.Race
             lastRefRoadClamp = rr.RoadConstrainedPoints;
             lastRefDetail = rr.Detail;
 
-            var lats = new List<float>(rr.Path.Count);
-            for (int i = 0; i < rr.Path.Count; i++) lats.Add(0f);
-            return BuildCommandFromPath(rr.Path, rr.StationS, lats, egoSpeed, dtPlan, cruise, "Track", egoPos);
+            LocalPlannerV1.Result lp = null;
+            try
+            {
+                lp = localPlanner.Plan(rr, corridor, route, perception, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime);
+            }
+            catch { lp = null; }
+
+            if (lp == null || !lp.Valid || lp.Chosen.Path == null || lp.Chosen.Path.Count < 3)
+            {
+                try { telemetry?.Event(Game.GameTime - t0, "LOCAL_PLAN_INVALID", lp != null ? lp.Detail : "null"); } catch { }
+                var latsFallback = new List<float>(rr.Path.Count);
+                for (int i = 0; i < rr.Path.Count; i++) latsFallback.Add(0f);
+                joinState = "TrackFallback";
+                return BuildCommandFromPath(rr.Path, rr.StationS, latsFallback, egoSpeed, dtPlan, cruise, "TrackFallback", egoPos);
+            }
+
+            joinState = lp.Intent;
+            return BuildCommandFromCandidate(lp.Chosen, egoSpeed, dtPlan, cruise, lp.RoadDesired);
+        }
+
+        private ManeuverCommand BuildCommandFromCandidate(
+            TrajectoryCandidate chosen, float egoSpeed, float dtPlan, float cruise, float roadDesired)
+        {
+            float aBrake = capability.UsableBrake(profile.GripFactor);
+            float aAcc = Math.Max(2f, aBrake * 0.55f);
+            float aDec = Math.Max(3f, aBrake);
+            float desired = RaceMath.Clamp(chosen.TargetSpeed, 0f, cruise);
+            desiredRoadSpeed = RaceMath.Clamp(roadDesired, 0f, cruise);
+
+            if (!commandedInit)
+            {
+                commandedSpeed = RaceMath.Clamp(egoSpeed, 0f, cruise);
+                commandedInit = true;
+            }
+            else if (desired > commandedSpeed)
+            {
+                commandedSpeed = Math.Min(desired, commandedSpeed + aAcc * dtPlan);
+            }
+            else if (desired < commandedSpeed)
+            {
+                commandedSpeed = Math.Max(desired, commandedSpeed - aDec * dtPlan);
+            }
+            commandedSpeed = RaceMath.Clamp(commandedSpeed, 0f, cruise);
+
+            var raw = chosen.SpeedProfile ?? new List<float>();
+            var ss = chosen.StationS ?? new List<float>();
+            var prof = new List<float>(raw.Count);
+            for (int i = 0; i < raw.Count; i++)
+            {
+                float s = i < ss.Count ? ss[i] : i * 4f;
+                float reach = (float)Math.Sqrt(commandedSpeed * commandedSpeed
+                    + 2f * aAcc * Math.Max(0f, s));
+                float v = Math.Min(raw[i], reach);
+                prof.Add(RaceMath.Clamp(v, 0f, cruise));
+            }
+            if (prof.Count == 0)
+            {
+                prof.Add(commandedSpeed);
+                prof.Add(commandedSpeed);
+            }
+            prof[0] = commandedSpeed;
+
+            string limit = chosen.SpeedLimiting ?? "Cruise";
+            if ((limit == "Cruise" || string.IsNullOrEmpty(limit)) && commandedSpeed < desired - 0.5f)
+                limit = "AccelRamp";
+
+            current = chosen;
+            current.SpeedProfile = prof;
+            current.TargetSpeed = commandedSpeed;
+            current.SpeedLimiting = limit;
+            current.MeanSpeed = Mean(prof);
+            current.MinSpeed = Min(prof, cruise);
+            current.RequiredDecel = Math.Max(0f, egoSpeed - desired);
+            hasCurrent = true;
+
+            return new ManeuverCommand
+            {
+                Path = new List<Vector3>(current.Path),
+                StationS = new List<float>(current.StationS),
+                SpeedProfile = new List<float>(prof),
+                AimPoint = current.AimPoint,
+                TargetSpeed = commandedSpeed,
+                Style = style,
+                Reason = limit,
+                Reverse = false,
+            };
         }
 
         // --- JOIN: one-time pose-feasible merge, only until aligned.
@@ -1053,7 +1144,15 @@ namespace StreetRacing.Race
             try
             {
                 trajViz.LastCandidates.Clear();
-                if (hasCurrent) trajViz.LastCandidates.Add(current);
+                if (joined && localPlanner.LastCandidates.Count > 0)
+                {
+                    for (int i = 0; i < localPlanner.LastCandidates.Count; i++)
+                        trajViz.LastCandidates.Add(localPlanner.LastCandidates[i]);
+                }
+                else if (hasCurrent)
+                {
+                    trajViz.LastCandidates.Add(current);
+                }
                 trajViz.Chosen = current;
                 trajViz.HasChosen = hasCurrent;
                 trajViz.PlanId = maneuverPlanId;
@@ -1095,7 +1194,8 @@ namespace StreetRacing.Race
                         + $"maxKappa={c.MaxKappa:F4};rawGpsK={lastRefRawKappa:F4};refK={lastRefKappa:F4};"
                         + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
                         + $"constr={(c.ConstrainHandle != -1 ? (c.ConstrainKind ?? "Actor") + "#" + c.ConstrainHandle + "@" + c.ConstrainS.ToString("F0") : "none")};"
-                        + $"minClear={c.MinPredClearance:F1};s={route.AlongS:F0};{route.LocDetail}");
+                        + $"minClear={c.MinPredClearance:F1};latTarget={c.LateralM:F1};score={c.Score:F1};"
+                        + $"local={localPlanner.LastDecision};s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }

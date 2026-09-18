@@ -23,8 +23,9 @@ namespace StreetRacing
         public List<float> StationS;      // s ahead (m) per path station
         public List<float> SpeedProfile;  // executable target speed per station
         public List<float> ArrivalT;      // predicted arrival time per station
-        public float TargetSpeed;         // SpeedProfile[0] (what to drive now)
-        public string SpeedLimiting;      // Cruise/Curvature/Follow/.../Obstacle:<kind>#h@s
+        public float TargetSpeed;         // actor+road desired at ego before command ramp
+        public float RoadTargetSpeed;     // road/curvature-only desired at ego
+        public string SpeedLimiting;      // Cruise/Curvature/Traffic:<kind>#handle
         public int ConstrainHandle;       // actor handle that binds this path (-1 none)
         public string ConstrainKind;      // actor kind string for telemetry
         public float ConstrainS;          // station s (m) of the binding constraint
