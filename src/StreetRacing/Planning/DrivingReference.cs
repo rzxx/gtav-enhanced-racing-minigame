@@ -15,8 +15,9 @@ namespace StreetRacing
     ///
     /// This layer keeps RaceRoute untouched for global progress/localization,
     /// but low-pass filters positions over arclength to create a physically
-    /// continuous local center reference. Smoothing is constrained back toward
-    /// the raw GPS point whenever the candidate leaves GTA's drivable road.
+    /// continuous local center reference. Smoothing is geometrically bounded
+    /// around GTA's routed spine; road structure is supplied separately by
+    /// LocalRoadModel, never by a binary IS_POINT_ON_ROAD width scan.
     internal sealed class DrivingReference
     {
         internal sealed class Result
@@ -102,7 +103,7 @@ namespace StreetRacing
                     float sAbs = startS + sAhead;
                     Vector3 pRaw = raw[i];
                     Vector3 pSmooth = SmoothAt(route, sAbs, windowM);
-                    Vector3 pSafe = KeepOnRoad(pRaw, pSmooth, out bool constrained);
+                    Vector3 pSafe = KeepNearGpsSpine(pRaw, pSmooth, out bool constrained);
                     if (constrained) r.RoadConstrainedPoints++;
                     r.Path.Add(pSafe);
                 }
@@ -179,44 +180,23 @@ namespace StreetRacing
             return new Vector3(x / sw, y / sw, z / sw);
         }
 
-        private static Vector3 KeepOnRoad(Vector3 raw, Vector3 smooth, out bool constrained)
+        private static Vector3 KeepNearGpsSpine(Vector3 raw, Vector3 smooth, out bool constrained)
         {
+            // GPS is topology, but it is still a far more reliable statement
+            // that "a road exists here" than a one-frame IS_POINT_ON_ROAD
+            // boolean. Allow smoothing to round/kink-filter the route while
+            // bounding how far it may cut away from GTA's own routed spine.
             constrained = false;
-            if (IsOnRoad(smooth)) return smooth;
+            float d = RaceMath.FlatDistance(raw, smooth);
+            const float MaxOffsetM = 3.5f;
+            if (d <= MaxOffsetM) return smooth;
 
-            // The averaged corner may cut the inside sidewalk/building. Walk
-            // it back toward GTA's GPS point until it is on drivable road.
             constrained = true;
-            float[] blends = { 0.75f, 0.50f, 0.25f, 0f };
-            foreach (float t in blends)
-            {
-                var p = new Vector3(
-                    raw.X + (smooth.X - raw.X) * t,
-                    raw.Y + (smooth.Y - raw.Y) * t,
-                    raw.Z + (smooth.Z - raw.Z) * t);
-                if (IsOnRoad(p)) return p;
-            }
-            return raw;
-        }
-
-        private static bool IsOnRoad(Vector3 p)
-        {
-            try
-            {
-                if (Function.Call<bool>(Hash.IS_POINT_ON_ROAD, p.X, p.Y, p.Z, 0))
-                    return true;
-            }
-            catch
-            {
-                // If the native is unavailable, do not reject the smoothing
-                // layer entirely; raw GTA GPS remains the fallback below.
-                return true;
-            }
-            try
-            {
-                return Function.Call<bool>(Hash.IS_POINT_ON_ROAD, p.X, p.Y, p.Z - 1f, 0);
-            }
-            catch { return true; }
+            float t = MaxOffsetM / Math.Max(d, 0.01f);
+            return new Vector3(
+                raw.X + (smooth.X - raw.X) * t,
+                raw.Y + (smooth.Y - raw.Y) * t,
+                raw.Z + (smooth.Z - raw.Z) * t);
         }
 
         private static float MaxCurvature(List<Vector3> path)
