@@ -84,6 +84,7 @@ namespace StreetRacing.Race
         private bool lastLoggedLost;
 
         private float lastSpeed;
+        private float lastSignedLong;
         private Vector3 lastPos = Vector3.Zero;
         private bool hasKin;
         private int lastKinT;
@@ -97,6 +98,8 @@ namespace StreetRacing.Race
         private int maneuverPlanId;
         private string lastIntentLog = "";
         private int lastIntentLogMs = -100000;
+        private string lastStabilityMode = "";
+        private int lastStabilityEventMs = -100000;
         private Vector3 lastEgoFwd = new Vector3(0f, 1f, 0f);
         private float lastEgoHeading;
 
@@ -170,6 +173,7 @@ namespace StreetRacing.Race
 
             hasKin = false;
             lastSpeed = originSpeed;
+            lastSignedLong = originSpeed;
             lastPos = origin;
             lastKinT = t0;
             lastHealth = -1f;
@@ -191,6 +195,8 @@ namespace StreetRacing.Race
             hasCurrent = false;
             lastIntentLog = "";
             lastIntentLogMs = -100000;
+            lastStabilityMode = "";
+            lastStabilityEventMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -305,6 +311,7 @@ namespace StreetRacing.Race
 
             hasKin = false;
             lastSpeed = originSpeed;
+            lastSignedLong = originSpeed;
             lastPos = origin;
             lastKinT = t0;
             lastHealth = -1f;
@@ -326,6 +333,8 @@ namespace StreetRacing.Race
             hasCurrent = false;
             lastIntentLog = "";
             lastIntentLogMs = -100000;
+            lastStabilityMode = "";
+            lastStabilityEventMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -416,17 +425,21 @@ namespace StreetRacing.Race
                 egoHeading = vehicle.Heading;
             }
             catch { return; }
+            float signedLongSpeed = RaceMath.FlatDot(new Vector3(egoVel.X, egoVel.Y, 0f), egoFwd);
+            float forwardPlanSpeed = Math.Max(0f, signedLongSpeed);
+
             ActualSpeed = egoSpeed;
             FinishGap = RaceMath.FlatDistance(egoPos, finish);
             lastEgoFwd = egoFwd;
             lastEgoHeading = egoHeading;
 
-            UpdateKinematics(now, egoPos, egoVel, egoSpeed, egoHeading);
+            UpdateKinematics(now, egoPos, egoVel, egoSpeed, signedLongSpeed, egoHeading);
 
             if (!hasKin)
             {
                 hasKin = true;
                 lastSpeed = egoSpeed;
+                lastSignedLong = signedLongSpeed;
                 lastPos = egoPos;
                 lastKinT = now;
                 try { lastHealth = vehicle.HealthFloat; } catch { lastHealth = -1f; }
@@ -437,7 +450,7 @@ namespace StreetRacing.Race
             if (doPlan)
             {
                 lastPlanMs = now;
-                try { route.Update(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth); } catch { }
+                try { route.Update(egoPos, egoHeading, forwardPlanSpeed, now, corridor.HalfWidth); } catch { }
 
                 // GPS-only: retry briefly, never drive on fallback.
                 if (!IsGpsSource())
@@ -490,7 +503,7 @@ namespace StreetRacing.Race
 
             if (doPlan && IsGpsSource())
             {
-                LookaheadM = profile.LookaheadForSpeed(egoSpeed);
+                LookaheadM = profile.LookaheadForSpeed(forwardPlanSpeed);
                 float dtPlan = 0.1f;
                 try
                 {
@@ -516,24 +529,24 @@ namespace StreetRacing.Race
                         joined = true;
                         joinState = "Track";
                         try { telemetry?.Event(t, "JOIN_DONE", $"latched to Track;lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0};s={route.AlongS:F0}"); } catch { }
-                        m = BuildTrack(egoPos, egoSpeed, dtPlan);
+                        m = BuildTrack(egoPos, forwardPlanSpeed, dtPlan);
                     }
                     else
                     {
                         joinState = "Join";
-                        m = BuildJoin(egoPos, egoSpeed, dtPlan);
+                        m = BuildJoin(egoPos, forwardPlanSpeed, dtPlan);
                     }
                 }
                 else
                 {
                     joinState = "Track";
-                    m = BuildTrack(egoPos, egoSpeed, dtPlan);
+                    m = BuildTrack(egoPos, forwardPlanSpeed, dtPlan);
                 }
                 m.PlanId = ++maneuverPlanId;
                 TargetSpeed = Math.Max(0f, commandedSpeed);
                 // SpeedLimit names the ROAD limit, never the ramp lag.
                 SpeedLimit = m.Reason ?? "Cruise";
-                PublishViz(m, egoSpeed, t, egoHeading);
+                PublishViz(m, forwardPlanSpeed, t, egoHeading);
                 try { actuator.SetManeuver(m); } catch { }
                 LogIntent(t, now);
 
@@ -560,8 +573,31 @@ namespace StreetRacing.Race
             try { actuator.OnTick(false, joinState); } catch { }
             try
             {
-                actuator?.UpdatePathError(egoPos, egoHeading, egoSpeed, route,
+                actuator?.UpdatePathError(egoPos, egoHeading, forwardPlanSpeed, route,
                     hasCurrent ? current : new TrajectoryCandidate(), hasCurrent, TargetSpeed);
+            }
+            catch { }
+
+            // Stability state comes from the actuator that has the command and
+            // the physical response in the same tick. Event on transitions and
+            // periodically while degraded so a failure is obvious without
+            // reconstructing every CSV row.
+            try
+            {
+                var peNow = actuator != null ? actuator.LastError : new PathFollowingError();
+                string sm = peNow.Valid ? (peNow.StabilityMode ?? "") : "";
+                if (!string.IsNullOrEmpty(sm)
+                    && (sm != lastStabilityMode || (sm != "Normal" && now - lastStabilityEventMs > 2000)))
+                {
+                    lastStabilityMode = sm;
+                    lastStabilityEventMs = now;
+                    telemetry?.Event(t, "STABILITY",
+                        $"mode={sm};vLong={peNow.SignedLongMps:F1};vLat={peNow.LateralVelMps:F1};"
+                        + $"slip={peNow.SlipDeg:F1};yaw={peNow.YawRateDegS:F1};yawTgt={peNow.DesiredYawRateDegS:F1};"
+                        + $"headErr={peNow.HeadingErrDeg:F1};latErr={peNow.LateralErrM:F1};"
+                        + $"steer={peNow.SteerDeg:F1};satS={peNow.SteerSaturationS:F2};"
+                        + $"thr={peNow.Throttle01:F2};brk={peNow.Brake01:F2}");
+                }
             }
             catch { }
             try
@@ -578,6 +614,7 @@ namespace StreetRacing.Race
             }
 
             lastSpeed = egoSpeed;
+            lastSignedLong = signedLongSpeed;
             lastPos = egoPos;
             lastKinT = now;
         }
@@ -880,18 +917,18 @@ namespace StreetRacing.Race
             catch { }
         }
 
-        private void UpdateKinematics(int now, Vector3 egoPos, Vector3 egoVel, float egoSpeed, float egoHeading)
+        private void UpdateKinematics(int now, Vector3 egoPos, Vector3 egoVel, float egoSpeed, float signedLongSpeed, float egoHeading)
         {
             if (!hasKin) return;
             float dtS = (now - lastKinT) / 1000f;
             if (dtS <= 0f || dtS > 0.6f) return;
-            float accel = (egoSpeed - lastSpeed) / dtS;
+            float accel = (signedLongSpeed - lastSignedLong) / dtS;
             lastAccelLong = accel;
             float dhDeg = RaceMath.HeadingDiffDeg(egoHeading, lastEgoHeading);
             float yawRate = 0f;
             try { yawRate = dhDeg * (float)Math.PI / 180f / dtS; } catch { }
             lastYawRate = yawRate;
-            float latA = egoSpeed * yawRate;
+            float latA = Math.Max(0f, signedLongSpeed) * yawRate;
             float slip = 0f;
             try
             {
@@ -913,8 +950,8 @@ namespace StreetRacing.Race
             // dt/speed. No Crashed/recovery coupling here.
             try
             {
-                if (egoSpeed > 4f)
-                    capability.Observe(accel, latA, egoSpeed, dtS, yawRate, slip);
+                if (signedLongSpeed > 4f)
+                    capability.Observe(accel, latA, signedLongSpeed, dtS, yawRate, slip);
             }
             catch { }
             try
@@ -967,7 +1004,18 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.Brake01 : 0f, pe.Valid ? pe.LocalTargetMps : commandedSpeed,
                     lastEgoHeading, route.RouteHeadingDeg, c.FirstTangentErrDeg,
                     route.ExpectedS, route.LocJumpM,
-                    desiredRoadSpeed, commandedSpeed, lookPt.X, lookPt.Y, joinState);
+                    desiredRoadSpeed, commandedSpeed, lookPt.X, lookPt.Y, joinState,
+                    pe.Valid ? pe.SignedLongMps : 0f,
+                    pe.Valid ? pe.LateralVelMps : 0f,
+                    pe.Valid ? pe.SlipDeg : lastSlipDeg,
+                    pe.Valid ? pe.YawRateDegS : lastYawRate * 180f / (float)Math.PI,
+                    pe.Valid ? pe.DesiredYawRateDegS : 0f,
+                    pe.Valid ? pe.SteerActualDeg : 0f,
+                    pe.Valid ? pe.ThrottleActual01 : 0f,
+                    pe.Valid ? pe.ThrottlePowerActual01 : 0f,
+                    pe.Valid ? pe.BrakeActual01 : 0f,
+                    pe.Valid ? pe.SteerSaturationS : 0f,
+                    pe.Valid ? pe.StabilityMode : "");
             }
             catch { }
         }
