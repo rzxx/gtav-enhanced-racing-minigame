@@ -448,9 +448,12 @@ namespace StreetRacing
                     c.RejectReason = $"pose-discontinuity:{firstTang:F0}";
                     return c;
                 }
-                if (maxKappa > 0.20f && egoSpeed > 7f)
+                // Curvature is normally a SPEED constraint, not a reason to
+                // throw the trajectory away. Only reject near-cusps that the
+                // low-level controller cannot represent at any useful speed.
+                if (maxKappa > 0.45f)
                 {
-                    c.RejectReason = $"kappa:{maxKappa:F3}";
+                    c.RejectReason = $"kappa-pathological:{maxKappa:F3}";
                     return c;
                 }
 
@@ -478,13 +481,32 @@ namespace StreetRacing
                 string constrainKind;
                 float constrainS;
                 float minClear;
-                float[] actorAllow = BuildWorldActorEnvelope(path, ss, perception, egoSpeed,
-                    cruise, profile, out constrainHandle, out constrainKind, out constrainS, out minClear);
+                float[] actorAllow = BuildWorldActorEnvelope(path, ss, roadProfile,
+                    perception, egoSpeed, cruise, profile,
+                    out constrainHandle, out constrainKind, out constrainS, out minClear);
 
                 float[] allow = new float[path.Count];
                 for (int i = 0; i < allow.Length; i++)
                     allow[i] = Math.Min(roadAllow[i], actorAllow[i]);
                 float[] desired = BackwardPass(allow, ss, aBrake);
+
+                // One fixed-point refinement: once the first pass decides we
+                // will slow, actor arrival prediction must use that slower
+                // trajectory instead of pretending we keep current speed.
+                int cHandle2;
+                string cKind2;
+                float cS2;
+                float minClear2;
+                float[] actorAllow2 = BuildWorldActorEnvelope(path, ss, desired,
+                    perception, egoSpeed, cruise, profile,
+                    out cHandle2, out cKind2, out cS2, out minClear2);
+                for (int i = 0; i < allow.Length; i++)
+                    allow[i] = Math.Min(roadAllow[i], actorAllow2[i]);
+                desired = BackwardPass(allow, ss, aBrake);
+                constrainHandle = cHandle2;
+                constrainKind = cKind2;
+                constrainS = cS2;
+                minClear = minClear2;
 
                 float mean = 0f;
                 float min = cruise;
@@ -568,6 +590,7 @@ namespace StreetRacing
         private static float[] BuildWorldActorEnvelope(
             IList<Vector3> path,
             IList<float> ss,
+            IList<float> provisionalSpeed,
             Perception perception,
             float egoSpeed,
             float cruise,
@@ -586,9 +609,15 @@ namespace StreetRacing
             minClearance = 999f;
             if (perception == null || perception.Actors.Count == 0) return allow;
 
+            var arrivalList = BuildArrivalTimes(ss, provisionalSpeed);
             var arrival = new float[n];
             for (int i = 0; i < n; i++)
-                arrival[i] = RaceMath.Clamp(ss[i] / Math.Max(egoSpeed, 6f), 0f, 5f);
+            {
+                float t = i < arrivalList.Count
+                    ? arrivalList[i]
+                    : ss[i] / Math.Max(egoSpeed, 6f);
+                arrival[i] = RaceMath.Clamp(t, 0f, 5f);
+            }
 
             float gapStop = (profile != null ? profile.SafetyMarginM : 3f) + Math.Max(0f, egoSpeed) * 0.25f;
             float earliestStopS = float.MaxValue;
