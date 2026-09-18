@@ -47,6 +47,13 @@ namespace StreetRacing
         private const float MinWindowM = 8f;
         private const float MaxWindowM = 16f;
 
+        private Result previousRoad;
+
+        public void Reset()
+        {
+            previousRoad = null;
+        }
+
         public Result Build(RaceRoute route, float startS, float horizonM, float speedMps)
         {
             var best = new Result();
@@ -129,6 +136,7 @@ namespace StreetRacing
                 }
 
                 LocalRoadModel.Populate(r);
+                StabilizeRoadTemporally(r, previousRoad);
 
                 r.MaxKappa = MaxCurvature(r.Path);
                 r.MaxHeadingStepDeg = MaxHeadingStep(r.Path);
@@ -142,6 +150,7 @@ namespace StreetRacing
                 r.Detail = $"window={windowM:F1};rawK={r.RawMaxKappa:F3};refK={r.MaxKappa:F3};"
                     + $"headStep={r.MaxHeadingStepDeg:F0};roadClamp={r.RoadConstrainedPoints};"
                     + $"roadLR={minL:F1}/{minR:F1};roadConf={minConf:F2};pts={r.Path.Count}";
+                previousRoad = r;
                 return r;
             }
             catch (Exception ex)
@@ -149,6 +158,68 @@ namespace StreetRacing
                 r.Detail = "exc:" + ex.Message;
                 return r;
             }
+        }
+
+        private static void StabilizeRoadTemporally(Result current, Result previous)
+        {
+            if (current == null || previous == null
+                || current.Path == null || previous.Path == null
+                || previous.Path.Count == 0) return;
+            try
+            {
+                for (int i = 0; i < current.Path.Count; i++)
+                {
+                    int best = -1;
+                    float bestD = 7.0f;
+                    Vector3 cd = DirectionAt(current.Path, i);
+                    float ch = RaceMath.HeadingFromVector(cd);
+                    for (int j = 0; j < previous.Path.Count; j++)
+                    {
+                        float d = RaceMath.FlatDistance(current.Path[i], previous.Path[j]);
+                        if (d >= bestD) continue;
+                        Vector3 pd = DirectionAt(previous.Path, j);
+                        float ph = RaceMath.HeadingFromVector(pd);
+                        float axis = Math.Abs(RaceMath.HeadingDiffDeg(ch, ph));
+                        axis = Math.Min(axis, Math.Abs(180f - axis));
+                        if (axis > 30f) continue;
+                        best = j;
+                        bestD = d;
+                    }
+                    if (best < 0
+                        || i >= current.RoadConfidence.Count
+                        || best >= previous.RoadConfidence.Count
+                        || i >= current.LeftRoadM.Count
+                        || best >= previous.LeftRoadM.Count) continue;
+
+                    float nc = current.RoadConfidence[i];
+                    float pc = previous.RoadConfidence[best];
+                    float alpha = nc >= 0.72f ? 0.72f : nc >= 0.45f ? 0.48f : 0.24f;
+                    if (pc < 0.35f && nc > pc) alpha = 0.80f;
+
+                    current.LeftRoadM[i] =
+                        previous.LeftRoadM[best] * (1f - alpha) + current.LeftRoadM[i] * alpha;
+                    current.RightRoadM[i] =
+                        previous.RightRoadM[best] * (1f - alpha) + current.RightRoadM[i] * alpha;
+
+                    // Confidence itself should not spike from a weak sample.
+                    if (nc < pc)
+                        current.RoadConfidence[i] = pc * (1f - alpha) + nc * alpha;
+                }
+            }
+            catch { }
+        }
+
+        private static Vector3 DirectionAt(IList<Vector3> path, int i)
+        {
+            Vector3 d;
+            if (i <= 0)
+                d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+            else if (i >= path.Count - 1)
+                d = new Vector3(path[i].X - path[i - 1].X, path[i].Y - path[i - 1].Y, 0f);
+            else
+                d = new Vector3(path[i + 1].X - path[i - 1].X, path[i + 1].Y - path[i - 1].Y, 0f);
+            if (RaceMath.FlatLength(d) < 0.2f) return new Vector3(0f, 1f, 0f);
+            return RaceMath.FlatNormalize(d);
         }
 
         private static float Min(List<float> xs)
