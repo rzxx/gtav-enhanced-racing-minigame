@@ -121,6 +121,8 @@ namespace StreetRacing.Race
         private int lastIntentLogMs = -100000;
         private string lastStabilityMode = "";
         private int lastStabilityEventMs = -100000;
+        private int lastRoadModelEventMs = -100000;
+        private bool roadModelWasLow;
         private float lastRefRawKappa;
         private float lastRefKappa;
         private float lastRefHeadStep;
@@ -237,6 +239,8 @@ namespace StreetRacing.Race
             stallWasActive = false;
             TestFailed = false;
             TestFailureReason = "";
+            lastRoadModelEventMs = -100000;
+            roadModelWasLow = false;
             lastRefRawKappa = 0f;
             lastRefKappa = 0f;
             lastRefHeadStep = 0f;
@@ -402,6 +406,8 @@ namespace StreetRacing.Race
             stallWasActive = false;
             TestFailed = false;
             TestFailureReason = "";
+            lastRoadModelEventMs = -100000;
+            roadModelWasLow = false;
             lastRefRawKappa = 0f;
             lastRefKappa = 0f;
             lastRefHeadStep = 0f;
@@ -921,6 +927,33 @@ namespace StreetRacing.Race
             lastRefHeadStep = rr.MaxHeadingStepDeg;
             lastRefRoadClamp = rr.RoadConstrainedPoints;
             lastRefDetail = rr.Detail;
+
+            try
+            {
+                float minRoadConf = 1f;
+                int lowCount = 0;
+                int laneHint = 0;
+                string sourceHint = "?";
+                for (int i = 0; i < rr.RoadConfidence.Count; i++)
+                {
+                    float cf = rr.RoadConfidence[i];
+                    if (cf < minRoadConf) minRoadConf = cf;
+                    if (cf < 0.45f) lowCount++;
+                    if (laneHint <= 0 && i < rr.RoadLaneCount.Count) laneHint = rr.RoadLaneCount[i];
+                    if (sourceHint == "?" && i < rr.RoadSource.Count && !string.IsNullOrEmpty(rr.RoadSource[i]))
+                        sourceHint = rr.RoadSource[i];
+                }
+                bool low = minRoadConf < 0.40f || lowCount > rr.RoadConfidence.Count / 3;
+                int now = Game.GameTime;
+                if (low != roadModelWasLow || (low && now - lastRoadModelEventMs > 2000))
+                {
+                    roadModelWasLow = low;
+                    lastRoadModelEventMs = now;
+                    telemetry?.Event(now - t0, low ? "ROAD_MODEL_LOW" : "ROAD_MODEL_OK",
+                        $"minConf={minRoadConf:F2};low={lowCount}/{rr.RoadConfidence.Count};laneHint={laneHint};src={sourceHint};{rr.Detail}");
+                }
+            }
+            catch { }
 
             LocalPlannerV2.Result lp = null;
             try
