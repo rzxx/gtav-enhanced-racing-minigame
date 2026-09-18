@@ -166,6 +166,28 @@ namespace StreetRacing
                         if (a.Dist > 12f) continue;
                     }
 
+                    // Defensive self-zone guard: an actor coincident with ego
+                    // at path station s=0 cannot create a stop constraint
+                    // unless it is a real external collision threat.
+                    // Source bug was the AI's own driver at ego center
+                    // (Dist~0, RouteDist~0, clearance 0-(1.15+0.45)=-1.6m).
+                    // A false hit at s=0 gives earliestStopS=0-gapStop<0,
+                    // which via propagation (stationS>=earliestStopS for all)
+                    // zeros vObs[*] and via vTgt[0]=0 zeros target speed.
+                    // Primary fix is Perception exclusion (IsInVehicle+handle
+                    // with track purge); this guard ensures any residual
+                    // coincident track cannot zero the plan. Tight 1.2m/1.5m
+                    // radius preserves real bumper blockers (d~2m+).
+                    if (s < 2.5f && a.Dist < 1.2f)
+                    {
+                        bool routeCoincident = !a.RouteValid || Math.Abs(a.RouteDist) < 1.5f;
+                        if (routeCoincident && a.Kind != ActorKind.TrafficVehicle && a.Kind != ActorKind.Rival)
+                        {
+                            bool fastIndependent = a.ClosingSpeed > 4f && Math.Abs(a.Speed - egoSpeed) > 4f;
+                            if (!fastIndependent) continue;
+                        }
+                    }
+
                     bool conflict = false;
                     float followV = 0f;
 
@@ -223,6 +245,10 @@ namespace StreetRacing
 
             // Gap handling: a stop conflict at s_c forbids everything beyond
             // s_c - gap (must stop BEFORE the envelope, not inside it).
+            // NOTE: a false conflict at s=0 produces earliestStopS<0 and via
+            // the loop below zeros the ENTIRE maneuver (all stationS>=neg).
+            // That is why the s=0 self-zone guard above must run BEFORE any
+            // hit is recorded — fix the source, never add creep around it.
             float earliestStopS = float.MaxValue;
             for (int k = 0; k < n; k++)
             {
@@ -330,6 +356,24 @@ namespace StreetRacing
             {
                 for (int k = 0; k < n; k++)
                 {
+                    // Same self-zone guard as the conflict pass: a coincident
+                    // occupant echo at s=0 must not veto scoring via clearance.
+                    // Real bumper blockers (d~2m+) are outside the 1.2m radius
+                    // and still veto correctly.
+                    try
+                    {
+                        float sk = stationS[k];
+                        if (sk < 2.5f && a.Dist < 1.2f)
+                        {
+                            bool rc = !a.RouteValid || Math.Abs(a.RouteDist) < 1.5f;
+                            if (rc && a.Kind != ActorKind.TrafficVehicle && a.Kind != ActorKind.Rival)
+                            {
+                                bool fastInd = a.ClosingSpeed > 4f && Math.Abs(a.Speed - egoSpeed) > 4f;
+                                if (!fastInd) continue;
+                            }
+                        }
+                    }
+                    catch { }
                     Vector3 pred;
                     try { pred = perception.Predict(a, arrivalT[k]); }
                     catch { pred = a.Position; }

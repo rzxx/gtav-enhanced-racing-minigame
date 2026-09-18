@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Windows.Forms;
 using GTA;
 using GTA.Math;
+using GTA.Native;
 using GTA.UI;
 using StreetRacing.Race;
 
@@ -34,6 +35,20 @@ namespace StreetRacing
         private DriverProfile activeProfile;
 
         private RaceTelemetry telemetry;
+
+        // Route-setup invariant: prefer a usable GPS route BEFORE releasing
+        // the rival. The GPS blip route takes a frame or two to compute; Start
+        // on the same tick as ShowRoute=true almost always Build()s a
+        // FallbackWalk, then upgrades underneath the planner 1s later
+        // (progress/heading jump). Arming holds the challenge up to 1.5s for
+        // GET_GPS_BLIP_ROUTE_FOUND so Build() starts on GPS when possible.
+        private bool hasPending;
+        private Vehicle pendingOppVehicle;
+        private Ped pendingOppDriver;
+        private Vector3 pendingFinish = Vector3.Zero;
+        private int pendingSince;
+        private int pendingStyle;
+        private DriverProfile pendingProfile;
 
         public StreetRacing()
         {
@@ -74,6 +89,46 @@ namespace StreetRacing
 
         private void TickIdle()
         {
+            // --- Arming: waiting for the GPS route before releasing the rival.
+            if (hasPending)
+            {
+                try
+                {
+                    if (pendingOppVehicle == null || !pendingOppVehicle.Exists()
+                        || pendingOppDriver == null || !pendingOppDriver.Exists() || pendingOppDriver.IsDead)
+                    {
+                        CancelPending();
+                        return;
+                    }
+                    var pc0 = Game.Player.Character;
+                    if (pc0 == null || !pc0.Exists() || !pc0.IsInVehicle())
+                    {
+                        CancelPending();
+                        return;
+                    }
+                }
+                catch { CancelPending(); return; }
+                bool gpsReady = false;
+                try { gpsReady = Function.Call<bool>(Hash.GET_GPS_BLIP_ROUTE_FOUND); }
+                catch { gpsReady = false; }
+                bool timedOut = Game.GameTime - pendingSince > 1500;
+                if (gpsReady || timedOut)
+                {
+                    // Release with whatever route exists (GPS preferred); the
+                    // Brain logs src + upgrades cleanly if this was a fallback.
+                    oppVehicle = pendingOppVehicle;
+                    oppDriver = pendingOppDriver;
+                    finish = pendingFinish;
+                    activeStyle = pendingStyle;
+                    activeProfile = pendingProfile;
+                    hasPending = false;
+                    pendingOppVehicle = null;
+                    pendingOppDriver = null;
+                    StartRaceNow(timedOut && !gpsReady ? "fallback-timeout" : "gps-ready");
+                }
+                return;
+            }
+
             bool down = false;
             try
             {
@@ -104,14 +159,18 @@ namespace StreetRacing
                 return;
             }
 
-            oppVehicle = vehicle;
-            oppDriver = driver;
-            finish = spot;
+            pendingOppVehicle = vehicle;
+            pendingOppDriver = driver;
+            pendingFinish = spot;
+            pendingStyle = cfg.ResolveDrivingStyle();
+            pendingProfile = cfg.ResolveDriverProfile();
+            pendingSince = Game.GameTime;
+            hasPending = true;
 
             try
             {
                 finishBlip?.Delete();
-                finishBlip = World.CreateBlip(finish);
+                finishBlip = World.CreateBlip(pendingFinish);
                 finishBlip.Sprite = BlipSprite.Standard;
                 finishBlip.Color = BlipColor.Yellow;
                 finishBlip.IsShortRange = false;
@@ -127,17 +186,23 @@ namespace StreetRacing
                 finishCp?.Delete();
                 finishCp = World.CreateCheckpoint(
                     CheckpointIcon.CylinderCheckerboard,
-                    finish,
-                    finish + new Vector3(0f, 0f, 10f),
+                    pendingFinish,
+                    pendingFinish + new Vector3(0f, 0f, 10f),
                     cfg.FinishRadius,
                     Color.FromArgb(220, 255, 210, 0));
             }
             catch
             {
             }
+            // Do NOT Start yet: arming branch above releases once the GPS
+            // route exists (or 1.5s timeout), so Build() starts on GPS.
+        }
 
-            activeStyle = cfg.ResolveDrivingStyle();
-            activeProfile = cfg.ResolveDriverProfile();
+        private void StartRaceNow(string armReason)
+        {
+            activeStyle = pendingStyle;
+            // activeProfile already set from pending in the arming release;
+            // keep fields consistent if StartRaceNow is called directly.
             raceStartTime = Game.GameTime;
             lastHudTime = 0;
             wasLeading = true;
@@ -152,6 +217,7 @@ namespace StreetRacing
             }
             try
             {
+                try { telemetry?.Event(0, "ARM", $"{armReason}"); } catch { }
                 brain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
                     activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
                     cfg.UseDirectActuator(), cfg.DebugViz);
@@ -164,6 +230,17 @@ namespace StreetRacing
             }
             state = RaceState.Racing;
             Notification.PostTicker("Challenge accepted! First to the ~y~yellow marker~s~ wins.", false, false);
+        }
+
+        private void CancelPending()
+        {
+            hasPending = false;
+            pendingOppVehicle = null;
+            pendingOppDriver = null;
+            try { finishBlip?.Delete(); } catch { }
+            try { finishCp?.Delete(); } catch { }
+            finishBlip = null;
+            finishCp = null;
         }
 
         private void TickRacing()
@@ -283,6 +360,9 @@ namespace StreetRacing
 
         private void OnAborted(object sender, EventArgs e)
         {
+            hasPending = false;
+            pendingOppVehicle = null;
+            pendingOppDriver = null;
             try
             {
                 brain.Stop();

@@ -104,6 +104,13 @@ namespace StreetRacing.Race
         private string lastChosenLimit = "";
         private bool pendingForceReissue;
 
+        // Self-ped diagnosis: handles to correlate Ped@s=0 blockers.
+        // Observed clearance -1.6/-1.7m == 0-(1.15+0.45): zero center distance
+        // minus car+ped half-widths, i.e. the AI driver at ego center.
+        private int oppDriverHandle;
+        private int egoVehicleHandle;
+        private int lastSelfPedLogMs = -100000;
+
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
             int refreshMs, int stuckMs)
@@ -149,7 +156,17 @@ namespace StreetRacing.Race
 
             try
             {
+                oppDriverHandle = 0;
+                egoVehicleHandle = 0;
+                try { if (driver != null && driver.Exists()) oppDriverHandle = driver.Handle; } catch { }
+                try { if (vehicle != null && vehicle.Exists()) egoVehicleHandle = vehicle.Handle; } catch { }
+            }
+            catch { }
+
+            try
+            {
                 telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};prof={this.profile.Name};risk={this.profile.RiskTolerance:F2}");
+                telemetry?.Event(0, "OPP_DRIVER", $"oppDriverHandle={oppDriverHandle};egoVehHandle={egoVehicleHandle};selfPedClearExpect=-1.6m(0-(1.15+0.45))");
                 telemetry?.Event(0, "ACTUATOR", $"{actuator.ActuatorName};joint maneuver (path+speed) -> {(useDirect ? "Direct 20Hz path/speed execution" : "GtaDriver baseline servo (diagnostic only)")}");
             }
             catch { }
@@ -218,7 +235,9 @@ namespace StreetRacing.Race
                 try { playerPed = Game.Player.Character; } catch { }
                 try
                 {
-                    perception.Update(vehicle, playerVeh, playerPed, egoSpeed,
+                    // Invariant: pass the AI driver so Perception excludes it
+                    // + all ego occupants (self-ped @s=0 guard).
+                    perception.Update(vehicle, driver, playerVeh, playerPed, egoSpeed,
                         capability.UsableBrake(profile.GripFactor), reactionS, now, profile.ReactionIntervalMs,
                         route, corridor);
                 }
@@ -226,6 +245,8 @@ namespace StreetRacing.Race
             }
 
             bool doPlan = now - lastPlanMs >= profile.ReactionIntervalMs;
+            bool routeUpgradedThisTick = false;
+            string routeUpgradeLog = "";
             if (doPlan)
             {
                 lastPlanMs = now;
@@ -237,10 +258,24 @@ namespace StreetRacing.Race
                     if (!route.Source.StartsWith("Gps") && now - t0 < 12000 && now - lastGpsRetryMs > 1000)
                     {
                         lastGpsRetryMs = now;
-                        if (route.TryUpgradeToGps(egoPos))
+                        string ulog;
+                        if (route.TryUpgradeToGps(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth, out ulog))
                         {
+                            routeUpgradedThisTick = true;
+                            routeUpgradeLog = ulog ?? "";
                             try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
-                            try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;pts={route.Points.Count};len={route.TotalLength:F0}"); } catch { }
+                            // Log old/new heading/projection/lateral so a
+                            // FallbackWalk->GPS switch is auditable as
+                            // setup/route evidence, never silently absorbed.
+                            // Invalidate the old maneuver: the pre-upgrade path
+                            // was built from incomparable arclength/heading.
+                            try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;{routeUpgradeLog}"); } catch { }
+                            try
+                            {
+                                traj.LastCandidates.Clear();
+                                traj.HasChosen = false;
+                            }
+                            catch { }
                         }
                     }
                 }
@@ -434,10 +469,28 @@ namespace StreetRacing.Race
                             catch { prof = ""; }
                             det = $"id={maneuverPlanId};chIdx={ch.CandidateIndex};lat={ch.LateralM:F1};v={target:F1};lim={limiting};"
                                 + $"clear={ch.MinPredClearance:F1};constr={ch.ConstrainKind}#{ch.ConstrainHandle}@{(ch.ConstrainS >= 0 ? ch.ConstrainS.ToString("F0") : "-")};"
+                                + $"oppDrv={oppDriverHandle};egoVeh={egoVehicleHandle};"
                                 + $"meanV={ch.MeanSpeed:F1};minV={ch.MinSpeed:F1};prof={prof};score={ch.Score:F2};why={what.Trim()}";
                         }
                         catch { det = what; }
                         try { telemetry?.Event(t, "PLAN", det); } catch { }
+                        // Explicit self-ped verification: a Ped@s=0 constraint
+                        // whose handle equals the AI driver is the false
+                        // self-block (clearance -1.6m). After the Perception
+                        // + SpeedPlanner fixes this must never fire; if it
+                        // does, it is source/invariant failure, not tuning.
+                        try
+                        {
+                            var ch = traj.HasChosen ? traj.Chosen : chosen;
+                            bool isPed = !string.IsNullOrEmpty(ch.ConstrainKind)
+                                && ch.ConstrainKind.ToLowerInvariant().Contains("ped");
+                            if (isPed && ch.ConstrainS >= 0f && ch.ConstrainS < 3f
+                                && ch.ConstrainHandle != -1 && ch.ConstrainHandle == oppDriverHandle)
+                            {
+                                try { telemetry?.Event(t, "SELF_PED", $"constrPed@{ch.ConstrainS:F0}==oppDriver#{oppDriverHandle};clear={ch.MinPredClearance:F1};SELF-BLOCK-SOURCE-FAIL"); } catch { }
+                            }
+                        }
+                        catch { }
                     }
                     lastPlanLogId = maneuverPlanId;
                     if (traj.HasChosen) lastChosenLat = traj.Chosen.LateralM;
@@ -446,8 +499,37 @@ namespace StreetRacing.Race
                 }
                 catch { }
 
+                // Self-ped invariant check EVERY plan tick (not only on change):
+                // a persistent Ped@s=0==oppDriver block would otherwise hide
+                // behind "no change" once zeroed. Classification: planner vs
+                // setup/route vs controller comes from PLAN vs prog/headErr
+                // vs PATH_ERR — this event pins the source to self.
+                try
+                {
+                    if (traj.HasChosen)
+                    {
+                        var ch = traj.Chosen;
+                        bool isPed = !string.IsNullOrEmpty(ch.ConstrainKind)
+                            && ch.ConstrainKind.ToLowerInvariant().Contains("ped");
+                        if (isPed && ch.ConstrainS >= 0f && ch.ConstrainS < 3f
+                            && ch.ConstrainHandle != -1 && ch.ConstrainHandle == oppDriverHandle
+                            && now - lastSelfPedLogMs > 4000)
+                        {
+                            lastSelfPedLogMs = now;
+                            // Reuse path-err throttle to avoid event spam; the
+                            // PLAN-embedded SELF_PED above fires on change.
+                            try { telemetry?.Event(t, "SELF_PED", $"persist constrPed@{ch.ConstrainS:F0}==oppDriver#{oppDriverHandle};clear={ch.MinPredClearance:F1}"); } catch { }
+                        }
+                    }
+                }
+                catch { }
+
                 // --- Hand the FULL maneuver through the seam (not an aim).
-                bool forceReissue = tactics.ChangedThisTick || recoveredTarget;
+                // A GPS upgrade invalidates the old maneuver (incomparable
+                // arclength/heading): force reissue so Direct drops the stale
+                // path the same tick. Never fall back to GTA on >90 deg
+                // heading errors — those are route/setup evidence first.
+                bool forceReissue = tactics.ChangedThisTick || recoveredTarget || routeUpgradedThisTick;
                 if (lastLoggedTactic != tactics.Mode) forceReissue = true;
                 if (route.IsLost != lastLoggedLost) forceReissue = true;
                 pendingForceReissue = forceReissue;

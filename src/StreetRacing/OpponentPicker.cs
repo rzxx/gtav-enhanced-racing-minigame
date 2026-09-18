@@ -28,6 +28,9 @@ namespace StreetRacing
             var origin = playerVeh.Position;
             var fwd = playerVeh.ForwardVector;
             var camDir = GameplayCamera.Direction;
+            Vector3 playerFwdFlat;
+            try { playerFwdFlat = RaceMath.FlatNormalize(new Vector3(fwd.X, fwd.Y, 0f)); }
+            catch { playerFwdFlat = new Vector3(0f, 1f, 0f); }
 
             Vehicle best = null;
             float bestScore = float.NegativeInfinity;
@@ -50,6 +53,18 @@ namespace StreetRacing
                 {
                     continue;
                 }
+                // Invariant: only same-direction targets. Oncoming/opposite
+                // forces >90 deg heading errors and head-on routing — reject.
+                // Stopped cars still carry heading, so ForwardVector gates even
+                // at zero speed. Threshold cos(60 deg)=0.5 allows lane/curve
+                // variance but rejects cross (dot~0) and oncoming (dot<0).
+                try
+                {
+                    var tvFwd = RaceMath.FlatNormalize(new Vector3(v.ForwardVector.X, v.ForwardVector.Y, 0f));
+                    float dot = RaceMath.FlatDot(tvFwd, playerFwdFlat);
+                    if (dot < 0.5f) continue;
+                }
+                catch { }
                 var toN = Vector3.Normalize(to);
 
                 float ahead = Vector3.Dot(fwd, toN);

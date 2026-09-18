@@ -121,11 +121,40 @@ namespace StreetRacing
         /// Called by RaceBrain during the first seconds if Build() fell back
         /// before the GPS route existed (blip route takes a frame or two to
         /// compute). Returns true when an upgrade happened.
+        /// Invariant: switching FallbackWalk-&gt;GPS must NOT redefine
+        /// progress/heading underneath the planner. The old code reset
+        /// AlongS=0/NearestIndex=0 without reprojecting, so the next plan
+        /// built from s=0 (route behind ego) with a flipped heading
+        /// (&gt;90 deg error) while the actuator still held the old maneuver.
+        /// This version reprojects ego cleanly onto the NEW polyline (full
+        /// search), resets the high-water mark to the new projection, clears
+        /// circling/lost state, and returns an old/new diagnostic string the
+        /// caller must log + use to invalidate the old maneuver (force replan
+        /// + actuator reissue same tick). Prefer GPS before Start (see
+        /// StreetRacing arming); this is the safe fallback when it arrives late.
         public bool TryUpgradeToGps(Vector3 egoPos)
         {
+            string dummy;
+            return TryUpgradeToGps(egoPos, 0f, 0f, Game.GameTime, 7f, out dummy);
+        }
+
+        public bool TryUpgradeToGps(Vector3 egoPos, float egoHeadingDeg, float egoSpeed,
+            int nowMs, float corridorHalfWidth, out string upgradeLog)
+        {
+            upgradeLog = "";
             try
             {
                 if (Built && Source.StartsWith("Gps")) return false;
+                // Snapshot old tracking for the upgrade log (setup-failure evidence).
+                float oldS = AlongS;
+                float oldMax = MaxS;
+                float oldLat = Lateral;
+                float oldHeadErr = HeadingErrorDeg;
+                float oldHead = 0f;
+                string oldSrc = Source ?? "?";
+                int oldPts = Points.Count;
+                float oldLen = TotalLength;
+                try { oldHead = HeadingAtS(oldS); } catch { }
                 List<Vector3> gps;
                 string how;
                 // Use current ego pos as origin hint for validation, but keep
@@ -134,18 +163,84 @@ namespace StreetRacing
                 if (!TryBuildFromGps(Points.Count > 0 ? Points[0] : egoPos, finish, out gps, out how))
                     return false;
                 if (gps == null || gps.Count < 2) return false;
-                // Preserve progress: find nearest index on the new polyline.
                 Points.Clear();
                 foreach (var p in gps) Points.Add(p);
                 Source = how;
                 GpsSamples = gps.Count;
                 FinalizeGeometry();
-                // Re-anchor tracking to current position.
-                NearestIndex = 0;
-                AlongS = 0f;
-                MaxS = 0f;
+                // Clean reproject onto the NEW geometry (full search, not the
+                // windowed Update): ego never jumps to s=0.
+                try
+                {
+                    int bestSeg = -1;
+                    float bestDist = float.MaxValue;
+                    RaceMath.Projection bestPr = new RaceMath.Projection();
+                    Vector3 bestDir = new Vector3(0f, 1f, 0f);
+                    var egoFwd = RaceMath.VectorFromHeading(egoHeadingDeg);
+                    for (int pass = 0; pass < 2; pass++)
+                    {
+                        for (int i = 0; i < Points.Count - 1; i++)
+                        {
+                            var a = Points[i];
+                            var b = Points[i + 1];
+                            var segDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                            if (pass == 0 && RaceMath.FlatDot(segDir, egoFwd) < -0.1f) continue;
+                            var pr = RaceMath.ProjectOnSegment(egoPos, a, b);
+                            if (pr.Dist < bestDist)
+                            {
+                                bestDist = pr.Dist;
+                                bestSeg = i;
+                                bestPr = pr;
+                                bestDir = segDir;
+                            }
+                        }
+                        if (bestSeg >= 0 && bestDist < 60f) break;
+                        if (pass == 0) { bestSeg = -1; bestDist = float.MaxValue; }
+                    }
+                    if (bestSeg >= 0)
+                    {
+                        NearestIndex = bestSeg;
+                        AlongS = CumulativeS[bestSeg] + bestPr.Along;
+                        DistToRoute = bestPr.Dist;
+                        Lateral = RaceMath.FlatCross(bestDir, new Vector3(egoPos.X - bestPr.Closest.X, egoPos.Y - bestPr.Closest.Y, 0f));
+                        float newHead = RaceMath.HeadingFromVector(bestDir);
+                        HeadingErrorDeg = RaceMath.HeadingDiffDeg(newHead, egoHeadingDeg);
+                    }
+                    else
+                    {
+                        NearestIndex = 0;
+                        AlongS = 0f;
+                        DistToRoute = 999f;
+                        Lateral = 0f;
+                        HeadingErrorDeg = 0f;
+                    }
+                }
+                catch
+                {
+                    NearestIndex = 0;
+                    AlongS = 0f;
+                }
+                // New geometry has incomparable arclength: reset high-water to
+                // the fresh projection so WentBackwards/NoProgress cannot trip
+                // on old-route mileage. Clear circling + lost (re-evaluated).
+                MaxS = AlongS;
+                LastProgressMs = nowMs;
+                FinishGapEuclid = RaceMath.FlatDistance(egoPos, finish);
                 hasLastHeading = false;
                 circleAccumDeg = 0f;
+                IsLost = false;
+                LossReason = "";
+                float newHeadAt = 0f;
+                try { newHeadAt = HeadingAtS(AlongS); } catch { }
+                float progJump = AlongS - oldS;
+                float headJump = RaceMath.HeadingDiffDeg(newHeadAt, oldHead);
+                try
+                {
+                    upgradeLog = $"old={oldSrc};oldPts={oldPts};oldLen={oldLen:F0};oldS={oldS:F0};oldMax={oldMax:F0};oldLat={oldLat:F1};oldHeadErr={oldHeadErr:F0};oldHead={oldHead:F0};"
+                        + $"new={Source};newPts={Points.Count};newLen={TotalLength:F0};newS={AlongS:F0};newLat={Lateral:F1};newHeadErr={HeadingErrorDeg:F0};newHead={newHeadAt:F0};"
+                        + $"dS={progJump:F0};dHead={headJump:F0};dist={DistToRoute:F1};egoSpd={egoSpeed:F1}";
+                }
+                catch { upgradeLog = $"old={oldSrc};new={Source}"; }
                 return true;
             }
             catch { return false; }

@@ -108,10 +108,29 @@ namespace StreetRacing
         public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
             float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs = 100)
         {
-            Update(ego, rivalVehicle, rivalPed, egoSpeed, brakeCap, reactionTimeS, nowMs, minIntervalMs, null, null);
+            Update(ego, null, rivalVehicle, rivalPed, egoSpeed, brakeCap, reactionTimeS, nowMs, minIntervalMs, null, null);
         }
 
         public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
+            float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs,
+            RaceRoute route, RoadCorridor corridor)
+        {
+            Update(ego, null, rivalVehicle, rivalPed, egoSpeed, brakeCap, reactionTimeS, nowMs, minIntervalMs, route, corridor);
+        }
+
+        /// <summary>
+        /// Invariant: the AI vehicle's own driver and all occupants of the ego
+        /// vehicle are NEVER perception actors.
+        /// The driver sits at the ego center (Dist~0, RouteDist~0) so its
+        /// Euclidean clearance is 0-(1.15+0.45)=-1.6m. Without exclusion it
+        /// creates a false Ped@s=0 stop conflict; earliestStopS=0-gapStop&lt;0
+        /// then propagates vObs[*]=0 and zeros the entire maneuver.
+        /// Primary fix is here (handle + IsInVehicle exclusion with persistent
+        /// track purge); SpeedPlanner has a defensive self-zone guard as backup.
+        /// Pass egoDriver (the AI driver ped) explicitly; seated occupants are
+        /// also skipped via IsInVehicle so vehicle+ped duplicates never form.
+        /// </summary>
+        public void Update(Vehicle ego, Ped egoDriver, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
             float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs,
             RaceRoute route, RoadCorridor corridor)
         {
@@ -152,13 +171,76 @@ namespace StreetRacing
             }
             catch { }
 
+            // --- Ego-occupant exclusion set (invariant: never perceive self).
+            // The AI driver sits at ego center; any stale/coasted track with
+            // its handle would otherwise appear as Ped@s=0 with clearance
+            // -(carHalf+pedHalf) ~= -1.6m. Collect handles explicitly and purge
+            // persistent tracks so one culled frame cannot resurrect self.
+            var egoExclude = new System.Collections.Generic.HashSet<int>();
+            try
+            {
+                if (egoDriver != null && egoDriver.Exists())
+                {
+                    int hd = SafeHandle(egoDriver);
+                    if (hd != 0) egoExclude.Add(hd);
+                }
+            }
+            catch { }
+            try
+            {
+                if (ego != null && ego.Exists())
+                {
+                    try
+                    {
+                        var ed = ego.Driver;
+                        if (ed != null && ed.Exists())
+                        {
+                            int hd = SafeHandle(ed);
+                            if (hd != 0) egoExclude.Add(hd);
+                        }
+                    }
+                    catch { }
+                    try
+                    {
+                        var occs = ego.Occupants;
+                        if (occs != null)
+                        {
+                            foreach (var o in occs)
+                            {
+                                try
+                                {
+                                    if (o != null && o.Exists())
+                                    {
+                                        int ho = SafeHandle(o);
+                                        if (ho != 0) egoExclude.Add(ho);
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            try
+            {
+                foreach (int eh in egoExclude)
+                    tracks.Remove(eh);
+            }
+            catch { }
+
             // --- Gather fresh observations (handle-keyed).
             var observed = new Dictionary<int, Observation>();
+            int egoHandle = 0;
+            try { if (ego != null && ego.Exists()) egoHandle = SafeHandle(ego); } catch { }
             try
             {
                 foreach (var v in World.GetNearbyVehicles(egoPos, RangeM))
                 {
                     if (v == null || !v.Exists() || v == ego) continue;
+                    int hv = SafeHandle(v);
+                    if (hv != 0 && hv == egoHandle) continue;
                     int h = SafeHandle(v);
                     if (h == 0) h = FallbackKey(v.Position);
                     if (observed.ContainsKey(h)) continue;
@@ -239,6 +321,29 @@ namespace StreetRacing
                     try
                     {
                         if (rivalPed != null && rivalPed.Exists() && p.Handle == rivalPed.Handle) continue;
+                    }
+                    catch { }
+                    // Invariant: AI's own driver + all ego occupants are never actors.
+                    // Explicit handle check first (covers API gaps / stale handles).
+                    try
+                    {
+                        int ph = SafeHandle(p);
+                        if (ph != 0 && egoExclude.Contains(ph)) continue;
+                    }
+                    catch { }
+                    // Any ped seated in a vehicle is represented by its vehicle.
+                    // This is the primary self-ped guard (driver at ego center)
+                    // and also prevents traffic vehicle+driver duplicates.
+                    try
+                    {
+                        if (p.IsInVehicle()) continue;
+                    }
+                    catch { }
+                    // Belt-and-braces: ped reporting ego as its current vehicle.
+                    try
+                    {
+                        var cv = p.CurrentVehicle;
+                        if (cv != null && cv.Exists() && ego != null && ego.Exists() && cv == ego) continue;
                     }
                     catch { }
                     int h = SafeHandle(p);
