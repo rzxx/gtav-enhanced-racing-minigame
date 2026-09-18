@@ -231,8 +231,21 @@ namespace StreetRacing.Control
 
         public bool Valid()
         {
-            return driver != null && driver.Exists() && !driver.IsDead
-                && vehicle != null && vehicle.Exists() && !vehicle.IsDead;
+            try
+            {
+                if (driver == null || !driver.Exists() || driver.IsDead) return false;
+                if (vehicle == null || !vehicle.Exists() || vehicle.IsDead) return false;
+
+                // Direct control is only valid while THIS ped is physically
+                // occupying THIS vehicle's driver seat. A damaged DriveV car
+                // can make its NPC bail out while the vehicle entity remains
+                // alive; without this invariant our memory writes keep driving
+                // the empty car like a ghost.
+                var vd = vehicle.Driver;
+                if (vd == null || !vd.Exists() || vd.Handle != driver.Handle) return false;
+                return true;
+            }
+            catch { return false; }
         }
 
         public void Stop()
