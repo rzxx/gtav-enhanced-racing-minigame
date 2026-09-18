@@ -20,6 +20,15 @@ namespace StreetRacing
         public int CooldownMs = 8000;
         public int HonkDebounceMs = 1500;
         public Keys CancelKey = Keys.G;
+        // New architecture: driver skill/personality as planner parameters.
+        // Profile presets: Cautious | Balanced | Aggressive.
+        public string DriverProfileName = "Balanced";
+        // Risk override: -1 = use preset, else 0..1 (0 cautious, 1 psycho).
+        public float RiskTolerance = -1f;
+        // Planner overrides: 0 = use preset.
+        public float LookaheadTimeS = 0f;
+        public float SafetyMarginM = 0f;
+        public float GripFactor = 0f;
 
         public static StreetRacingConfig Load()
         {
@@ -40,6 +49,11 @@ namespace StreetRacing
                 c.RaceTimeoutMs = s.GetValue("Race", "RaceTimeoutMs", c.RaceTimeoutMs);
                 c.CooldownMs = s.GetValue("Race", "CooldownMs", c.CooldownMs);
                 c.HonkDebounceMs = s.GetValue("Race", "HonkDebounceMs", c.HonkDebounceMs);
+                c.DriverProfileName = s.GetValue("Race", "DriverProfile", c.DriverProfileName);
+                c.RiskTolerance = (float)s.GetValue("Race", "RiskTolerance", (double)c.RiskTolerance);
+                c.LookaheadTimeS = (float)s.GetValue("Race", "LookaheadTimeS", (double)c.LookaheadTimeS);
+                c.SafetyMarginM = (float)s.GetValue("Race", "SafetyMarginM", (double)c.SafetyMarginM);
+                c.GripFactor = (float)s.GetValue("Race", "GripFactor", (double)c.GripFactor);
                 var keyName = s.GetValue("Race", "CancelKey", "G");
                 if (Enum.TryParse(keyName, true, out Keys k))
                 {
@@ -58,6 +72,8 @@ namespace StreetRacing
         }
 
         /// Resolves the driving style int from preset name or raw override.
+        /// The style is the low-level actuator mode only; race intelligence
+        /// lives in the planner (trajectory + speed), not in these flags.
         /// Flag math (from SHVDN VehicleDrivingFlags):
         ///   Calm        786475     = stop for vehicles/peds, ignore lights (polite baseline)
         ///   Rushed      1074528293 = SHVDN DrivingStyle.Rushed (still stops for vehicles!)
@@ -79,6 +95,18 @@ namespace StreetRacing
                 case "disciplined": return 1074266152;
                 default: return 1074528292;
             }
+        }
+
+        public DriverProfile ResolveDriverProfile()
+        {
+            var p = DriverProfile.FromName(DriverProfileName, RiskTolerance);
+            if (LookaheadTimeS > 0.5f && LookaheadTimeS < 8f)
+                p.LookaheadTimeS = LookaheadTimeS;
+            if (SafetyMarginM > 0f && SafetyMarginM < 30f)
+                p.SafetyMarginM = SafetyMarginM;
+            if (GripFactor > 0.4f && GripFactor <= 1.05f)
+                p.GripFactor = GripFactor;
+            return p;
         }
     }
 }

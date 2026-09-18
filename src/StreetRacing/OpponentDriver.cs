@@ -4,9 +4,11 @@ using GTA.Native;
 
 namespace StreetRacing
 {
-    /// Owns the opponent AI: issues a rushed long-range drive task and keeps
-    /// speed/style hot without repathing (repath = brake + replan stutter).
-    /// Full DriveTo reissue happens only when actually stuck.
+    /// LEGACY actuator (long-range DriveTo to the finish). Replaced by
+    /// Control.GtaDriverActuator, which servo-tracks the planner's
+    /// short-horizon aim point on the correct carriageway. Kept compiling
+    /// for reference; RaceBrain no longer uses this class.
+    [System.Obsolete("Use Control.GtaDriverActuator via Race.RaceBrain.")]
     internal sealed class OpponentDriver
     {
         private Ped driver;

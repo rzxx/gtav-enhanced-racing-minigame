@@ -4,9 +4,11 @@ using System.IO;
 
 namespace StreetRacing
 {
-    /// Per-race CSV telemetry: samples at 10 Hz + discrete events.
-    /// Files land in scripts\StreetRacing_race_<id>.csv (+ _events.csv).
-    /// Floats are invariant-culture; event details use integers only (no separators).
+    /// LEGACY per-race CSV telemetry (10 Hz samples + events) for the v1 AI.
+    /// Schema logged the invalid `offroad_m` street-node distance — do not use
+    /// for new work. Replaced by Telemetry.RaceTelemetry (route / corridor /
+    /// trajectory / TTC / tactic / controller / impact classification).
+    [System.Obsolete("Use Telemetry.RaceTelemetry.")]
     internal sealed class Telemetry
     {
         private readonly StreamWriter samples;

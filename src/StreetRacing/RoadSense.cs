@@ -4,9 +4,11 @@ using GTA.Math;
 
 namespace StreetRacing
 {
-    /// Road context around the rival, sampled at ~2 Hz for telemetry and
-    /// (later) for context-dependent recklessness.
-    /// Uses only street-snap positions, so no heading-unit pitfalls.
+    /// RETIRED: road context probe used only for old telemetry detectors.
+    /// `OffRoad` measured distance to a *future* street node (GetNextPositionOnStreet
+    /// with heading bias), not lateral road departure, so nothing may be built on it.
+    /// Replaced by RoadCorridor (usable width + OffCorridor) and RaceRoute progress.
+    [System.Obsolete("Use RoadCorridor.OffCorridor + RaceRoute; this metric is invalid.")]
     internal struct RoadSense
     {
         public float OffRoad;   // m from rival to nearest street point

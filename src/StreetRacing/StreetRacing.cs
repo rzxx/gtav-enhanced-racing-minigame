@@ -3,16 +3,20 @@ using System.Drawing;
 using System.Windows.Forms;
 using GTA;
 using GTA.Math;
-using GTA.Native;
 using GTA.UI;
+using StreetRacing.Race;
 
 namespace StreetRacing
 {
+    /// Race lifecycle (challenge -> racing -> cooldown). Driving intelligence
+    /// lives in RaceBrain (route -> corridor -> perception -> tactics ->
+    /// trajectory -> speed -> actuator); this class only owns the trigger,
+    /// finish marker, win/lose checks and HUD.
     public class StreetRacing : Script
     {
         private readonly StreetRacingConfig cfg;
         private RaceState state = RaceState.Idle;
-        private readonly OpponentDriver ai = new OpponentDriver();
+        private readonly RaceBrain brain = new RaceBrain();
 
         private Vehicle oppVehicle;
         private Ped oppDriver;
@@ -27,20 +31,9 @@ namespace StreetRacing
         private bool hornWasDown;
         private bool wasLeading;
         private int activeStyle;
+        private DriverProfile activeProfile;
 
-        private Telemetry telemetry;
-        private int lastSenseTime;
-        private int lastSampleTime;
-        private RoadSense sense;
-        private bool offroadIn;
-        private int offroadEnterT;
-        private int wrongwaySince;
-        private bool wrongwayIn;
-        private int underSince;
-        private float lastSpeedB;
-        private int lastSpeedT;
-        private int lastBrakeEvent;
-        private float lastHealth;
+        private RaceTelemetry telemetry;
 
         public StreetRacing()
         {
@@ -143,30 +136,30 @@ namespace StreetRacing
             {
             }
 
-            ai.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, cfg.ResolveDrivingStyle(), cfg.RefreshIntervalMs, cfg.StuckTimeoutMs);
+            activeStyle = cfg.ResolveDrivingStyle();
+            activeProfile = cfg.ResolveDriverProfile();
             raceStartTime = Game.GameTime;
             lastHudTime = 0;
             wasLeading = true;
-            activeStyle = cfg.ResolveDrivingStyle();
-            lastSenseTime = 0;
-            lastSampleTime = 0;
-            sense = new RoadSense();
-            offroadIn = false;
-            wrongwaySince = 0;
-            wrongwayIn = false;
-            underSince = 0;
-            lastSpeedB = oppVehicle.Speed;
-            lastSpeedT = raceStartTime;
-            lastBrakeEvent = 0;
-            lastHealth = oppVehicle.Health;
             try
             {
                 telemetry?.Close();
-                telemetry = cfg.TelemetryEnabled ? new Telemetry(raceStartTime, activeStyle) : null;
+                telemetry = cfg.TelemetryEnabled ? new RaceTelemetry(raceStartTime, activeStyle, activeProfile.Name) : null;
             }
             catch
             {
                 telemetry = null;
+            }
+            try
+            {
+                brain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
+                    activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs);
+            }
+            catch (Exception ex)
+            {
+                try { telemetry?.Event(0, "BRAIN_START_FAIL", ex.Message); } catch { }
+                EndRace("Rival failed to start. Race over.");
+                return;
             }
             state = RaceState.Racing;
             Notification.PostTicker("Challenge accepted! First to the ~y~yellow marker~s~ wins.", false, false);
@@ -180,7 +173,7 @@ namespace StreetRacing
                 EndRace("You died. Race over.");
                 return;
             }
-            if (!ai.Valid())
+            if (!brain.Valid())
             {
                 EndRace("Rival is out (wrecked / gone). Race over.");
                 return;
@@ -191,33 +184,19 @@ namespace StreetRacing
                 return;
             }
 
-            ai.OnTick();
+            try
+            {
+                brain.OnTick();
+            }
+            catch
+            {
+                // One bad planning tick must not kill the race; the actuator
+                // keeps executing its last plan.
+            }
 
             var youAt = player.IsInVehicle() ? player.CurrentVehicle.Position : player.Position;
             float dYou = FinishPicker.FlatDistance(youAt, finish);
             float dOpp = FinishPicker.FlatDistance(oppVehicle.Position, finish);
-
-            int now = Game.GameTime;
-            if (now - lastSenseTime >= 500)
-            {
-                lastSenseTime = now;
-                try
-                {
-                    sense = RoadSense.Sample(oppVehicle);
-                }
-                catch
-                {
-                }
-            }
-            if (telemetry != null && now - lastSampleTime >= 100)
-            {
-                lastSampleTime = now;
-                float rSpeed = oppVehicle.Speed;
-                float ySpeed = player.IsInVehicle() ? player.CurrentVehicle.Speed : 0f;
-                telemetry.Sample(now - raceStartTime, activeStyle, rSpeed, ySpeed,
-                    dOpp, dYou, sense.OffRoad, sense.AlignDeg, sense.Traffic, sense.Frontal, cfg.AiCruiseSpeed);
-                Detect(now - raceStartTime, rSpeed);
-            }
 
             if (dYou < cfg.FinishRadius || dOpp < cfg.FinishRadius)
             {
@@ -243,12 +222,21 @@ namespace StreetRacing
                 {
                 }
                 bool leading = dYou <= dOpp;
-                string msg = leading
-                    ? $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~g~you lead"
-                    : $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~r~rival leads";
                 if (leading != wasLeading)
                 {
                     wasLeading = leading;
+                }
+                string lead = leading ? "~g~you lead" : "~r~rival leads";
+                string msg;
+                try
+                {
+                    msg = $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  {lead} ~s~[{brain.TacticalName} {brain.TargetSpeed:F0}]";
+                }
+                catch
+                {
+                    msg = leading
+                        ? $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~g~you lead"
+                        : $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~r~rival leads";
                 }
                 try
                 {
@@ -260,90 +248,11 @@ namespace StreetRacing
             }
         }
 
-        private void Detect(int t, float rSpeed)
-        {
-            // Off-road episodes with hysteresis (7 m enter, 4 m exit).
-            if (!offroadIn && sense.OffRoad > 7f)
-            {
-                offroadIn = true;
-                offroadEnterT = t;
-                telemetry.Event(t, "OFFROAD_ENTER", $"speed={rSpeed:F0}");
-            }
-            else if (offroadIn && sense.OffRoad < 4f)
-            {
-                offroadIn = false;
-                telemetry.Event(t, "OFFROAD_EXIT", $"dur={(t - offroadEnterT) / 1000}");
-            }
-
-            // Wrong-way: facing >100 deg off the road direction, sustained 2 s.
-            if (sense.AlignDeg > 100f && rSpeed > 8f)
-            {
-                if (wrongwaySince == 0)
-                {
-                    wrongwaySince = t;
-                }
-                else if (!wrongwayIn && t - wrongwaySince > 2000)
-                {
-                    wrongwayIn = true;
-                    telemetry.Event(t, "WRONGWAY_ENTER", $"align={sense.AlignDeg:F0}");
-                }
-            }
-            else
-            {
-                if (wrongwayIn)
-                {
-                    telemetry.Event(t, "WRONGWAY_EXIT", $"dur={(t - wrongwaySince) / 1000}");
-                }
-                wrongwayIn = false;
-                wrongwaySince = 0;
-            }
-
-            // Under-drive: on road, 60 m+ clear ahead, but under 45% of cruise.
-            if (sense.OffRoad < 5f && sense.Frontal > 60f && rSpeed < cfg.AiCruiseSpeed * 0.45f)
-            {
-                if (underSince == 0)
-                {
-                    underSince = t;
-                }
-                else if (t - underSince > 3000)
-                {
-                    underSince = t; // re-fire every 3 s while it persists
-                    telemetry.Event(t, "UNDERDRIVE", $"speed={rSpeed:F0};frontal={sense.Frontal:F0}");
-                }
-            }
-            else
-            {
-                underSince = 0;
-            }
-
-            // Panic braking: decel worse than -7 m/s^2.
-            int dt = t - lastSpeedT;
-            if (dt >= 100)
-            {
-                float accel = (rSpeed - lastSpeedB) / (dt / 1000f);
-                if (accel < -7f && t - lastBrakeEvent > 3000)
-                {
-                    lastBrakeEvent = t;
-                    telemetry.Event(t, "HARD_BRAKE", $"speed={rSpeed:F0};dec={accel:F0}");
-                }
-                lastSpeedB = rSpeed;
-                lastSpeedT = t;
-            }
-
-            // Crash: health drop over one sample.
-            float h = oppVehicle.Health;
-            if (lastHealth - h > 8f)
-            {
-                telemetry.Event(t, "CRASH", $"dmg={lastHealth - h:F0};speed={rSpeed:F0};offroad={sense.OffRoad:F0}");
-            }
-            lastHealth = h;
-        }
-
         private void EndRace(string message)
         {
             try
             {
-                ai.Stop();
+                brain.Stop();
             }
             catch
             {
@@ -375,7 +284,7 @@ namespace StreetRacing
         {
             try
             {
-                ai.Stop();
+                brain.Stop();
             }
             catch
             {
