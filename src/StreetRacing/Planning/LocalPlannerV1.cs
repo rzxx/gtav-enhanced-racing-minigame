@@ -148,19 +148,38 @@ namespace StreetRacing
                 if (string.IsNullOrEmpty(cc.RejectReason))
                 {
                     // While committed, only abandon for a materially safer/faster
-                    // option. Small score jitter must never make us weave.
+                    // option. Never jump directly from one side of the road to
+                    // the other: unwind through center first.
                     var challenger = LastCandidates[bestIndex];
                     bool committedUnsafe = cc.MinPredClearance < -0.25f || cc.MinSpeed < 1.0f;
-                    bool challengerDecisive = challenger.Score > cc.Score + 9f
+                    bool oppositeSide = Math.Abs(challenger.LateralM) > 0.35f
+                        && Math.Sign(challenger.LateralM) != Math.Sign(committedLat);
+                    bool challengerDecisive = !oppositeSide
+                        && challenger.Score > cc.Score + 9f
                         && challenger.MinPredClearance > cc.MinPredClearance + 0.7f;
-                    if (!committedUnsafe && !challengerDecisive)
+
+                    if (committedUnsafe && centerIndex >= 0 && string.IsNullOrEmpty(center.RejectReason))
+                    {
+                        bestIndex = centerIndex;
+                        committedLat = 0f;
+                        committedShape = "";
+                        committedIntent = "Return";
+                        commitUntilMs = nowMs + 700;
+                    }
+                    else if (!committedUnsafe && !challengerDecisive)
+                    {
                         bestIndex = committedIndex;
+                    }
                 }
                 else if (centerIndex >= 0 && string.IsNullOrEmpty(center.RejectReason))
                 {
                     // Road narrowed / committed corridor disappeared: unwind
                     // through center instead of snapping across to the other side.
                     bestIndex = centerIndex;
+                    committedLat = 0f;
+                    committedShape = "";
+                    committedIntent = "Return";
+                    commitUntilMs = nowMs + 700;
                 }
             }
 
