@@ -877,6 +877,22 @@ namespace StreetRacing
                 // keeps executing its last plan.
             }
 
+            // Simple is currently an engineering benchmark. Once its own
+            // localization/reference contract fails, end the run instead of
+            // spending minutes watching the direct controller brute-force a
+            // wall with a meaningless target. Recovery is tested separately.
+            try
+            {
+                if (cfg.UseSimpleDriver() && simpleBrain.TestFailed)
+                {
+                    string why = simpleBrain.TestFailureReason ?? "driver-reference-failed";
+                    try { telemetry?.Event(Game.GameTime - raceStartTime, "TEST_ABORT", why); } catch { }
+                    EndRace("AI test stopped: " + why);
+                    return;
+                }
+            }
+            catch { }
+
             var youAt = player.IsInVehicle() ? player.CurrentVehicle.Position : player.Position;
             float dYou = FinishPicker.FlatDistance(youAt, finish);
             float dOpp = FinishPicker.FlatDistance(oppVehicle.Position, finish);
