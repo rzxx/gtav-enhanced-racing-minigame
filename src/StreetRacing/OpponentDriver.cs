@@ -4,32 +4,32 @@ using GTA.Native;
 
 namespace StreetRacing
 {
-    /// Owns the opponent AI: issues a rushed long-range drive task,
-    /// re-paths on an interval and when stuck.
+    /// Owns the opponent AI: issues a rushed long-range drive task and keeps
+    /// speed/style hot without repathing (repath = brake + replan stutter).
+    /// Full DriveTo reissue happens only when actually stuck.
     internal sealed class OpponentDriver
     {
-        // Rushed + ignore lights + aggressive overtake (public driving-style guides).
-        private const int RushedStyle = 1074528293;
-
         private Ped driver;
         private Vehicle vehicle;
         private Vector3 target;
         private float cruiseSpeed;
-        private int retaskMs;
+        private int drivingStyle;
+        private int refreshMs;
         private int stuckMs;
 
         private Vector3 lastPos = Vector3.Zero;
         private int lastMoveTime;
-        private int lastTaskTime;
+        private int lastRefreshTime;
         public bool Running { get; private set; }
 
-        public void Start(Ped driver, Vehicle vehicle, Vector3 target, float cruiseSpeed, int retaskMs, int stuckMs)
+        public void Start(Ped driver, Vehicle vehicle, Vector3 target, float cruiseSpeed, int drivingStyle, int refreshMs, int stuckMs)
         {
             this.driver = driver;
             this.vehicle = vehicle;
             this.target = target;
             this.cruiseSpeed = cruiseSpeed;
-            this.retaskMs = retaskMs;
+            this.drivingStyle = drivingStyle;
+            this.refreshMs = refreshMs;
             this.stuckMs = stuckMs;
 
             driver.IsPersistent = true;
@@ -40,6 +40,7 @@ namespace StreetRacing
             Function.Call(Hash.SET_PED_KEEP_TASK, driver, true);
             Function.Call(Hash.SET_DRIVER_ABILITY, driver, 1.0f);
             Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, driver, 1.0f);
+            Function.Call(Hash.SET_DRIVER_RACING_MODIFIER, driver, 1.0f);
 
             IssueTask();
             lastPos = vehicle.Position;
@@ -55,9 +56,11 @@ namespace StreetRacing
             }
 
             int now = Game.GameTime;
-            if (now - lastTaskTime > retaskMs)
+            if (now - lastRefreshTime > refreshMs)
             {
-                IssueTask();
+                Function.Call(Hash.SET_DRIVE_TASK_CRUISE_SPEED, driver, cruiseSpeed);
+                Function.Call(Hash.SET_DRIVE_TASK_DRIVING_STYLE, driver, drivingStyle);
+                lastRefreshTime = now;
             }
 
             // Stuck? (crawling and barely moved) -> force a fresh path.
@@ -104,8 +107,10 @@ namespace StreetRacing
 
         private void IssueTask()
         {
-            driver.Task.DriveTo(vehicle, target, 15f, (VehicleDrivingFlags)RushedStyle, cruiseSpeed);
-            lastTaskTime = Game.GameTime;
+            // NOTE: this overload is (vehicle, target, SPEED, flags, stopRadius).
+            // Passing 15 as 3rd arg caps the AI at 15 m/s — that was the v1 bug.
+            driver.Task.DriveTo(vehicle, target, cruiseSpeed, (VehicleDrivingFlags)drivingStyle, 15f);
+            lastRefreshTime = Game.GameTime;
         }
     }
 }

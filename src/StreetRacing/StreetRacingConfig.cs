@@ -11,8 +11,10 @@ namespace StreetRacing
         public int FinishRadius = 30;
         public int MaxChallengeRange = 35;
         public float AiCruiseSpeed = 47f;
+        public int RefreshIntervalMs = 2000;
         public int StuckTimeoutMs = 4000;
-        public int RetaskIntervalMs = 6000;
+        public string DrivingStyleName = "Reckless";
+        public int DrivingStyleRaw = 0;
         public int RaceTimeoutMs = 600000;
         public int CooldownMs = 8000;
         public int HonkDebounceMs = 1500;
@@ -29,8 +31,10 @@ namespace StreetRacing
                 c.FinishRadius = s.GetValue("Race", "FinishRadius", c.FinishRadius);
                 c.MaxChallengeRange = s.GetValue("Race", "MaxChallengeRange", c.MaxChallengeRange);
                 c.AiCruiseSpeed = (float)s.GetValue("Race", "AiCruiseSpeed", (double)c.AiCruiseSpeed);
+                c.RefreshIntervalMs = s.GetValue("Race", "RefreshIntervalMs", c.RefreshIntervalMs);
                 c.StuckTimeoutMs = s.GetValue("Race", "StuckTimeoutMs", c.StuckTimeoutMs);
-                c.RetaskIntervalMs = s.GetValue("Race", "RetaskIntervalMs", c.RetaskIntervalMs);
+                c.DrivingStyleName = s.GetValue("Race", "DrivingStyle", c.DrivingStyleName);
+                c.DrivingStyleRaw = s.GetValue("Race", "DrivingStyleRaw", c.DrivingStyleRaw);
                 c.RaceTimeoutMs = s.GetValue("Race", "RaceTimeoutMs", c.RaceTimeoutMs);
                 c.CooldownMs = s.GetValue("Race", "CooldownMs", c.CooldownMs);
                 c.HonkDebounceMs = s.GetValue("Race", "HonkDebounceMs", c.HonkDebounceMs);
@@ -49,6 +53,27 @@ namespace StreetRacing
                 // Missing/corrupt ini -> run on defaults.
             }
             return c;
+        }
+
+        /// Resolves the driving style int from preset name or raw override.
+        /// Flag math (from SHVDN VehicleDrivingFlags):
+        ///   Calm     786475    = stop for vehicles/peds, ignore lights (polite baseline)
+        ///   Rushed   1074528293 = SHVDN DrivingStyle.Rushed (still stops for vehicles!)
+        ///   Reckless 1074528292 = Rushed minus StopForVehicles -> swerves instead of queuing
+        ///   Psycho   1074528804 = Reckless plus AllowGoingWrongWay (oncoming-lane passes)
+        public int ResolveDrivingStyle()
+        {
+            if (DrivingStyleRaw != 0)
+            {
+                return DrivingStyleRaw;
+            }
+            switch ((DrivingStyleName ?? "").Trim().ToLowerInvariant())
+            {
+                case "calm": return 786475;
+                case "rushed": return 1074528293;
+                case "psycho": return 1074528804;
+                default: return 1074528292;
+            }
         }
     }
 }

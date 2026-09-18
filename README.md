@@ -48,9 +48,22 @@ Then in game press **Insert** to reload scripts (or restart the game).
 
 ## Tuning the AI (the fun part)
 
-- Rival too slow: raise `AiCruiseSpeed`. Too crashy: lower it, raise `RetaskIntervalMs`.
-- Driving style is `1074528293` (rushed, ignore lights, aggressive overtake) in `OpponentDriver.cs`. Normal-traffic style `786603` is there for comparison if you want a "lawful" mode later.
-- Skill-by-car, rubber-banding, and nitro are intentionally left out of MVP — see roadmap.
+Found by dumping `VehicleDrivingFlags` from SHVDN metadata + FiveM native docs:
+
+- **v1 bug (big one):** we called the wrong `DriveTo` overload — `(speed, flags, radius)`
+  instead of `(radius, speed, style)` — so the rival was capped at **15 m/s (~54 km/h)**.
+  Fixed; `AiCruiseSpeed` now actually applies.
+- **v1 style bug:** `Rushed (1074528293)` contains the `StopForVehicles` flag, so the AI
+  queued behind traffic and only passed when the road opened up. Default is now
+  `Reckless (1074528292)` = Rushed minus that flag, so it swerves/passes instead.
+- We also set `SET_DRIVER_RACING_MODIFIER 1.0` (game scripts use 0.2/0.5/1.0 for race drivers)
+  and refresh cruise speed + style per tick via `SET_DRIVE_TASK_CRUISE_SPEED` /
+  `SET_DRIVE_TASK_DRIVING_STYLE` instead of re-issuing the task (repath = brake stutter).
+- A/B test styles live via `DrivingStyle` in the ini (`Calm/Rushed/Reckless/Psycho`)
+  or any raw int via `DrivingStyleRaw`, then Insert to reload. No recompile.
+- If rivals still feel capped at high speed, the remaining suspect is
+  `vehicleaihandlinginfo.meta` (what Eddlm's Faster AI Drivers mod edits): the game caps
+  non-racing AI below a car's true top speed. Optional experiment, needs OpenIV.
 
 ## Roadmap (post-MVP ideas)
 

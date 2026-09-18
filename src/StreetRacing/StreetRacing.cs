@@ -18,6 +18,7 @@ namespace StreetRacing
         private Ped oppDriver;
         private Vector3 finish = Vector3.Zero;
         private Blip finishBlip;
+        private Checkpoint finishCp;
 
         private int raceStartTime;
         private int lastHudTime;
@@ -113,7 +114,21 @@ namespace StreetRacing
             {
             }
 
-            ai.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, cfg.RetaskIntervalMs, cfg.StuckTimeoutMs);
+            try
+            {
+                finishCp?.Delete();
+                finishCp = World.CreateCheckpoint(
+                    CheckpointIcon.CylinderCheckerboard,
+                    finish,
+                    finish + new Vector3(0f, 0f, 10f),
+                    cfg.FinishRadius,
+                    Color.FromArgb(220, 255, 210, 0));
+            }
+            catch
+            {
+            }
+
+            ai.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, cfg.ResolveDrivingStyle(), cfg.RefreshIntervalMs, cfg.StuckTimeoutMs);
             raceStartTime = Game.GameTime;
             lastHudTime = 0;
             wasLeading = true;
@@ -141,7 +156,6 @@ namespace StreetRacing
             }
 
             ai.OnTick();
-            DrawFinish();
 
             var youAt = player.IsInVehicle() ? player.CurrentVehicle.Position : player.Position;
             float dYou = FinishPicker.FlatDistance(youAt, finish);
@@ -158,6 +172,18 @@ namespace StreetRacing
             if (Game.GameTime - lastHudTime > 1000)
             {
                 lastHudTime = Game.GameTime;
+                try
+                {
+                    // The game can drop a blip route when you stray far off-path;
+                    // re-asserting rebuilds it instead of leaving you guideless.
+                    if (finishBlip != null)
+                    {
+                        finishBlip.ShowRoute = true;
+                    }
+                }
+                catch
+                {
+                }
                 bool leading = dYou <= dOpp;
                 string msg = leading
                     ? $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  ~g~you lead"
@@ -176,23 +202,6 @@ namespace StreetRacing
             }
         }
 
-        private void DrawFinish()
-        {
-            try
-            {
-                World.DrawMarker(
-                    MarkerType.Cylinder,
-                    finish + new Vector3(0f, 0f, 1f),
-                    new Vector3(0f, 0f, 0f),
-                    new Vector3(0f, 0f, 0f),
-                    new Vector3(cfg.FinishRadius * 0.6f, cfg.FinishRadius * 0.6f, 6f),
-                    Color.FromArgb(200, 255, 200, 0));
-            }
-            catch
-            {
-            }
-        }
-
         private void EndRace(string message)
         {
             try
@@ -205,11 +214,13 @@ namespace StreetRacing
             try
             {
                 finishBlip?.Delete();
+                finishCp?.Delete();
             }
             catch
             {
             }
             finishBlip = null;
+            finishCp = null;
             Notification.PostTicker(message, false, false);
             cooldownUntil = Game.GameTime + cfg.CooldownMs;
             state = RaceState.Cooldown;
@@ -227,6 +238,7 @@ namespace StreetRacing
             try
             {
                 finishBlip?.Delete();
+                finishCp?.Delete();
             }
             catch
             {
