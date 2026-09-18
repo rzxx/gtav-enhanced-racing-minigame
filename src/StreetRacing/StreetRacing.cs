@@ -208,7 +208,6 @@ namespace StreetRacing
             armingLastSampleMs = now;
             armingSampleNotBeforeMs = now + SimpleInitialRouteSettleMs;
             armingSampleAttempts = 0;
-            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             armingLastReassertMs = now;
             acceptedSnapshot = null;
@@ -525,6 +524,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             try { finishBlip?.Delete(); } catch { }
             try { finishCp?.Delete(); } catch { }
@@ -630,6 +630,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             try { telemetry?.Event(ElapsedArmingMs(), "RACE_START", $"src={snap.Source};pts={snap.Points.Count};len={snap.TotalLength:F0}"); } catch { }
             state = RaceState.Racing;
@@ -773,6 +774,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             raceStartTime = Game.GameTime;
             lastHudTime = 0;
