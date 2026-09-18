@@ -332,19 +332,28 @@ namespace StreetRacing
             right = 4f;
             try
             {
-                float ml = float.MaxValue;
-                float mr = float.MaxValue;
+                var ls = new List<float>();
+                var rs = new List<float>();
                 for (int i = 0; i < reference.Path.Count; i++)
                 {
                     float s = reference.StationS[i];
                     if (s > horizon) break;
+                    if (s < 6f) continue; // current pinch is checked point-by-point
                     if (i < reference.LeftRoadM.Count)
-                        ml = Math.Min(ml, reference.LeftRoadM[i] - VehicleHalfWidthM - RoadMarginM);
+                        ls.Add(reference.LeftRoadM[i] - VehicleHalfWidthM - RoadMarginM);
                     if (i < reference.RightRoadM.Count)
-                        mr = Math.Min(mr, reference.RightRoadM[i] - VehicleHalfWidthM - RoadMarginM);
+                        rs.Add(reference.RightRoadM[i] - VehicleHalfWidthM - RoadMarginM);
                 }
-                if (ml != float.MaxValue) left = ml;
-                if (mr != float.MaxValue) right = mr;
+                if (ls.Count > 0)
+                {
+                    ls.Sort();
+                    left = ls[(int)Math.Floor((ls.Count - 1) * 0.65f)];
+                }
+                if (rs.Count > 0)
+                {
+                    rs.Sort();
+                    right = rs[(int)Math.Floor((rs.Count - 1) * 0.65f)];
+                }
             }
             catch { }
             left = RaceMath.Clamp(left, 0.4f, 6f);
