@@ -18,26 +18,26 @@ namespace StreetRacing.Race
     ///   -> persistent GPS centerline reference (route-anchored window, NOT
     ///      rebuilt through ego)
     ///   -> curvature-based desired road speed (cruise-capped, braking-feasible)
+    ///   -> path-specific actor prediction constrains speed for genuine conflicts
     ///   -> persistent acceleration-limited commanded speed
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
     /// Explicitly DISABLED by construction for this milestone:
-    ///   civilian traffic avoidance / passing (FOLLOW/PASS) /
+    ///   lateral traffic avoidance / passing (FOLLOW/PASS) /
     ///   player race tactics / candidate trajectory scoring / seven lateral
     ///   choices / Crashed state / ImpactClassifier-driven behavior /
     ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
-    ///   StraightFallback. Perception is OBSERVE-ONLY in this pass so traffic
-    ///   can be diagnosed without affecting planning.
+    ///   StraightFallback. Perception affects longitudinal speed only: the
+    ///   driver may follow/stop, but cannot change lanes to avoid or pass yet.
     ///
     /// Speed separation (the recursive bug this fixes):
     ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
     ///   commandedSpeed  = persistent ramp toward desired (accel/decel limits).
     ///   actualSpeed     = vehicle.Speed (measured, NEVER feeds desired).
     ///   localTarget     = SpeedAtS(profile, sEgo) ~= commandedSpeed.
-    /// Telemetry exposes all four separately. SpeedLimit is "Curvature" only
-    /// when the ROAD caps speed; when the ramp lags behind desired it is
-    /// "AccelRamp", never mislabelled as curvature.
+    /// Telemetry exposes all four separately. SpeedLimit identifies
+    /// Traffic:<kind>#handle, Curvature, AccelRamp, or Cruise.
     ///
     /// Path separation (the ego-anchored bug this fixes):
     ///   TRACK path geometry is anchored to the ROUTE (PointAtS(AlongS + s)),
@@ -1094,7 +1094,8 @@ namespace StreetRacing.Race
                         + $"headErr={route.HeadingErrorDeg:F0};firstTang={c.FirstTangentErrDeg:F1};"
                         + $"maxKappa={c.MaxKappa:F4};rawGpsK={lastRefRawKappa:F4};refK={lastRefKappa:F4};"
                         + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
-                        + $"s={route.AlongS:F0};{route.LocDetail}");
+                        + $"constr={(c.ConstrainHandle != -1 ? (c.ConstrainKind ?? "Actor") + "#" + c.ConstrainHandle + "@" + c.ConstrainS.ToString("F0") : "none")};"
+                        + $"minClear={c.MinPredClearance:F1};s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }
