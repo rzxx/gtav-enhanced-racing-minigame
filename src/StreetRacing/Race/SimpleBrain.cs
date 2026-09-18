@@ -126,6 +126,7 @@ namespace StreetRacing.Race
         private float lastRefHeadStep;
         private int lastRefRoadClamp;
         private string lastRefDetail = "";
+        private DrivingReference.Result lastRoadReference;
         private Vector3 lastEgoFwd = new Vector3(0f, 1f, 0f);
         private float lastEgoHeading;
 
@@ -241,6 +242,7 @@ namespace StreetRacing.Race
             lastRefHeadStep = 0f;
             lastRefRoadClamp = 0;
             lastRefDetail = "";
+            lastRoadReference = null;
             TargetSpeed = 0f;
             SpeedLimit = "Cruise";
             ActualSpeed = originSpeed;
@@ -405,6 +407,7 @@ namespace StreetRacing.Race
             lastRefHeadStep = 0f;
             lastRefRoadClamp = 0;
             lastRefDetail = "";
+            lastRoadReference = null;
             TargetSpeed = 0f;
             SpeedLimit = "Cruise";
             ActualSpeed = originSpeed;
@@ -624,23 +627,36 @@ namespace StreetRacing.Race
 
                 if (!recovery.Active)
                 {
+                    // Planner uncertainty is NEVER a recovery trigger. Recovery
+                    // requires physical evidence that the car's pose/motion is
+                    // actually bad.
+                    bool severeRoutePose = false;
+                    bool physicallyStuck = false;
+                    try
+                    {
+                        severeRoutePose = route.IsLost
+                            && routeLostSinceMs >= 0
+                            && now - routeLostSinceMs >= 1000
+                            && (route.DistToRoute > 8f || Math.Abs(route.HeadingErrorDeg) > 55f);
+                        physicallyStuck = !trafficBlocked
+                            && commandedSpeed > 4f
+                            && forwardPlanSpeed < 0.7f
+                            && stallSinceMs >= 0
+                            && now - stallSinceMs >= 2500;
+                    }
+                    catch { }
+
                     if (trafficBlocked)
                     {
-                        // A legitimate queue is not a geometric failure. Reset
-                        // the primitive's no-progress clock while we wait.
                         try { recovery.Reset(now); } catch { }
                     }
-                    else
+                    else if (severeRoutePose)
                     {
-                        bool shouldRecover = false;
-                        try
-                        {
-                            shouldRecover = recovery.ShouldEnter(route, forwardPlanSpeed, route.AlongS,
-                                false, 0f, lastAccelLong, now);
-                        }
-                        catch { }
-                        if (shouldRecover)
-                            EnterRecovery(route.IsLost ? "route-lost:" + route.LossReason : "pose-or-progress", now);
+                        EnterRecovery("physical-route-loss:" + route.LossReason, now);
+                    }
+                    else if (physicallyStuck)
+                    {
+                        EnterRecovery("physical-stuck", now);
                     }
                 }
 
@@ -805,7 +821,8 @@ namespace StreetRacing.Race
             try
             {
                 if (viz.Enabled)
-                    viz.Draw(route, corridor, trajViz, null, speedViz, egoPos, lastEgoFwd, egoSpeed, LookaheadM, TargetSpeed);
+                    viz.Draw(route, corridor, trajViz, perception, speedViz, lastRoadReference,
+                        egoPos, lastEgoFwd, egoSpeed, LookaheadM, TargetSpeed);
             }
             catch { }
 
@@ -888,16 +905,17 @@ namespace StreetRacing.Race
                 if (referenceInvalidSinceMs < 0)
                 {
                     referenceInvalidSinceMs = now;
-                    plannerInvalidSinceMs = now;
-                    try { telemetry?.Event(now - t0, "REFERENCE_INVALID", lastRefDetail); } catch { }
+                    try { telemetry?.Event(now - t0, "REFERENCE_UNCERTAIN", lastRefDetail); } catch { }
                 }
-                if (plannerInvalidSinceMs < 0) plannerInvalidSinceMs = now;
-                if (!recovery.Active && now - plannerInvalidSinceMs > 900 && egoSpeed < 3.0f)
-                    EnterRecovery("reference-invalid:" + lastRefDetail, now);
-                return BuildPlannerStop(egoPos, "ReferenceInvalid");
+                // Perception uncertainty is not an obstacle. Preserve the last
+                // known maneuver at a reduced speed instead of emergency stop
+                // or reverse.
+                joinState = "RoadUncertain";
+                return BuildFailSoftFromCurrent(egoPos, Math.Min(6f, cruise), "RoadUncertain");
             }
 
             referenceInvalidSinceMs = -1;
+            lastRoadReference = rr;
             lastRefRawKappa = rr.RawMaxKappa;
             lastRefKappa = rr.MaxKappa;
             lastRefHeadStep = rr.MaxHeadingStepDeg;
@@ -919,18 +937,75 @@ namespace StreetRacing.Race
                 if (plannerInvalidSinceMs < 0)
                 {
                     plannerInvalidSinceMs = now;
-                    try { telemetry?.Event(now - t0, "LOCAL_PLAN_INVALID", why); } catch { }
+                    try { telemetry?.Event(now - t0, "LOCAL_PLAN_UNCERTAIN", why); } catch { }
                 }
-                if (!recovery.Active && now - plannerInvalidSinceMs > 800 && egoSpeed < 3.0f)
-                    EnterRecovery("no-viable-plan:" + why, now);
-                joinState = "PlannerStop";
-                return BuildPlannerStop(egoPos, "PlannerNoViable");
+                // No candidate is an epistemic failure, not proof of a wall.
+                // Follow the known-good reference conservatively and keep
+                // replanning. Physical recovery has separate entry criteria.
+                joinState = "PlanUncertain";
+                var latsFallback = new List<float>(rr.Path.Count);
+                for (int i = 0; i < rr.Path.Count; i++) latsFallback.Add(0f);
+                return BuildCommandFromPath(rr.Path, rr.StationS, latsFallback,
+                    egoSpeed, dtPlan, Math.Min(cruise, 7f), "PlanUncertain", egoPos);
             }
 
             plannerInvalidSinceMs = -1;
             referenceInvalidSinceMs = -1;
             joinState = lp.Intent;
             return BuildCommandFromCandidate(lp.Chosen, egoSpeed, dtPlan, cruise, lp.RoadDesired);
+        }
+
+        private ManeuverCommand BuildFailSoftFromCurrent(Vector3 egoPos, float cap, string why)
+        {
+            try
+            {
+                if (hasCurrent && current.Path != null && current.Path.Count >= 2
+                    && current.StationS != null && current.StationS.Count == current.Path.Count)
+                {
+                    float v = Math.Max(2.5f, Math.Min(cap, commandedSpeed > 0f ? commandedSpeed : cap));
+                    var prof = new List<float>(current.Path.Count);
+                    for (int i = 0; i < current.Path.Count; i++) prof.Add(v);
+                    commandedSpeed = v;
+                    commandedInit = true;
+                    desiredRoadSpeed = v;
+                    TargetSpeed = v;
+                    SpeedLimit = why;
+                    return new ManeuverCommand
+                    {
+                        Path = new List<Vector3>(current.Path),
+                        StationS = new List<float>(current.StationS),
+                        SpeedProfile = prof,
+                        AimPoint = current.AimPoint,
+                        TargetSpeed = v,
+                        Style = style,
+                        Reason = why,
+                        Reverse = false,
+                    };
+                }
+            }
+            catch { }
+
+            var p = new Vector3(
+                egoPos.X + lastEgoFwd.X * 15f,
+                egoPos.Y + lastEgoFwd.Y * 15f,
+                egoPos.Z);
+            float crawl = Math.Max(2.5f, Math.Min(cap, 4f));
+            commandedSpeed = crawl;
+            commandedInit = true;
+            desiredRoadSpeed = crawl;
+            TargetSpeed = crawl;
+            SpeedLimit = why;
+            return new ManeuverCommand
+            {
+                Path = new List<Vector3> { egoPos, p },
+                StationS = new List<float> { 0f, 15f },
+                SpeedProfile = new List<float> { crawl, crawl },
+                AimPoint = p,
+                TargetSpeed = crawl,
+                Style = style,
+                Reason = why,
+                Reverse = false,
+            };
         }
 
         private ManeuverCommand BuildPlannerStop(Vector3 egoPos, string why)
