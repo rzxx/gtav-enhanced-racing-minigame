@@ -340,19 +340,10 @@ namespace StreetRacing
         private void TickArmingSimple()
         {
             int now = Game.GameTime;
-            // Keep the yellow route visible while arming (re-assert, never recreate).
-            try
-            {
-                if (finishBlip != null && now - armingLastReassertMs > 1000)
-                {
-                    armingLastReassertMs = now;
-                    finishBlip.ShowRoute = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                try { telemetry?.Event(ElapsedArmingMs(), "ARM_EXC", "reassert:" + ex.Message); } catch { }
-            }
+            // Simple mode owns one routed blip for the whole arming/race
+            // lifecycle. Do NOT periodically call SET_BLIP_ROUTE(true):
+            // GTA already keeps an enabled route active, and reasserting it can
+            // visibly flash/rebuild the GPS route while we are sampling it.
 
             // Acquisition timeout: GPS still isn't available -> fail cleanly.
             // NEVER fall through to FallbackWalk/StraightFallback.
@@ -908,17 +899,18 @@ namespace StreetRacing
             if (Game.GameTime - lastHudTime > 1000)
             {
                 lastHudTime = Game.GameTime;
-                try
+                // Legacy keeps its historical route reassertion. Simple
+                // intentionally does not: it drives the immutable startup
+                // snapshot and repeated SET_BLIP_ROUTE(true) caused visible GPS
+                // flicker/rebuilds without improving the controller's route.
+                if (!cfg.UseSimpleDriver())
                 {
-                    // The game can drop a blip route when you stray far off-path;
-                    // re-asserting rebuilds it instead of leaving you guideless.
-                    if (finishBlip != null)
+                    try
                     {
-                        finishBlip.ShowRoute = true;
+                        if (finishBlip != null)
+                            finishBlip.ShowRoute = true;
                     }
-                }
-                catch
-                {
+                    catch { }
                 }
                 bool leading = dYou <= dOpp;
                 if (leading != wasLeading)
