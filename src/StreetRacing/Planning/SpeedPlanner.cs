@@ -1,47 +1,383 @@
 using System;
 using System.Collections.Generic;
+using GTA.Math;
 
 namespace StreetRacing
 {
-    /// Speed planning from curvature + grip + obstacles + tactics.
-    /// v = min(cruise, curve limit, obstacle limit, tactical limit).
-    /// All limits derive from the measured capability (brake / lateral g),
-    /// scaled by the driver profile — no hardcoded vehicle classes.
+    /// Per-path speed profiler for the JOINT maneuver planner.
     ///
-    /// Corner profile: local curvature is sampled every ~10 m out to
-    /// lookahead+80 m (vAllow(s) = sqrt(aLatEff/kappa)/CornerCaution) and a
-    /// backwards braking pass enforces
-    ///   v[i] = min(vAllow[i], sqrt(v[i+1]^2 + 2*aBrake*ds))
-    /// so a slow corner 120 m ahead constrains current speed through braking
-    /// distance — not just the corner you are already in.
+    /// The old global planner computed one corridor-wide obstacle speed
+    /// (worst actor anywhere in the lane) and applied it after trajectory
+    /// selection. A path that cleanly avoided an actor was still braked for
+    /// it — the architectural deadlock this pass removes.
     ///
-    /// CORNER-CAUTION SEMANTICS (fixed): CornerCaution > 1 = more cautious =
-    /// slower (vAllow divided by it). Cautious=1.15 slows ~13%, Aggressive=
-    /// 0.92 quickens ~9%. The old code multiplied grip by it, which inverted
-    /// the meaning (Cautious was faster). Profile numbers are unchanged; the
-    /// formula now matches their intent.
+    /// Now: for a GIVEN path, constrain speed only for actors that actually
+    /// conflict with that path's swept envelope at the predicted arrival
+    /// times, then run the backwards braking pass. Each candidate gets its
+    /// own physically executable speed profile; the maneuver scorer picks
+    /// the best path+speed together.
     ///
-    /// Obstacle speeds use projected actor velocity along the route
-    /// (SpeedAlong), not actor.Speed*0.7. Oncoming traffic projects negative
-    /// and is clamped to 0 for stopping logic (assume worst); same-direction
-    /// traffic projects positive and correctly raises the follow speed.
+    /// No creep heuristic: a stopped maneuver simply scores badly on
+    /// progress and loses to an avoiding maneuver. Creep compensated for the
+    /// deadlock instead of removing it.
     internal sealed class SpeedPlanner
     {
+        // Kept for debug-viz / telemetry compat: mirrors the CHOSEN
+        // maneuver's profile (set by RaceBrain from the joint planner).
         public float TargetSpeed;
         public string Limiting = "Cruise";
         public float CurveLimit = 99f;
         public float ObstacleLimit = 99f;
-        public float RequiredDecel;  // + = need to slow (m/s^2)
-        public float BrakingNeed;    // 0..1
+        public float RequiredDecel;
+        public float BrakingNeed;
 
-        // Full profile for debug viz + telemetry (s ahead, m).
         public readonly List<float> ProfileS = new List<float>();
         public readonly List<float> ProfileAllowed = new List<float>();
         public readonly List<float> ProfileTarget = new List<float>();
         public float BrakingPointS = -1f;
 
-        private const float StationDs = 10f;
+        public const float VehicleHalfWidthM = 1.15f;
 
+        public static float ActorHalfWidth(ActorKind kind)
+        {
+            switch (kind)
+            {
+                case ActorKind.Ped: return 0.45f;
+                case ActorKind.Obstacle: return 0.9f;
+                default: return 1.1f;
+            }
+        }
+
+        public static float ConflictRadius(ActorKind kind)
+        {
+            // Swept-envelope conflict distance (center to center).
+            return VehicleHalfWidthM + ActorHalfWidth(kind) + 0.4f;
+        }
+
+        /// Per-path profile: vAllow from curvature, vObs only from actors
+        /// whose predicted position at arrival time penetrates THIS path's
+        /// envelope, backwards braking pass, forward accel feasibility pass.
+        ///
+        /// Two complementary conflict tests (both path-specific):
+        ///   (a) Euclidean swept envelope: predicted actor center vs path
+        ///       station (catches cut-ins, crossing, side swipe);
+        ///   (b) Path-frame (route lateral vs this path's lateral + predicted
+        ///       longitudinal overlap): catches same-lane following and fast
+        ///       head-on where the Euclidean snapshot at 10 m stations can
+        ///       straddle the meeting point.
+        public static void ProfileForPath(
+            IList<Vector3> path,
+            IList<float> stationS,
+            IList<float> kappa,
+            IList<float> pathLats,
+            float egoRouteS,
+            Perception perception,
+            RoadCorridor corridor,
+            float egoSpeed,
+            float cruise,
+            float aLatEff,
+            float aBrake,
+            float topSpeed,
+            DriverProfile profile,
+            float tacticalCap,
+            out float[] vAllow,
+            out float[] vTgt,
+            out float[] arrivalT,
+            out int constrainHandle,
+            out string constrainKind,
+            out float constrainS,
+            out float minPredClearance)
+        {
+            int n = path.Count;
+            vAllow = new float[n];
+            vTgt = new float[n];
+            arrivalT = new float[n];
+            constrainHandle = -1;
+            constrainKind = "";
+            constrainS = -1f;
+            minPredClearance = 999f;
+
+            float[] vCurve = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                float k = (kappa != null && i < kappa.Count) ? kappa[i] : 0f;
+                float vc;
+                if (k < 1e-5f) vc = cruise;
+                else
+                {
+                    vc = (float)Math.Sqrt(aLatEff / k);
+                    if (vc > cruise) vc = cruise;
+                }
+                if (topSpeed > 5f && vc > topSpeed) vc = topSpeed;
+                vCurve[i] = vc;
+            }
+
+            // Free-flow arrival estimate for conflict detection (uses current
+            // speed, clamped — stable across ticks, no circular dependency).
+            float[] tFree = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                float s = stationS[i];
+                float t = s / Math.Max(egoSpeed, 6f);
+                tFree[i] = RaceMath.Clamp(t, 0f, 5f);
+            }
+
+            float[] vObs = new float[n];
+            for (int i = 0; i < n; i++) vObs[i] = cruise;
+
+            float gapStop = profile.SafetyMarginM + egoSpeed * 0.35f;
+
+            // Per-station conflict test against THIS path only.
+            // Off-roadway peds/props can never intersect an on-road path:
+            // skip them explicitly (they still constrain off-road paths).
+            int[] hitHandle = new int[n];
+            string[] hitKind = new string[n];
+            for (int i = 0; i < n; i++) { hitHandle[i] = int.MinValue; hitKind[i] = ""; }
+            float[] hitFollowV = new float[n];
+            for (int i = 0; i < n; i++) hitFollowV[i] = float.MaxValue;
+
+            for (int k = 0; k < n; k++)
+            {
+                float s = stationS[k];
+                Vector3 pk = path[k];
+                Vector3 pdir = PathDirAt(path, k);
+                float pathLat = (pathLats != null && k < pathLats.Count) ? pathLats[k] : 0f;
+                foreach (var a in perception.Actors)
+                {
+                    if (a.RouteValid)
+                    {
+                        if (a.RouteDist < -8f || a.RouteDist > s + 90f) continue;
+                        // Actor far behind/ahead of this station in route
+                        // distance cannot conflict here (cheap reject). Both
+                        // tests below are authoritative within the window.
+                        if (Math.Abs(a.RouteDist - s) > 45f) continue;
+                    }
+                    else
+                    {
+                        if (!a.IsAhead && a.Dist > 25f) continue;
+                        if (a.Dist > 120f) continue;
+                    }
+                    if (a.OffRoadway)
+                    {
+                        // Sidewalk rule: far off-roadway clutter never
+                        // influences any path; near off-roadway actors only
+                        // matter when the path actually goes near them
+                        // (radius test below decides).
+                        if (a.Dist > 12f) continue;
+                    }
+
+                    bool conflict = false;
+                    float followV = 0f;
+
+                    // (a) Euclidean swept envelope at arrival time.
+                    Vector3 pred;
+                    try { pred = perception.Predict(a, tFree[k]); }
+                    catch { pred = a.Position; }
+                    float d = RaceMath.FlatDistance(pk, pred);
+                    float clearance = d - (VehicleHalfWidthM + ActorHalfWidth(a.Kind));
+                    if (clearance < minPredClearance) minPredClearance = clearance;
+                    float confR = ConflictRadius(a.Kind);
+                    if (d < confR)
+                    {
+                        float along = RaceMath.FlatDot(new Vector3(a.Velocity.X, a.Velocity.Y, 0f), pdir);
+                        followV = along > 2f ? along : 0f;
+                        conflict = true;
+                    }
+
+                    // (b) Path-frame overlap: same-lane following + fast
+                    // head-on that a 10 m Euclidean snapshot can straddle.
+                    // Predicted actor route position vs this path station.
+                    if (!conflict && a.RouteValid)
+                    {
+                        float predRouteS = a.RouteS + a.SpeedAlong * tFree[k];
+                        float egoRouteAtStation = egoRouteS + s;
+                        float longGap = predRouteS - egoRouteAtStation;
+                        float latGap = Math.Abs(a.RouteLateral - pathLat);
+                        float latTol = VehicleHalfWidthM + ActorHalfWidth(a.Kind) - 0.15f;
+                        if (latTol < 1.4f) latTol = 1.4f;
+                        // Longitudinal window covers car length + one station
+                        // step so meetings between stations still bind.
+                        if (Math.Abs(longGap) < 8f && latGap < latTol)
+                        {
+                            followV = a.SpeedAlong > 2f ? a.SpeedAlong : 0f;
+                            conflict = true;
+                            float pc = (float)Math.Sqrt(longGap * longGap + latGap * latGap)
+                                - (VehicleHalfWidthM + ActorHalfWidth(a.Kind));
+                            if (pc < minPredClearance) minPredClearance = pc;
+                        }
+                    }
+
+                    if (conflict)
+                    {
+                        // Keep the most restrictive (lowest) at this station.
+                        if (hitKind[k] == "" || followV < hitFollowV[k])
+                        {
+                            hitHandle[k] = a.Handle;
+                            hitKind[k] = a.Kind.ToString();
+                            hitFollowV[k] = followV;
+                            if (followV < vObs[k]) vObs[k] = followV;
+                        }
+                    }
+                }
+            }
+
+            // Gap handling: a stop conflict at s_c forbids everything beyond
+            // s_c - gap (must stop BEFORE the envelope, not inside it).
+            float earliestStopS = float.MaxValue;
+            for (int k = 0; k < n; k++)
+            {
+                if (hitKind[k] != "" && hitFollowV[k] < 0.5f)
+                {
+                    float sc = stationS[k] - gapStop;
+                    if (sc < earliestStopS) earliestStopS = sc;
+                }
+            }
+
+            bool[] isHit = new bool[n];
+            for (int k = 0; k < n; k++)
+                isHit[k] = hitKind[k] != "" && vObs[k] < cruise - 0.01f;
+
+            if (earliestStopS < float.MaxValue)
+            {
+                for (int k = 0; k < n; k++)
+                {
+                    if (stationS[k] >= earliestStopS && vObs[k] > 0f)
+                    {
+                        vObs[k] = 0f;
+                        if (!isHit[k])
+                        {
+                            isHit[k] = true;
+                            // Attribute the propagated stop to the earliest
+                            // conflicting actor for telemetry.
+                            for (int j = 0; j < n; j++)
+                            {
+                                if (hitKind[j] != "" && hitFollowV[j] < 0.5f &&
+                                    Math.Abs((stationS[j] - gapStop) - earliestStopS) < 11f)
+                                {
+                                    hitHandle[k] = hitHandle[j];
+                                    hitKind[k] = hitKind[j];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Following gaps: soften the station just before a follow
+                // constraint so we don't tailgate (small, no tuning).
+                for (int k = 0; k < n; k++)
+                {
+                    if (isHit[k] && hitFollowV[k] >= 0.5f)
+                    {
+                        // No forward propagation for following; the backwards
+                        // pass handles the braking distance.
+                    }
+                }
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                float va = vCurve[i];
+                if (vObs[i] < va) va = vObs[i];
+                if (tacticalCap < va) va = tacticalCap;
+                vAllow[i] = Math.Max(0f, va);
+            }
+
+            // Backwards braking pass.
+            vTgt[n - 1] = vAllow[n - 1];
+            for (int i = n - 2; i >= 0; i--)
+            {
+                float ds = Math.Max(1f, stationS[i + 1] - stationS[i]);
+                float vReach = (float)Math.Sqrt(vTgt[i + 1] * vTgt[i + 1] + 2f * aBrake * ds);
+                vTgt[i] = Math.Min(vAllow[i], vReach);
+            }
+            // Forward accel feasibility (cannot teleport to speed).
+            // If we must brake from egoSpeed, vFwd[0] stays at vTgt[0] (the
+            // braking pass is already feasible); the forward pass only limits
+            // acceleration toward distant fast stations.
+            float aAccel = Math.Max(2f, aBrake * 0.55f);
+            float[] vFwd = new float[n];
+            vFwd[0] = vTgt[0] > egoSpeed ? egoSpeed : vTgt[0];
+            if (vTgt[0] <= egoSpeed) vFwd[0] = vTgt[0];
+            else vFwd[0] = Math.Min(vTgt[0], egoSpeed + 1f);
+            for (int i = 1; i < n; i++)
+            {
+                float ds = Math.Max(1f, stationS[i] - stationS[i - 1]);
+                float vReach = (float)Math.Sqrt(vFwd[i - 1] * vFwd[i - 1] + 2f * aAccel * ds);
+                vFwd[i] = Math.Min(vTgt[i], vReach);
+            }
+            for (int i = 0; i < n; i++) vTgt[i] = vFwd[i];
+
+            // Final arrival times from the executable profile.
+            arrivalT[0] = 0f;
+            for (int i = 1; i < n; i++)
+            {
+                float ds = Math.Max(0.5f, stationS[i] - stationS[i - 1]);
+                float vAvg = (vTgt[i - 1] + vTgt[i]) * 0.5f;
+                if (vAvg < 1.2f) vAvg = 1.2f;
+                arrivalT[i] = arrivalT[i - 1] + ds / vAvg;
+            }
+
+            // Recompute clearance at EXECUTABLE arrival times for scoring.
+            // Keep the conflict-time minimum too: a head-on blocked between
+            // 10 m stations can look Euclidean-far at executable times while
+            // the path-frame test correctly stopped for it.
+            float minConflict = minPredClearance;
+            minPredClearance = 999f;
+            foreach (var a in perception.Actors)
+            {
+                for (int k = 0; k < n; k++)
+                {
+                    Vector3 pred;
+                    try { pred = perception.Predict(a, arrivalT[k]); }
+                    catch { pred = a.Position; }
+                    float d = RaceMath.FlatDistance(path[k], pred);
+                    float c = d - (VehicleHalfWidthM + ActorHalfWidth(a.Kind));
+                    if (c < minPredClearance) minPredClearance = c;
+                }
+            }
+
+            // Constraining actor: earliest station where obstacle binds.
+            if (minConflict < minPredClearance) minPredClearance = minConflict;
+            for (int k = 0; k < n; k++)
+            {
+                if (isHit[k] && vObs[k] < vCurve[k] - 0.01f)
+                {
+                    constrainHandle = hitHandle[k];
+                    constrainKind = hitKind[k];
+                    constrainS = stationS[k];
+                    break;
+                }
+            }
+            // gapFollow documents follow-gap intent (no forward stop needed;
+            // the backwards pass handles braking distance for following).
+        }
+
+        private static Vector3 PathDirAt(IList<Vector3> path, int k)
+        {
+            try
+            {
+                Vector3 d;
+                if (k <= 0)
+                    d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+                else if (k >= path.Count - 1)
+                    d = new Vector3(path[k].X - path[k - 1].X, path[k].Y - path[k - 1].Y, 0f);
+                else
+                    d = new Vector3(path[k + 1].X - path[k - 1].X, path[k + 1].Y - path[k - 1].Y, 0f);
+                if (RaceMath.FlatLength(d) < 0.3f) return new Vector3(0f, 1f, 0f);
+                return RaceMath.FlatNormalize(d);
+            }
+            catch { return new Vector3(0f, 1f, 0f); }
+        }
+
+        /// Legacy global planner: RETIRED. Kept compiling for tooling; the
+        /// joint planner (ProfileForPath per candidate) is the only speed
+        /// authority. This shim returns a curvature-only profile with NO
+        /// obstacle logic and NO creep, so any accidental caller cannot
+        /// reintroduce the corridor-wide deadlock.
+        [System.Obsolete("Use ProfileForPath per candidate (joint maneuver planner).")]
         public float Plan(
             float cruise,
             float egoSpeed,
@@ -54,7 +390,6 @@ namespace StreetRacing
             float lookaheadM)
         {
             float aLatRaw = cap.UsableLat(profile.GripFactor);
-            // Fixed semantics: divide, don't multiply.
             float cc = profile.CornerCaution;
             if (cc < 0.5f) cc = 0.5f;
             if (cc > 2f) cc = 2f;
@@ -66,14 +401,13 @@ namespace StreetRacing
             ProfileTarget.Clear();
             BrakingPointS = -1f;
 
-            // --- Curve profile with backwards braking pass.
             float horizon = Math.Min(lookaheadM + 80f, 230f);
-            int n = Math.Max(5, (int)(horizon / StationDs) + 1);
+            int n = Math.Max(5, (int)(horizon / 10f) + 1);
             if (n > 24) n = 24;
             float[] vAllow = new float[n];
             for (int i = 0; i < n; i++)
             {
-                float s = i * StationDs;
+                float s = i * 10f;
                 ProfileS.Add(s);
                 float kappa = 0f;
                 try { kappa = route.CurvatureAtS(route.AlongS + s, 20f); }
@@ -85,7 +419,6 @@ namespace StreetRacing
                     va = (float)Math.Sqrt(aLatEff / kappa);
                     if (va > cruise) va = cruise;
                 }
-                // Capability top speed caps everything (DriveV AI caps aside).
                 try { if (cap.TopSpeedEst > 5f && va > cap.TopSpeedEst) va = cap.TopSpeedEst; }
                 catch { }
                 vAllow[i] = va;
@@ -95,120 +428,22 @@ namespace StreetRacing
             vTgt[n - 1] = vAllow[n - 1];
             for (int i = n - 2; i >= 0; i--)
             {
-                float vReach = (float)Math.Sqrt(vTgt[i + 1] * vTgt[i + 1] + 2f * aBrake * StationDs);
+                float vReach = (float)Math.Sqrt(vTgt[i + 1] * vTgt[i + 1] + 2f * aBrake * 10f);
                 vTgt[i] = Math.Min(vAllow[i], vReach);
-                ProfileTarget.Add(0f); // placeholder, filled below in order
             }
             ProfileTarget.Clear();
             for (int i = 0; i < n; i++) ProfileTarget.Add(vTgt[i]);
 
             CurveLimit = vTgt[0];
             if (CurveLimit > cruise) CurveLimit = cruise;
-
-            // First station ahead that forces braking from current speed.
-            for (int i = 1; i < n; i++)
-            {
-                if (vTgt[i] < egoSpeed - 0.75f)
-                {
-                    // Only report it if we are currently faster than allowed
-                    // here OR will need to shed speed to make it.
-                    if (vTgt[0] < egoSpeed - 0.5f || vAllow[i] < egoSpeed - 1f)
-                    {
-                        BrakingPointS = i * StationDs;
-                        break;
-                    }
-                }
-            }
-
-            // --- Obstacle limit: worst actor ahead by stopping-distance logic,
-            // in route coordinates with projected along-route speed.
             ObstacleLimit = cruise;
-            foreach (var a in perception.Actors)
-            {
-                float routeDist;
-                float routeLat;
-                float actorAlong;
-                float ttc;
-                bool usable = false;
-                if (a.RouteValid)
-                {
-                    routeDist = a.RouteDist;
-                    routeLat = a.RouteLateral;
-                    actorAlong = Math.Max(0f, a.SpeedAlong);
-                    ttc = Math.Min(a.Ttc, a.RouteTtc);
-                    usable = true;
-                }
-                else
-                {
-                    if (!a.IsAhead) continue;
-                    if (Math.Abs(a.Lateral) > 5.5f) continue;
-                    routeDist = a.Dist;
-                    routeLat = a.Lateral;
-                    // Fallback projection onto ego forward when route is lost.
-                    actorAlong = 0f;
-                    try
-                    {
-                        // a.Velocity is flat; ego fwd approx from closing geometry.
-                        // Conservative: treat non-route actors as static unless
-                        // clearly receding (closing<0) — never invent speed.
-                        if (a.ClosingSpeed < -1f) actorAlong = Math.Max(0f, egoSpeed + a.ClosingSpeed);
-                    }
-                    catch { }
-                    ttc = a.Ttc;
-                    usable = true;
-                }
-                if (!usable) continue;
-                if (routeDist < -3f || routeDist > lookaheadM + 60f) continue;
-                float halfAt = corridor != null ? corridor.HalfWidthAt(Math.Max(0f, routeDist)) : 7f;
-                if (Math.Abs(routeLat) > halfAt + 2f) continue; // different lane, planner handles laterally
-                float gapNeed = profile.SafetyMarginM + egoSpeed * profile.SafetyTimeS * 0.5f;
-                float avail = routeDist - gapNeed;
-                if (avail < 0f) avail = 0f;
-                float vStop = (float)Math.Sqrt(actorAlong * actorAlong + 2f * aBrake * avail);
-                // TTC guard: imminent (<1.6 s) threats clamp hard.
-                float closingForTtc = a.RouteValid ? a.ClosingAlong : a.ClosingSpeed;
-                if (ttc < 1.6f && closingForTtc > 2f)
-                    vStop = Math.Min(vStop, Math.Max(0f, egoSpeed - aBrake * 0.8f));
-                else if (ttc < 2.8f && closingForTtc > 2f)
-                    vStop = Math.Min(vStop, Math.Max(actorAlong, egoSpeed - aBrake * 0.35f));
-                if (vStop < ObstacleLimit) ObstacleLimit = vStop;
-            }
 
-            // --- Anti-deadlock creep: a full stop behind a static non-ped
-            // blocker (parked car, prop, stopped rival) with nobody touching
-            // us must not pin v_tgt at 0 forever. The trajectory scorer steers
-            // around when width allows; creeping at 2.5 m/s lets the servo
-            // close the gap and either pass or stop again at the 3.5 m gate.
-            // Peds veto creep entirely — never nudge into pedestrians.
-            bool creeping = false;
-            if (egoSpeed < 1.5f && ObstacleLimit < 0.5f)
-            {
-                bool pedNear = false;
-                float nearestBlocker = float.MaxValue;
-                foreach (var a in perception.Actors)
-                {
-                    float rd = a.RouteValid ? a.RouteDist : (a.IsAhead ? a.Dist : 999f);
-                    float rl = a.RouteValid ? a.RouteLateral : a.Lateral;
-                    if (rd < -2f || rd > 14f) continue;
-                    float halfAt = corridor != null ? corridor.HalfWidthAt(Math.Max(0f, rd)) : 7f;
-                    if (Math.Abs(rl) > halfAt + 2f) continue;
-                    if (a.Kind == ActorKind.Ped && a.Dist < 14f) { pedNear = true; break; }
-                    if (a.Dist < nearestBlocker) nearestBlocker = a.Dist;
-                }
-                if (!pedNear && nearestBlocker > 3.5f && nearestBlocker < 200f)
-                    creeping = true;
-            }
-
-            // --- Tactical limit.
             float tactical = cruise;
             string tacReason = "Cruise";
             switch (mode)
             {
                 case Tactics.TacticalMode.Follow:
-                    // Match the leader ahead on the route: never faster than
-                    // leader's along-route speed + small.
-                    tactical = cruise;
-                    tacReason = "Follow";
+                    tactical = cruise; tacReason = "Follow";
                     try
                     {
                         TrackedActor lead;
@@ -221,41 +456,27 @@ namespace StreetRacing
                     catch { }
                     break;
                 case Tactics.TacticalMode.CornerPrep:
-                    tactical = Math.Min(cruise, CurveLimit);
-                    tacReason = "CornerPrep";
-                    break;
+                    tactical = Math.Min(cruise, CurveLimit); tacReason = "CornerPrep"; break;
                 case Tactics.TacticalMode.Commit:
-                    tactical = cruise; // committed overtake: use everything
-                    tacReason = "Commit";
-                    break;
+                    tactical = cruise; tacReason = "Commit"; break;
                 case Tactics.TacticalMode.Abort:
                 case Tactics.TacticalMode.SideBySide:
-                    tactical = Math.Min(cruise, Math.Max(egoSpeed - 1f, 8f));
-                    tacReason = mode.ToString();
-                    break;
+                    tactical = Math.Min(cruise, Math.Max(egoSpeed - 1f, 8f)); tacReason = mode.ToString(); break;
                 case Tactics.TacticalMode.Recovery:
                 case Tactics.TacticalMode.Crashed:
-                    tactical = 11f;
-                    tacReason = "Recovery";
-                    break;
+                    tactical = 11f; tacReason = "Recovery"; break;
                 case Tactics.TacticalMode.Defend:
-                    tactical = cruise;
-                    tacReason = "Defend";
-                    break;
+                    tactical = cruise; tacReason = "Defend"; break;
             }
 
             float target = cruise;
             Limiting = "Cruise";
             if (CurveLimit < target) { target = CurveLimit; Limiting = "Curvature"; }
-            if (ObstacleLimit < target) { target = ObstacleLimit; Limiting = "Obstacle"; }
             if (tactical < target) { target = tactical; Limiting = tacReason; }
             if (mode == Tactics.TacticalMode.CornerPrep && Limiting == "Cruise") Limiting = "CornerPrep";
-            if (creeping && target < 2.5f) { target = 2.5f; Limiting = "Creep"; }
 
             target = Math.Max(0f, target);
             TargetSpeed = target;
-
-            // Braking need for telemetry + actuator urgency.
             float dv = egoSpeed - target;
             RequiredDecel = dv <= 0f ? 0f : (dv * dv) / Math.Max(2f * Math.Max(lookaheadM * 0.6f, 15f), 1f);
             BrakingNeed = RaceMath.Clamp(RequiredDecel / Math.Max(aBrake, 1f), 0f, 1f);

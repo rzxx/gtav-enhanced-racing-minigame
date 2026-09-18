@@ -31,10 +31,12 @@ namespace StreetRacing
         public float GripFactor = 0f;
         // Spatial debug overlay (route / corridor / candidates / predictions).
         public bool DebugViz = false;
-        // Actuator: GtaDriver (experiment: point/speed to GTA pathfinding) or
-        // Direct (steering/throttle/brake, planner unchanged). Default stays
-        // GtaDriver until path-following-error tests decide otherwise.
-        public string ActuatorName = "GtaDriver";
+        // Actuator: Direct (intended: executes the joint path/speed maneuver
+        // itself every tick) or GtaDriver (baseline/diagnostic only: hands
+        // point/speed to GTA pathfinding, does not guarantee the maneuver).
+        // Default is Direct: the isolation test for planner deadlocks and the
+        // intended controller going forward.
+        public string ActuatorName = "Direct";
 
         public static StreetRacingConfig Load()
         {

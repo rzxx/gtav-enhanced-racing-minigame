@@ -327,6 +327,9 @@ namespace StreetRacing.Tactics
             float worst = 999f;
             foreach (var a in perception.Actors)
             {
+                // Sidewalk clutter can never intersect an on-road pass.
+                if (a.OffRoadway && (a.Kind == ActorKind.Ped || a.Kind == ActorKind.Obstacle) && a.Dist > 8f)
+                    continue;
                 // Route frame first (road-following); ego cone only as fallback.
                 float lat, dist, ttc, closing;
                 bool ahead;
@@ -362,6 +365,8 @@ namespace StreetRacing.Tactics
             float need = profile.ClearanceNeed(14f + egoSpeed * 0.35f);
             foreach (var a in perception.Actors)
             {
+                if (a.OffRoadway && (a.Kind == ActorKind.Ped || a.Kind == ActorKind.Obstacle) && a.Dist > 8f)
+                    continue;
                 float lat, dist, ttc;
                 bool ahead;
                 if (a.RouteValid)
@@ -393,6 +398,8 @@ namespace StreetRacing.Tactics
             float need = profile.ClearanceNeed(10f + egoSpeed * 0.25f);
             foreach (var a in perception.Actors)
             {
+                if (a.OffRoadway && (a.Kind == ActorKind.Ped || a.Kind == ActorKind.Obstacle) && a.Dist > 8f)
+                    continue;
                 float lat, dist, ttc;
                 bool ahead;
                 if (a.RouteValid)

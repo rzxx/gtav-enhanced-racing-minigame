@@ -5,24 +5,17 @@ using GTA.Native;
 
 namespace StreetRacing.Control
 {
-    /// EXPERIMENT — stock GTA driver used as a trajectory/speed servo.
+    /// BASELINE / DIAGNOSTIC ONLY — stock GTA driver used as a servo.
     ///
-    /// We command a SHORT-horizon aim point on the planned trajectory
-    /// (80–150 m), not the 2 km finish. That keeps the game pathfinder on the
-    /// correct carriageway and makes unreachable-finish losses structurally
-    /// impossible — the failure mode that killed the old long-range DriveTo.
-    ///
-    /// DECISIVE LIMITATION: this still hands (point, speed) to GTA's own
-    /// pathfinding, which replans its own lane-level path with its own
-    /// curvature/speed model under DriveV. It therefore DOES NOT guarantee
-    /// execution of our trajectory: our corridor/path/speed work is advisory,
-    /// and the game may cut, swing wide, or cap speed wherever its AI wants.
-    /// Treat every race with this actuator as a measurement of that gap —
-    /// see PathFollowingError (desired path vs actual pose/speed), logged to
-    /// telemetry. If the error stays large, switch to DirectActuator.
-    ///
-    /// Re-issues are rate-limited (aim moved / speed changed / mode changed /
-    /// stuck): per-tick we only refresh cruise + style, which does not stutter.
+    /// The joint planner + Direct controller is the intended path: it
+    /// executes the selected sampled path/speed itself. This actuator still
+    /// hands (point, speed) to GTA's own pathfinding, which replans its own
+    /// lane-level path with its own curvature/speed model under DriveV and
+    /// therefore DOES NOT guarantee execution of our maneuver. Keep it only
+    /// to measure that gap (see PathFollowingError) — never as the decision
+    /// maker. Persistent perception + joint planning already removed the
+    /// flicker that used to force constant DriveTo repaths; re-issues stay
+    /// rate-limited (aim moved / speed changed / mode changed / stuck).
     internal sealed class GtaDriverActuator : IVehicleActuator
     {
         private Ped driver;
@@ -35,7 +28,7 @@ namespace StreetRacing.Control
         public bool HasPlan { get; private set; }
         public int ReissueCount { get; private set; }
         public string LastReason { get; private set; } = "";
-        public string ActuatorName => "GtaDriver(experiment)";
+        public string ActuatorName => "GtaDriver(baseline)";
         public PathFollowingError LastError { get; private set; } = new PathFollowingError();
         public bool LastTickReissued { get; private set; }
 
@@ -75,6 +68,22 @@ namespace StreetRacing.Control
             CurrentStyle = style;
             LastReason = reason ?? "";
             HasPlan = true;
+        }
+
+        public void SetManeuver(ManeuverCommand cmd)
+        {
+            // Baseline ignores the sampled path: it servo-tracks the distant
+            // aim + cruise only (diagnostic against the SELECTED maneuver via
+            // UpdatePathError's chosen path).
+            try
+            {
+                CurrentAim = cmd.AimPoint;
+                CurrentCruise = Math.Max(0f, cmd.TargetSpeed);
+                CurrentStyle = cmd.Style;
+                LastReason = cmd.Reason ?? "";
+                HasPlan = true;
+            }
+            catch { }
         }
 
         public void Clear() { HasPlan = false; }

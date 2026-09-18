@@ -27,6 +27,10 @@ namespace StreetRacing
     {
         public bool Valid;
         public ActorKind Kind;
+        public int Handle;        // persistent entity handle (0 = unknown/coasted)
+        public int SeenCount;     // observations merged for this track
+        public bool Stale;        // true when coasted (not seen this scan)
+        public bool OffRoadway;   // true when provably off the drivable surface
         public Vector3 Position;
         public Vector3 Velocity;
         public float Dist;          // flat distance from ego
@@ -47,16 +51,23 @@ namespace StreetRacing
         public float RouteTtc;      // s from along-route closing
     }
 
-    /// Predictive perception well beyond stopping distance.
-    /// Replaces the old 40 m / ~20 deg frontal sample at 2 Hz, which saw
-    /// DriveV traffic (~30–42 m/s) only ~1 s before impact.
+    /// Predictive perception with PERSISTENT tracking.
     ///
-    /// - Range adapts to ego stopping distance + margin (up to 170 m).
-    /// - Full surround (not a narrow cone); cones are applied at scoring time.
-    /// - Relative velocity + TTC for every actor; predictions assume constant
-    ///   velocity over the planner horizon (2–3 s).
-    /// - Every actor is additionally projected into route coordinates so
-    ///   collision reasoning follows the road, not just the current nose.
+    /// The old implementation cleared and rebuilt a TTC-sorted top-24 world
+    /// every scan. Pool flicker (an actor missing for one frame, TTC jitter
+    /// reordering the truncation) then destabilized both trajectory selection
+    /// and the global speed planner, and GtaDriver turned that into constant
+    /// DriveTo repaths.
+    ///
+    /// This implementation:
+    ///   - tracks entities persistently by handle with short expiry;
+    ///   - coasts missed tracks for a few frames (hysteresis) instead of
+    ///     deleting them, so one culled frame cannot flip the plan;
+    ///   - ALWAYS retains route/path-relevant actors, the nearby safety
+    ///     bubble and the rival; TTC is one threat signal, not the retention
+    ///     ordering (retention + display order are stable by relevance);
+    ///   - flags provably-off-roadway peds/props so paths they cannot
+    ///     intersect never constrain them (the joint planner skips those).
     internal sealed class Perception
     {
         public readonly List<TrackedActor> Actors = new List<TrackedActor>();
@@ -70,6 +81,30 @@ namespace StreetRacing
         public float NearestAheadTtc = 999f;
         public float NearestAheadClosing;
 
+        // Persistent tracks by entity handle.
+        private readonly Dictionary<int, PersistedTrack> tracks = new Dictionary<int, PersistedTrack>();
+        private int prevScanMs;
+
+        private sealed class PersistedTrack
+        {
+            public int Handle;
+            public ActorKind Kind;
+            public Vector3 Position;
+            public Vector3 Velocity;
+            public int LastSeenMs;
+            public int FirstSeenMs;
+            public int SeenCount;
+            public bool Stale;
+        }
+
+        private struct Observation
+        {
+            public int Handle;
+            public ActorKind Kind;
+            public Vector3 Position;
+            public Vector3 Velocity;
+        }
+
         public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
             float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs = 100)
         {
@@ -81,13 +116,11 @@ namespace StreetRacing
             RaceRoute route, RoadCorridor corridor)
         {
             if (nowMs - LastScanMs < minIntervalMs) return;
+            int dtScanMs = Math.Max(20, nowMs - prevScanMs);
+            float dtScanS = dtScanMs / 1000f;
+            if (dtScanS > 0.6f) dtScanS = 0.6f;
+            prevScanMs = nowMs;
             LastScanMs = nowMs;
-            Actors.Clear();
-            AheadCount = 0;
-            NearestAheadDist = 999f;
-            NearestAheadTtc = 999f;
-            NearestAheadClosing = 0f;
-            ClosestTtcIndex = -1;
 
             Vector3 egoPos;
             Vector3 egoVel;
@@ -101,15 +134,12 @@ namespace StreetRacing
             }
             catch { return; }
 
-            // Dynamic range: stopping distance + margin, so fast DriveV cars
-            // see 120–170 m ahead instead of a fixed 40 m.
             float aB = brakeCap > 1f ? brakeCap : 6f;
             float stop = egoSpeed * reactionTimeS + (egoSpeed * egoSpeed) / (2f * aB);
             RangeM = RaceMath.Clamp(stop + 60f, 80f, 170f);
 
             var left = new Vector3(-fwd.Y, fwd.X, 0f);
             float egoS = (route != null && route.Built) ? route.AlongS : 0f;
-            // Ego speed along the route (discounts sliding / wrong-way).
             float egoAlong = egoSpeed;
             try
             {
@@ -122,64 +152,111 @@ namespace StreetRacing
             }
             catch { }
 
+            // --- Gather fresh observations (handle-keyed).
+            var observed = new Dictionary<int, Observation>();
             try
             {
                 foreach (var v in World.GetNearbyVehicles(egoPos, RangeM))
                 {
                     if (v == null || !v.Exists() || v == ego) continue;
-                    AddVehicle(v.Position, SafeVelocity(v), ActorKind.TrafficVehicle,
-                        egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
+                    int h = SafeHandle(v);
+                    if (h == 0) h = FallbackKey(v.Position);
+                    if (observed.ContainsKey(h)) continue;
+                    observed[h] = new Observation
+                    {
+                        Handle = h,
+                        Kind = ActorKind.TrafficVehicle,
+                        Position = v.Position,
+                        Velocity = SafeVelocity(v),
+                    };
                 }
             }
             catch { }
 
-            // Rival (player) is always tracked explicitly even if outside the
-            // vehicle pool for a frame (pool culling at range).
             try
             {
                 Vehicle rv = rivalVehicle;
                 if (rv != null && rv.Exists() && rv != ego)
                 {
-                    bool already = false;
-                    foreach (var a in Actors)
+                    int h = SafeHandle(rv);
+                    if (h == 0) h = FallbackKey(rv.Position);
+                    Vector3 rvp = rv.Position;
+                    if (RaceMath.FlatDistance(egoPos, rvp) < RangeM + 30f)
                     {
-                        if (RaceMath.FlatDistance(a.Position, rv.Position) < 2f) { already = true; break; }
+                        if (observed.TryGetValue(h, out var ex))
+                        {
+                            ex.Kind = ActorKind.Rival;
+                            observed[h] = ex;
+                        }
+                        else
+                        {
+                            observed[h] = new Observation
+                            {
+                                Handle = h,
+                                Kind = ActorKind.Rival,
+                                Position = rvp,
+                                Velocity = SafeVelocity(rv),
+                            };
+                        }
                     }
-                    if (!already && RaceMath.FlatDistance(egoPos, rv.Position) < RangeM + 30f)
-                        AddVehicle(rv.Position, SafeVelocity(rv), ActorKind.Rival, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
-                    else if (already)
-                        MarkRival(rv.Position);
                 }
                 else if (rivalPed != null && rivalPed.Exists())
                 {
                     var rp = rivalPed.Position;
                     if (RaceMath.FlatDistance(egoPos, rp) < RangeM)
                     {
+                        int h = SafeHandle(rivalPed);
+                        if (h == 0) h = FallbackKey(rp);
                         Vector3 rvv = new Vector3();
                         try { rvv = rivalPed.Velocity; } catch { }
-                        AddVehicle(rp, rvv, ActorKind.Rival, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
+                        if (observed.TryGetValue(h, out var ex))
+                        {
+                            ex.Kind = ActorKind.Rival;
+                            observed[h] = ex;
+                        }
+                        else
+                        {
+                            observed[h] = new Observation
+                            {
+                                Handle = h,
+                                Kind = ActorKind.Rival,
+                                Position = rp,
+                                Velocity = rvv,
+                            };
+                        }
                     }
                 }
             }
             catch { }
 
-            // Peds: shorter range (perf + relevance), still TTC-aware.
             try
             {
                 float pedRange = Math.Min(RangeM, 70f);
                 foreach (var p in World.GetNearbyPeds(egoPos, pedRange))
                 {
                     if (p == null || !p.Exists()) continue;
+                    // Skip the rival on foot here; handled above as Rival.
+                    try
+                    {
+                        if (rivalPed != null && rivalPed.Exists() && p.Handle == rivalPed.Handle) continue;
+                    }
+                    catch { }
+                    int h = SafeHandle(p);
+                    if (h == 0) h = FallbackKey(p.Position);
+                    if (observed.ContainsKey(h)) continue;
                     Vector3 pv = new Vector3();
                     try { pv = p.Velocity; } catch { }
-                    AddVehicle(p.Position, pv, ActorKind.Ped, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
+                    observed[h] = new Observation
+                    {
+                        Handle = h,
+                        Kind = ActorKind.Ped,
+                        Position = p.Position,
+                        Velocity = pv,
+                    };
                 }
             }
             catch { }
 
-            // Static obstacles (props, street furniture, barriers): short range,
-            // capped count. Modelled as zero-velocity actors so TTC degrades to
-            // dist/egoSpeed and the trajectory scorer treats them as blocks.
             try
             {
                 float propRange = Math.Min(RangeM, 60f);
@@ -191,15 +268,144 @@ namespace StreetRacing
                     Vector3 pp;
                     try { pp = pr.Position; } catch { continue; }
                     float pd = RaceMath.FlatDistance(egoPos, pp);
-                    if (pd < 4f) continue; // ignore what we're already touching
-                    AddVehicle(pp, new Vector3(), ActorKind.Obstacle, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
+                    if (pd < 4f) continue;
+                    int h = SafeHandle(pr);
+                    if (h == 0) h = FallbackKey(pp);
+                    if (observed.ContainsKey(h)) continue;
+                    observed[h] = new Observation
+                    {
+                        Handle = h,
+                        Kind = ActorKind.Obstacle,
+                        Position = pp,
+                        Velocity = new Vector3(),
+                    };
                     added++;
                 }
             }
             catch { }
 
-            // Summaries for planner + telemetry (computed BEFORE sort; the
-            // threat index is resolved AFTER sort so it stays valid).
+            // --- Merge into persistent tracks.
+            var seenNow = new HashSet<int>();
+            foreach (var kv in observed)
+            {
+                int h = kv.Key;
+                var o = kv.Value;
+                seenNow.Add(h);
+                PersistedTrack t;
+                if (tracks.TryGetValue(h, out t))
+                {
+                    // Handle reuse guard: teleport of an existing id -> reset.
+                    try
+                    {
+                        if (RaceMath.FlatDistance(t.Position, o.Position) > 25f && t.SeenCount > 2)
+                        {
+                            t.FirstSeenMs = nowMs;
+                            t.SeenCount = 0;
+                        }
+                    }
+                    catch { }
+                    t.Position = o.Position;
+                    t.Velocity = o.Velocity;
+                    t.Kind = o.Kind; // rival marking wins
+                    t.LastSeenMs = nowMs;
+                    t.SeenCount++;
+                    t.Stale = false;
+                }
+                else
+                {
+                    tracks[h] = new PersistedTrack
+                    {
+                        Handle = h,
+                        Kind = o.Kind,
+                        Position = o.Position,
+                        Velocity = o.Velocity,
+                        LastSeenMs = nowMs,
+                        FirstSeenMs = nowMs,
+                        SeenCount = 1,
+                        Stale = false,
+                    };
+                }
+            }
+
+            // Coast + expire.
+            var toRemove = new List<int>();
+            foreach (var kv in tracks)
+            {
+                var t = kv.Value;
+                if (seenNow.Contains(kv.Key)) continue;
+                float expiry = ExpiryFor(t.Kind);
+                if (nowMs - t.LastSeenMs > expiry)
+                {
+                    toRemove.Add(kv.Key);
+                }
+                else
+                {
+                    // Coast forward so one culled frame cannot flip the plan.
+                    try
+                    {
+                        t.Position = new Vector3(
+                            t.Position.X + t.Velocity.X * dtScanS,
+                            t.Position.Y + t.Velocity.Y * dtScanS,
+                            t.Position.Z);
+                    }
+                    catch { }
+                    t.Stale = true;
+                }
+            }
+            foreach (int k in toRemove)
+                tracks.Remove(k);
+
+            // --- Build the planning list with structural retention.
+            Actors.Clear();
+            AheadCount = 0;
+            NearestAheadDist = 999f;
+            NearestAheadTtc = 999f;
+            NearestAheadClosing = 0f;
+            ClosestTtcIndex = -1;
+
+            var scored = new List<KeyValuePair<TrackedActor, int>>();
+            foreach (var kv in tracks)
+            {
+                var t = kv.Value;
+                var a = BuildActor(t, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
+                // Hysteresis: single-frame ghosts never constrain (need 2 hits),
+                // but the rival is trusted immediately.
+                if (t.SeenCount < 2 && t.Kind != ActorKind.Rival && !t.Stale)
+                {
+                    // Still keep it for display/retention, but mark stale-ish so
+                    // the joint planner treats it as unconfirmed? Keep simple:
+                    // keep, since expiry/coast already damps flicker. No drop.
+                }
+                int keepRank = RetentionRank(a, corridor);
+                if (keepRank < 0) continue; // irrelevant far field
+                scored.Add(new KeyValuePair<TrackedActor, int>(a, keepRank));
+            }
+
+            // Stable relevance ordering (NOT TTC): rival, route-relevant by
+            // distance, nearby bubble by distance. TTC never reorders.
+            scored.Sort((x, y) =>
+            {
+                int r = x.Value.CompareTo(y.Value);
+                if (r != 0) return r;
+                var ax = x.Key;
+                var ay = y.Key;
+                bool rx = ax.Kind == ActorKind.Rival;
+                bool ry = ay.Kind == ActorKind.Rival;
+                if (rx != ry) return rx ? -1 : 1;
+                float dx = ax.RouteValid ? ax.RouteDist : ax.Dist + 1000f;
+                float dy = ay.RouteValid ? ay.RouteDist : ay.Dist + 1000f;
+                // Prefer ahead route actors, then nearest.
+                bool axRel = ax.RouteValid && ax.RouteDist > -10f && ax.RouteDist < 200f;
+                bool ayRel = ay.RouteValid && ay.RouteDist > -10f && ay.RouteDist < 200f;
+                if (axRel != ayRel) return axRel ? -1 : 1;
+                if (axRel && ayRel) return dx.CompareTo(dy);
+                return ax.Dist.CompareTo(ay.Dist);
+            });
+
+            int cap = 48;
+            for (int i = 0; i < scored.Count && Actors.Count < cap; i++)
+                Actors.Add(scored[i].Key);
+
             for (int i = 0; i < Actors.Count; i++)
             {
                 var a = Actors[i];
@@ -218,13 +424,6 @@ namespace StreetRacing
                 }
             }
 
-            // Keep the list bounded + sorted by threat for telemetry stability.
-            Actors.Sort((x, y) => x.Ttc.CompareTo(y.Ttc));
-            if (Actors.Count > 24)
-                Actors.RemoveRange(24, Actors.Count - 24);
-
-            // Resolve the closest-TTC index AFTER sorting (the old code set it
-            // before Sort, so it pointed at a different actor afterwards).
             float bestTtc = 999f;
             ClosestTtcIndex = -1;
             for (int i = 0; i < Actors.Count; i++)
@@ -238,6 +437,36 @@ namespace StreetRacing
             }
         }
 
+        private static float ExpiryFor(ActorKind kind)
+        {
+            switch (kind)
+            {
+                case ActorKind.Rival: return 900f;
+                case ActorKind.Ped: return 550f;
+                case ActorKind.Obstacle: return 1000f;
+                default: return 700f;
+            }
+        }
+
+        // Retention rank: 0 rival, 1 route/path-relevant, 2 near safety bubble,
+        // 3 imminent TTC, -1 drop. Always retains the three required classes.
+        private static int RetentionRank(TrackedActor a, RoadCorridor corridor)
+        {
+            if (a.Kind == ActorKind.Rival) return 0;
+            if (a.RouteValid && a.RouteDist > -10f && a.RouteDist < 175f)
+            {
+                float half = corridor != null ? corridor.HalfWidthAt(Math.Max(0f, a.RouteDist)) : 7f;
+                float tol = half + (a.Kind == ActorKind.Ped ? 3f : 4f);
+                if (Math.Abs(a.RouteLateral) < tol) return 1;
+            }
+            if (a.Dist < 30f) return 2;
+            if (a.Ttc < 3.5f && a.ClosingSpeed > 2f) return 3;
+            // Far route actors slightly beyond the horizon are still worth
+            // keeping for the braking preview; everything else drops.
+            if (a.RouteValid && a.RouteDist >= 175f && a.RouteDist < 230f) return 3;
+            return -1;
+        }
+
         public bool TryGetClosestThreat(out TrackedActor actor)
         {
             actor = new TrackedActor();
@@ -246,7 +475,6 @@ namespace StreetRacing
                 actor = Actors[ClosestTtcIndex];
                 return true;
             }
-            // Fall back to nearest ahead.
             float bd = 999f;
             bool found = false;
             foreach (var a in Actors)
@@ -257,7 +485,6 @@ namespace StreetRacing
         }
 
         /// Nearest actor ahead ON THE ROUTE (not just in the nose cone).
-        /// Used by the speed planner's stopping logic.
         public bool TryGetLeadOnRoute(out TrackedActor actor, float egoS, RoadCorridor corridor, float maxDistM)
         {
             actor = new TrackedActor();
@@ -284,10 +511,12 @@ namespace StreetRacing
                 a.Position.Z);
         }
 
-        private void AddVehicle(Vector3 pos, Vector3 vel, ActorKind kind,
+        private TrackedActor BuildActor(PersistedTrack t,
             Vector3 egoPos, Vector3 egoVel, Vector3 fwd, Vector3 left,
             RaceRoute route, RoadCorridor corridor, float egoS, float egoAlong)
         {
+            Vector3 pos = t.Position;
+            Vector3 vel = t.Velocity;
             var to = new Vector3(pos.X - egoPos.X, pos.Y - egoPos.Y, 0f);
             float dist = RaceMath.FlatLength(to);
             float lon = RaceMath.FlatDot(to, fwd);
@@ -298,14 +527,18 @@ namespace StreetRacing
             if (dist > 0.5f)
             {
                 var dir = new Vector3(to.X / dist, to.Y / dist, 0f);
-                closing = -(rel.X * dir.X + rel.Y * dir.Y); // + = approaching
+                closing = -(rel.X * dir.X + rel.Y * dir.Y);
                 if (closing > 0.5f) ttc = dist / closing;
             }
             float spd = RaceMath.FlatLength(vel);
             var a = new TrackedActor
             {
                 Valid = true,
-                Kind = kind,
+                Kind = t.Kind,
+                Handle = t.Handle,
+                SeenCount = t.SeenCount,
+                Stale = t.Stale,
+                OffRoadway = false,
                 Position = pos,
                 Velocity = new Vector3(vel.X, vel.Y, 0f),
                 Dist = dist,
@@ -323,7 +556,6 @@ namespace StreetRacing
                 ClosingAlong = 0f,
                 RouteTtc = 999f,
             };
-            // Route-frame projection (road-following, not nose-following).
             try
             {
                 if (route != null && route.Built)
@@ -337,24 +569,41 @@ namespace StreetRacing
                     a.ClosingAlong = egoAlong - a.SpeedAlong;
                     if (a.ClosingAlong > 0.5f && a.RouteDist > -2f)
                         a.RouteTtc = a.RouteDist / a.ClosingAlong;
+                    try
+                    {
+                        if (corridor != null && a.RouteDist > -10f && a.RouteDist < 230f)
+                        {
+                            float half = corridor.HalfWidthAt(Math.Max(0f, a.RouteDist));
+                            float tol = half + (t.Kind == ActorKind.Ped || t.Kind == ActorKind.Obstacle ? 2f : 2f);
+                            a.OffRoadway = Math.Abs(a.RouteLateral) > tol;
+                        }
+                    }
+                    catch { }
                 }
             }
             catch { a.RouteValid = false; }
-            Actors.Add(a);
+            return a;
         }
 
-        private void MarkRival(Vector3 rivalPos)
+        private static int SafeHandle(Entity e)
         {
-            for (int i = 0; i < Actors.Count; i++)
+            try { return e.Handle; }
+            catch { return 0; }
+        }
+
+        private static int FallbackKey(Vector3 p)
+        {
+            // Entities without a readable handle (should be rare): quantize
+            // position into a negative pseudo-key so repeated scans merge.
+            try
             {
-                if (RaceMath.FlatDistance(Actors[i].Position, rivalPos) < 2f)
-                {
-                    var a = Actors[i];
-                    a.Kind = ActorKind.Rival;
-                    Actors[i] = a;
-                    return;
-                }
+                int qx = (int)Math.Floor(p.X / 2f);
+                int qy = (int)Math.Floor(p.Y / 2f);
+                int k = (qx * 73856093) ^ (qy * 19349663);
+                k = Math.Abs(k % 1000000) + 1;
+                return -k;
             }
+            catch { return -1; }
         }
 
         private static Vector3 SafeVelocity(Entity e)

@@ -5,20 +5,18 @@ using GTA.Native;
 
 namespace StreetRacing.Control
 {
-    /// Real direct controller: pure-pursuit steering + longitudinal PID that
-    /// writes steering/throttle/brake every tick. The planner architecture
-    /// above it is UNCHANGED — it consumes the same (aim point, target speed)
-    /// the GTA servo gets, but executes the trajectory itself instead of
-    /// asking GTA pathfinding to replan it.
+    /// Intended controller: executes the joint planner's sampled path + speed
+    /// profile directly (steering/throttle/brake), with no Rockstar
+    /// pathfinding in the loop. The planner ticks at ~10 Hz; this controller
+    /// runs every script tick (~20 Hz) against the latest maneuver:
+    ///   - local speed-dependent lookahead point on the SELECTED path;
+    ///   - pure-pursuit steering to that point (cross-track + heading error);
+    ///   - PI longitudinal tracking of the LOCAL planned speed.
     ///
-    /// Status: implemented, selectable via StreetRacing.ini Actuator=Direct,
-    /// default remains GtaDriver(experiment) until controlled tests answer:
-    /// "Can GTA's driver accurately follow our chosen path and speed under
-    /// DriveV?" If path-following error stays large under GtaDriver, flip the
-    /// default here. Direct control under DriveV physics still needs in-game
-    /// gain validation (steering authority falls with speed; throttle/brake
-    /// mapping varies by car) — start with Balanced + low cruise and read the
-    /// PathFollowingError telemetry before raising pace.
+    /// GtaDriverActuator remains only as a baseline/diagnostic. Direct is the
+    /// default isolation test AND the intended actuator: if the AI stops, the
+    /// maneuver (path+speed) and these errors say why — there is no second
+    /// independent driving decision to blame.
     internal sealed class DirectActuator : IVehicleActuator
     {
         private Ped driver;
@@ -35,8 +33,15 @@ namespace StreetRacing.Control
         public string ActuatorName => "Direct";
         public PathFollowingError LastError { get; private set; } = new PathFollowingError();
 
+        private ManeuverCommand cmd;
+        private bool hasManeuver;
+        private int planId;
+
         // Longitudinal state (simple PI + anti-windup via clamp).
         private float speedInt;
+        private float lastSteer;
+        private float lastThr;
+        private float lastBrk;
 
         public void Attach(Ped driver, Vehicle vehicle, float cruise, int style, int refreshMs, int stuckMs)
         {
@@ -58,8 +63,12 @@ namespace StreetRacing.Control
 
             try { driver.Task.ClearAll(); } catch { }
             HasPlan = false;
+            hasManeuver = false;
             ReissueCount = 0;
             speedInt = 0f;
+            lastSteer = 0f;
+            lastThr = 0f;
+            lastBrk = 0f;
         }
 
         public void SetPlan(Vector3 aimPoint, float targetSpeed, int style, string reason)
@@ -69,11 +78,46 @@ namespace StreetRacing.Control
             CurrentStyle = style;
             LastReason = reason ?? "";
             HasPlan = true;
+            // Legacy seam: single-point maneuver at constant speed.
+            try
+            {
+                Vector3 ego = vehicle != null && vehicle.Exists() ? vehicle.Position : aimPoint;
+                cmd = new ManeuverCommand
+                {
+                    Path = new System.Collections.Generic.List<Vector3> { ego, aimPoint },
+                    StationS = new System.Collections.Generic.List<float> { 0f, RaceMath.FlatDistance(ego, aimPoint) },
+                    SpeedProfile = new System.Collections.Generic.List<float> { CurrentCruise, CurrentCruise },
+                    AimPoint = aimPoint,
+                    TargetSpeed = CurrentCruise,
+                    Style = style,
+                    Reason = LastReason,
+                    PlanId = planId,
+                };
+                hasManeuver = cmd.Path.Count >= 2;
+            }
+            catch { hasManeuver = false; }
+        }
+
+        public void SetManeuver(ManeuverCommand c)
+        {
+            cmd = c;
+            planId = c.PlanId;
+            hasManeuver = c.Path != null && c.Path.Count >= 2;
+            HasPlan = hasManeuver;
+            try
+            {
+                CurrentAim = c.AimPoint;
+                CurrentCruise = Math.Max(0f, c.TargetSpeed);
+                CurrentStyle = c.Style;
+                LastReason = c.Reason ?? "";
+            }
+            catch { }
         }
 
         public void Clear()
         {
             HasPlan = false;
+            hasManeuver = false;
             try
             {
                 if (vehicle != null && vehicle.Exists())
@@ -116,7 +160,7 @@ namespace StreetRacing.Control
 
         public bool OnTick(bool forceReissue, string tacticalName)
         {
-            if (!HasPlan || !Valid()) return false;
+            if (!HasPlan || !Valid() || !hasManeuver) return false;
             Vector3 egoPos;
             float egoHeading;
             float egoSpeed;
@@ -128,37 +172,78 @@ namespace StreetRacing.Control
             }
             catch { return false; }
 
-            // --- Lateral: pure pursuit to the aim point.
-            var to = new Vector3(CurrentAim.X - egoPos.X, CurrentAim.Y - egoPos.Y, 0f);
-            float distToAim = RaceMath.FlatLength(to);
-            float desiredHeading = distToAim > 1f
+            // --- Locate ego on the selected path.
+            float sEgo;
+            float crossTrack;
+            float pathHeading;
+            Vector3 closest;
+            try
+            {
+                ClosestOnPath(egoPos, cmd.Path, out sEgo, out crossTrack, out pathHeading, out closest);
+            }
+            catch { return false; }
+
+            // Local speed-dependent lookahead on the SELECTED path.
+            float ld = 6f + egoSpeed * 0.7f;
+            ld = RaceMath.Clamp(ld, 8f, 28f);
+            Vector3 lookPt;
+            float lookS;
+            float lookSpeed;
+            try
+            {
+                lookS = sEgo + ld;
+                lookPt = PointAtS(cmd.Path, StationSToCumulative(cmd), lookS);
+                lookSpeed = SpeedAtS(cmd, sEgo);
+            }
+            catch
+            {
+                lookPt = CurrentAim;
+                lookS = sEgo + ld;
+                lookSpeed = CurrentCruise;
+            }
+
+            // --- Lateral: pure pursuit to the local lookahead point.
+            var to = new Vector3(lookPt.X - egoPos.X, lookPt.Y - egoPos.Y, 0f);
+            float distToLook = RaceMath.FlatLength(to);
+            float desiredHeading = distToLook > 1f
                 ? RaceMath.HeadingFromVector(RaceMath.FlatNormalize(to))
-                : egoHeading;
-            // Signed error: + = need to turn left.
+                : pathHeading;
             float headErr = RaceMath.HeadingDiffDeg(desiredHeading, egoHeading);
 
-            // Speed-scheduled gain: full authority at crawl, calmer at pace.
-            // SteeringAngle units in SHVDN are degrees at the wheels; clamp hard.
-            float steerDeg = RaceMath.Clamp(headErr * 1.2f, -32f, 32f);
-            if (egoSpeed > 25f) steerDeg = RaceMath.Clamp(headErr * 0.7f, -18f, 18f);
-            else if (egoSpeed > 15f) steerDeg = RaceMath.Clamp(headErr * 0.9f, -24f, 24f);
+            // Pure-pursuit curvature -> wheel angle (wheelbase ~2.7 m).
+            float alphaDeg = headErr;
+            float alphaRad = alphaDeg * (float)Math.PI / 180f;
+            float wheelbase = 2.7f;
+            float steerPursuit = 0f;
+            if (distToLook > 1f)
+            {
+                float kappa = 2f * (float)Math.Sin(alphaRad) / Math.Max(distToLook, 3f);
+                steerPursuit = (float)(Math.Atan(wheelbase * kappa) * 180.0 / Math.PI);
+            }
+            // Blend pursuit angle with heading error for low-speed authority,
+            // plus a small cross-track correction so we rejoin after slides.
+            float steerDeg = steerPursuit * 1.4f + headErr * 0.35f - crossTrack * 1.1f;
+            // Speed-scheduled clamp (authority falls with speed).
+            if (egoSpeed > 25f) steerDeg = RaceMath.Clamp(steerDeg, -18f, 18f);
+            else if (egoSpeed > 15f) steerDeg = RaceMath.Clamp(steerDeg, -24f, 24f);
+            else steerDeg = RaceMath.Clamp(steerDeg, -32f, 32f);
 
-            // Reverse logic: aim behind us at crawl -> back up with inverted steer.
-            bool reversing = Math.Abs(headErr) > 130f && egoSpeed < 4f && distToAim > 4f;
+            bool reversing = Math.Abs(headErr) > 130f && egoSpeed < 4f && distToLook > 4f;
             if (reversing) steerDeg = -steerDeg;
 
             try { vehicle.SteeringAngle = steerDeg; } catch { }
             try { vehicle.SteeringScale = 1f; } catch { }
 
-            // --- Longitudinal: PI on speed error, mapped to throttle/brake.
-            float speedErr = CurrentCruise - egoSpeed;
+            // --- Longitudinal: PI on LOCAL planned speed error.
+            float speedErr = lookSpeed - egoSpeed;
             float dt = 0.05f; // 20 Hz script tick
             speedInt = RaceMath.Clamp(speedInt + speedErr * dt, -6f, 6f);
-            float u = speedErr * 0.35f + speedInt * 0.12f; // + = need throttle
+            float u = speedErr * 0.35f + speedInt * 0.12f;
 
-            // Crawl recovery: stopped far from aim with a plan -> launch.
-            bool stalled = egoSpeed < 1.5f && distToAim > 8f && CurrentCruise > 3f;
+            bool stalled = egoSpeed < 1.5f && lookSpeed > 3f;
 
+            float thr = 0f;
+            float brk = 0f;
             try
             {
                 if (reversing)
@@ -166,65 +251,187 @@ namespace StreetRacing.Control
                     vehicle.Throttle = -0.6f;
                     try { vehicle.BrakePower = 0f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
+                    thr = -0.6f;
                 }
                 else if (u >= 0f)
                 {
-                    float thr = RaceMath.Clamp(u, stalled ? 0.8f : 0f, 1f);
+                    thr = RaceMath.Clamp(u, stalled ? 0.8f : 0f, 1f);
                     if (stalled && thr < 0.8f) thr = 0.8f;
                     vehicle.Throttle = thr;
                     try { vehicle.BrakePower = 0f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
-                    // Brakes below ~35 m/s full-throttle launch control-ish: keep simple.
                 }
                 else
                 {
                     vehicle.Throttle = 0f;
-                    float brk = RaceMath.Clamp(-u, 0.15f, 1f);
-                    // Hard stop when the plan wants ~0 and we still roll.
-                    if (CurrentCruise < 0.5f && egoSpeed > 1f) brk = 1f;
+                    brk = RaceMath.Clamp(-u, 0.15f, 1f);
+                    if (lookSpeed < 0.5f && egoSpeed > 1f) brk = 1f;
                     try { vehicle.BrakePower = brk; } catch { }
-                    try { vehicle.IsHandbrakeForcedOn = CurrentCruise < 0.5f && egoSpeed < 3f && distToAim < 6f; }
+                    try { vehicle.IsHandbrakeForcedOn = lookSpeed < 0.5f && egoSpeed < 3f; }
                     catch { }
                 }
             }
             catch { }
 
-            ReissueCount++; // counts control applications (vs GTA repaths)
+            lastSteer = steerDeg;
+            lastThr = thr;
+            lastBrk = brk;
+
+            var e = new PathFollowingError
+            {
+                Valid = true,
+                LateralErrM = crossTrack,
+                HeadingErrDeg = -headErr,
+                SpeedErrMps = speedErr,
+                DistToPathM = Math.Abs(crossTrack),
+                SteerDeg = steerDeg,
+                Throttle01 = thr,
+                Brake01 = brk,
+                LocalTargetMps = lookSpeed,
+                LookaheadM = ld,
+                PlanId = planId,
+            };
+            LastError = e;
+
+            ReissueCount++;
             return true;
         }
 
         public void UpdatePathError(Vector3 egoPos, float egoHeadingDeg, float egoSpeed,
             RaceRoute route, TrajectoryCandidate chosen, bool hasChosen, float targetSpeed)
         {
-            var e = new PathFollowingError { Valid = false };
+            // Direct already maintains LastError every control tick in OnTick.
+            // This path only fills a fallback when OnTick hasn't run yet
+            // (first plan tick) so telemetry never gaps.
             try
             {
-                if (route == null || !route.Built) { LastError = e; return; }
-                float desiredHeading = route.HeadingAtS(route.AlongS + 8f);
-                float distToPath = 999f;
-                if (hasChosen && chosen.Path != null && chosen.Path.Count >= 2)
+                if (LastError.Valid && LastError.PlanId == planId) return;
+                if (!hasManeuver || cmd.Path == null || cmd.Path.Count < 2)
                 {
-                    var p0 = chosen.Path[0];
-                    var p1 = chosen.Path[Math.Min(2, chosen.Path.Count - 1)];
-                    var d = new Vector3(p1.X - p0.X, p1.Y - p0.Y, 0f);
-                    if (RaceMath.FlatLength(d) > 0.5f)
-                        desiredHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d));
-                    float best = float.MaxValue;
-                    for (int i = 0; i < chosen.Path.Count - 1; i++)
-                    {
-                        var pr = RaceMath.ProjectOnSegment(egoPos, chosen.Path[i], chosen.Path[i + 1]);
-                        if (pr.Dist < best) best = pr.Dist;
-                    }
-                    distToPath = best;
+                    var fb = new PathFollowingError { Valid = false };
+                    LastError = fb;
+                    return;
                 }
-                e.Valid = true;
-                e.LateralErrM = route.Lateral;
-                e.HeadingErrDeg = -RaceMath.HeadingDiffDeg(desiredHeading, egoHeadingDeg);
-                e.SpeedErrMps = targetSpeed - egoSpeed;
-                e.DistToPathM = distToPath;
+                float sEgo;
+                float cross;
+                float pHead;
+                Vector3 closest;
+                ClosestOnPath(egoPos, cmd.Path, out sEgo, out cross, out pHead, out closest);
+                float localV = SpeedAtS(cmd, sEgo);
+                float headErr = RaceMath.HeadingDiffDeg(pHead, egoHeadingDeg);
+                LastError = new PathFollowingError
+                {
+                    Valid = true,
+                    LateralErrM = cross,
+                    HeadingErrDeg = -headErr,
+                    SpeedErrMps = localV - egoSpeed,
+                    DistToPathM = Math.Abs(cross),
+                    SteerDeg = lastSteer,
+                    Throttle01 = lastThr,
+                    Brake01 = lastBrk,
+                    LocalTargetMps = localV,
+                    LookaheadM = RaceMath.Clamp(6f + egoSpeed * 0.7f, 8f, 28f),
+                    PlanId = planId,
+                };
             }
-            catch { e.Valid = false; }
-            LastError = e;
+            catch { }
+        }
+
+        private static void ClosestOnPath(Vector3 egoPos, System.Collections.Generic.List<Vector3> path,
+            out float sEgo, out float crossTrack, out float pathHeading, out Vector3 closest)
+        {
+            sEgo = 0f;
+            crossTrack = 999f;
+            pathHeading = 0f;
+            closest = path[0];
+            float best = float.MaxValue;
+            float accum = 0f;
+            int bestSeg = 0;
+            RaceMath.Projection bestPr = new RaceMath.Projection();
+            for (int i = 0; i < path.Count - 1; i++)
+            {
+                var pr = RaceMath.ProjectOnSegment(egoPos, path[i], path[i + 1]);
+                if (pr.Dist < best)
+                {
+                    best = pr.Dist;
+                    bestSeg = i;
+                    bestPr = pr;
+                }
+            }
+            // Arclength to projection.
+            accum = 0f;
+            for (int i = 0; i < bestSeg; i++)
+                accum += RaceMath.FlatDistance(path[i], path[i + 1]);
+            sEgo = accum + bestPr.Along;
+            closest = bestPr.Closest;
+            var segDir = new Vector3(
+                path[Math.Min(bestSeg + 1, path.Count - 1)].X - path[bestSeg].X,
+                path[Math.Min(bestSeg + 1, path.Count - 1)].Y - path[bestSeg].Y, 0f);
+            if (RaceMath.FlatLength(segDir) < 0.3f) segDir = new Vector3(0f, 1f, 0f);
+            segDir = RaceMath.FlatNormalize(segDir);
+            pathHeading = RaceMath.HeadingFromVector(segDir);
+            float cross = RaceMath.FlatCross(segDir, new Vector3(egoPos.X - closest.X, egoPos.Y - closest.Y, 0f));
+            crossTrack = cross; // + = ego left of path direction
+        }
+
+        private static System.Collections.Generic.List<float> StationSToCumulative(ManeuverCommand c)
+        {
+            if (c.StationS != null && c.StationS.Count == c.Path.Count)
+                return c.StationS;
+            var cum = new System.Collections.Generic.List<float>(c.Path.Count);
+            float acc = 0f;
+            cum.Add(0f);
+            for (int i = 1; i < c.Path.Count; i++)
+            {
+                acc += RaceMath.FlatDistance(c.Path[i - 1], c.Path[i]);
+                cum.Add(acc);
+            }
+            return cum;
+        }
+
+        private static Vector3 PointAtS(System.Collections.Generic.List<Vector3> path,
+            System.Collections.Generic.List<float> cum, float s)
+        {
+            if (path.Count == 0) return Vector3.Zero;
+            if (s <= 0f) return path[0];
+            if (s >= cum[cum.Count - 1]) return path[path.Count - 1];
+            for (int i = 0; i < cum.Count - 1; i++)
+            {
+                if (s >= cum[i] && s <= cum[i + 1])
+                {
+                    float seg = cum[i + 1] - cum[i];
+                    float t = seg > 1e-4f ? (s - cum[i]) / seg : 0f;
+                    var a = path[i];
+                    var b = path[i + 1];
+                    return new Vector3(
+                        a.X + (b.X - a.X) * t,
+                        a.Y + (b.Y - a.Y) * t,
+                        a.Z + (b.Z - a.Z) * t);
+                }
+            }
+            return path[path.Count - 1];
+        }
+
+        private static float SpeedAtS(ManeuverCommand c, float s)
+        {
+            try
+            {
+                if (c.SpeedProfile == null || c.SpeedProfile.Count == 0) return c.TargetSpeed;
+                var cum = StationSToCumulative(c);
+                if (s <= 0f) return c.SpeedProfile[0];
+                if (s >= cum[cum.Count - 1]) return c.SpeedProfile[c.SpeedProfile.Count - 1];
+                for (int i = 0; i < cum.Count - 1; i++)
+                {
+                    if (s >= cum[i] && s <= cum[i + 1])
+                    {
+                        float seg = cum[i + 1] - cum[i];
+                        float t = seg > 1e-4f ? (s - cum[i]) / seg : 0f;
+                        return c.SpeedProfile[i] * (1f - t) + c.SpeedProfile[i + 1] * t;
+                    }
+                }
+                return c.SpeedProfile[c.SpeedProfile.Count - 1];
+            }
+            catch { return c.TargetSpeed; }
         }
     }
 
@@ -249,6 +456,7 @@ namespace StreetRacing.Control
             HasPlan = true;
             throw new NotImplementedException("DirectActuatorStub is retired; use Control.DirectActuator.");
         }
+        public void SetManeuver(ManeuverCommand cmd) { throw new NotImplementedException(); }
         public void Clear() { HasPlan = false; }
         public bool Valid() => false;
         public void Stop() { }

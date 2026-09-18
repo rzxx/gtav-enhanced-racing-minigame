@@ -50,23 +50,22 @@ Then in game press **Insert** to reload scripts (or restart the game).
 | RaceTimeoutMs / CooldownMs | 600000 / 8000 | give-up timer, rest between races |
 | CancelKey | G | cancel active race |
 | DebugViz | 0 | 1 = in-game overlay: route/corridor/candidates/predictions/braking |
-| Actuator | GtaDriver | GtaDriver (experiment) or Direct (steering/throttle/brake) |
+| Actuator | Direct | Direct (intended: executes joint path/speed every tick) or GtaDriver (baseline/diagnostic only) |
 
-## Architecture (v2 — trajectory foundations)
+## Architecture (v3 — joint maneuver)
 
 ```
-race route -> drivable corridor -> perception/prediction -> tactics
-    -> candidate trajectories -> speed profile -> actuator -> DriveV
+race route -> drivable corridor -> persistent perception -> tactics
+    -> JOINT maneuver (path + speed together) -> Direct -> DriveV
 ```
 
 - **Route (`Route/RaceRoute.cs`):** real connected GPS route first (`GET_GPS_BLIP_ROUTE_FOUND` / `GET_POS_ALONG_GPS_TYPE_ROUTE`, validated geometrically across route types 1/0/2, distance- then index-interpretation, resampled ~18 m), with connected street-walk fallback and straight last resort. `Source` (`GpsDist/GpsIdx/FallbackWalk/StraightFallback`) is logged; a `TryUpgradeToGps` pass adopts GPS within ~12 s if the blip route wasn't ready at Start. Progress/loss/recovery as before (same-direction bias, near-point recovery, never the 2 km finish).
 - **Corridor (`Road/RoadCorridor.cs`):** FIXED `GET_ROAD_BOUNDARY_USING_HEADING` (one output, not two — probes left/right via ±90° with width/midpoint validation + on-road cross-check). Sampled profile along the horizon (slices every 10 m to lookahead+60 m, `HalfWidthAt/MinHalfWidthAhead/SliceAt`), not one `HalfWidth`. Sweep fallback, then conservative default.
-- **Perception (`Sense/Perception.cs`):** route-frame actors (`RouteS/RouteLateral/SpeedAlong/ClosingAlong/RouteTtc`) alongside ego-frame; all planning uses the route frame. FIXED `ClosestTtcIndex` (resolved after sort, was invalid). `TryGetLeadOnRoute` for speed following.
+- **Perception (`Sense/Perception.cs`):** PERSISTENT tracking by handle with short expiry + coast/hysteresis (no clear/rebuild TTC-sorted top-24). Always retains route/path-relevant actors, the nearby safety bubble and the rival; stable relevance ordering (TTC is one signal, not the retention order). Route-frame actors (`RouteS/RouteLateral/SpeedAlong/ClosingAlong/RouteTtc`) + `OffRoadway` flag so sidewalk peds/props never constrain paths they cannot intersect. `TryGetLeadOnRoute` for Follow.
 - **Capability (`Planning/VehicleCapability.cs`):** spin/yaw rejection via slip + yaw gates; confidence 0..1 (rises stable, collapses on slide/spin); only stable physical samples adapt brake/lat/top. Impacts/teleports never train it.
-- **Trajectories (`Planning/TrajectoryPlanner.cs`):** 7 smooth sampled paths (smoothstep start→target lateral, stations every 10 m) through corridor slices. Swept scoring: per-station boundaries, path curvature (`MaxKappa`, lateral-g demand), predicted-actor distance to the polyline over transit time, tactical/inside bias. Blocked best yields to first viable unless committed.
-- **Speed (`Planning/SpeedPlanner.cs`):** curvature profile every 10 m to lookahead+80 m with backwards braking pass (`v[i]=min(vAllow[i],sqrt(v[i+1]²+2·a·ds))`), so future corners constrain now. FIXED `CornerCaution` (divide: >1 slower; numbers unchanged). Obstacle speeds from projected `SpeedAlong`, not `Speed*0.7`. `BrakingPointS` + full profile exposed for viz.
-- **Tactics (`Tactics/RaceTactics.cs`):** same modes/gates, now route-aware (`SideClear/Blocked/Clearance` use route lateral/dist; narrow-road uses profile min width).
-- **Actuator (`Control/`):** `IVehicleActuator` seam, planner unchanged. `GtaDriverActuator` = EXPERIMENT (short-horizon servo, rate-limited re-issue; hands point/speed to GTA pathfinding, does not guarantee trajectory). `DirectActuator` = real pure-pursuit + PI longitudinal (`SteeringAngle/Throttle/BrakePower`), selectable via `Actuator=Direct`. Both report `PathFollowingError` (desired vs actual) every plan tick — the decisive measurement.
+- **Maneuver (`Planning/TrajectoryPlanner.cs` + `SpeedPlanner.cs`):** JOINT 7-candidate plan. Every candidate: curvature speed profile → station arrival times → predict actors at those times → swept-envelope test along THAT path → constrain speed only for actors conflicting with THAT path → backwards braking pass (+ forward accel feasibility) → score the complete maneuver (safety/clearance, progress/mean-speed, smoothness/curvature+decel, tactical/inside intent, road margin, hysteresis). Winner is path+speed together; an avoiding path keeps speed and beats a stopped center path — no global corridor-wide obstacle speed, no creep heuristic.
+- **Tactics (`Tactics/RaceTactics.cs`):** same modes/gates, route-aware, skips `OffRoadway` sidewalk clutter in `SideClear/Blocked/Clearance`.
+- **Actuator (`Control/`):** `IVehicleActuator` seam now passes the full maneuver (`SetManeuver`: sampled `Path` + `StationS` + `SpeedProfile`). `DirectActuator` = intended controller: local speed-dependent lookahead on the SELECTED path + pure-pursuit steering + PI on LOCAL planned speed, every script tick (~20 Hz) independently of the ~10 Hz plan cadence. `GtaDriverActuator` = baseline/diagnostic only (servo-tracks aim+speed, rate-limited re-issue). Both report extended `PathFollowingError` (cross-track/heading/local-speed + steer/throttle/brake) every tick.
 - **Viz (`Debug/RaceDebugViz.cs`):** route/corridor/candidates/chosen/predictions/aim/braking markers (`DebugViz=1`).
 - **Skill (`Core/DriverProfile.cs`):** unchanged numbers (no tuning this pass).
 - **Impacts (`Sense/ImpactClassifier.cs`):** unchanged.
@@ -76,13 +75,13 @@ race route -> drivable corridor -> perception/prediction -> tactics
 Each race writes `scripts\StreetRacing_race_<id>.csv` (10 Hz) plus `_events.csv`.
 Disable with `TelemetryEnabled=0`. Send both files after test races to tune further.
 
-Samples: `t_ms,...,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa` (first 31 cols unchanged)
+Samples: legacy 42 cols unchanged, then `chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt` — chosen candidate + its speed profile summary, which actor constrained which station, predicted clearance, planner id, controller errors/outputs.
 
-Events: `START / ROUTE / GPS_ROUTE / ACTUATOR / TACTIC / ROUTE_LOST / ROUTE_FOUND / IMPACT / TELEPORT / HARD_BRAKE / CTRL / PATH_ERR`
+Events: `START / ROUTE / GPS_ROUTE / ACTUATOR / TACTIC / ROUTE_LOST / ROUTE_FOUND / IMPACT / TELEPORT / HARD_BRAKE / CTRL / PATH_ERR / PLAN` (`PLAN` = planner changes: chosen idx/lat/speed/limiting/clearance/constraining actor/station/score).
 
-Decisive test: run 2–3 races with `DebugViz=1`, then read `distToPath/speedErr` + `PATH_ERR` events. If GTA's servo holds <4 m / <4 m/s on twisty roads, it follows; if it repeatedly cuts/swings/caps (expectation: it will not hold precise trajectories under DriveV), set `Actuator=Direct` and re-test — planner output is identical, only the servo changes.
+Decisive test: run 2–3 races with `DebugViz=1` (default `Actuator=Direct`). Read `chIdx/constrKind/constrS/minPredClear/planId` + `PLAN` events (which actor constrained which path station, when the plan changed) and `distToPath/speedErr/steerDeg/thr01/brk01/localVTgt` (Direct executing the maneuver). A correct pass shows: avoiding paths keep `chMeanV` high while blocked center paths stop; `constrHandle/constrS` names the binding actor/station; `distToPath` stays small without `CTRL` repath storms (GtaDriver baseline only).
 
-Retired: `offroad_m` (invalid street-node distance), 40 m frontal-only sensing, `dec`-only brake detection, alignment-only wrong-way detection, long-range `DriveTo(finish)`.
+Retired: `offroad_m` (invalid street-node distance), 40 m frontal-only sensing, `dec`-only brake detection, alignment-only wrong-way detection, long-range `DriveTo(finish)`, global corridor-wide obstacle speed, creep heuristic, TTC-sorted top-24 perception rebuild.
 
 ## Tuning the AI
 
