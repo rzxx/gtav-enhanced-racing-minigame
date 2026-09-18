@@ -167,6 +167,173 @@ namespace StreetRacing
             }
         }
 
+        /// Immutable snapshot export (no GPS natives). The returned snapshot
+        /// is a by-value copy of the current geometry for handoff.
+        public RouteSnapshot ExportSnapshot()
+        {
+            var s = new RouteSnapshot
+            {
+                TotalLength = TotalLength,
+                Source = Source,
+                GpsSamples = GpsSamples,
+                Finish = finish,
+            };
+            try
+            {
+                if (Points.Count > 0) s.Origin = Points[0];
+            }
+            catch { }
+            try
+            {
+                foreach (var p in Points) s.Points.Add(p);
+                foreach (var c in CumulativeS) s.CumulativeS.Add(c);
+            }
+            catch { }
+            return s;
+        }
+
+        /// Import a previously acquired snapshot (no GPS natives). Recomputes
+        /// cumulative arclength deterministically so validation and the brain
+        /// share EXACTLY the accepted geometry.
+        public void ImportSnapshot(RouteSnapshot snap)
+        {
+            Reset();
+            if (snap == null || snap.Points == null || snap.Points.Count < 2)
+            {
+                finish = snap != null ? snap.Finish : Vector3.Zero;
+                Source = "None";
+                return;
+            }
+            finish = snap.Finish;
+            foreach (var p in snap.Points) Points.Add(p);
+            Source = snap.Source ?? "None";
+            GpsSamples = snap.GpsSamples;
+            try { DistToRoute = Points.Count > 0 ? RaceMath.FlatDistance(Points[0], finish) : 0f; } catch { }
+            FinalizeGeometry();
+        }
+
+        /// GPS native readiness probe (no geometry sampling). Returns the raw
+        /// GET_GPS_BLIP_ROUTE_FOUND flag plus route length for telemetry.
+        public static bool GpsNativeReady(out int routeLen)
+        {
+            routeLen = 0;
+            bool found = false;
+            try { found = Function.Call<bool>(Hash.GET_GPS_BLIP_ROUTE_FOUND); }
+            catch { return false; }
+            try { routeLen = Function.Call<int>(Hash.GET_GPS_BLIP_ROUTE_LENGTH); }
+            catch { routeLen = 0; }
+            return found;
+        }
+
+        /// GPS-ONLY acquisition (no fallback). Samples the GTA GPS natives
+        /// once and returns an immutable snapshot when globally plausible.
+        /// Any failure is readiness (RETRY), never validation (REROLL):
+        ///   native-not-ready / too-few-samples / implausible-geometry.
+        /// Caller must NOT delete the blip or reroll the finish on failure.
+        public static bool TryAcquireGpsSnapshot(Vector3 origin, Vector3 finishIn,
+            out RouteSnapshot snap, out string detail)
+        {
+            snap = null;
+            detail = "";
+            bool found = false;
+            int routeLen = 0;
+            try { found = Function.Call<bool>(Hash.GET_GPS_BLIP_ROUTE_FOUND); }
+            catch (Exception ex) { detail = $"native-exc found;{ex.Message}"; return false; }
+            if (!found) { detail = "native-not-ready"; return false; }
+            try { routeLen = Function.Call<int>(Hash.GET_GPS_BLIP_ROUTE_LENGTH); }
+            catch { routeLen = 0; }
+
+            int[] types = { 1, 0, 2 };
+            string attempts = $"nativeFound=1;routeLen={routeLen}";
+            foreach (int t in types)
+            {
+                List<Vector3> byDist = null;
+                List<Vector3> byIdx = null;
+                try { byDist = SampleGpsByDistance(origin, finishIn, routeLen, t); }
+                catch { byDist = null; }
+                int nDist = byDist != null ? byDist.Count : -1;
+                string whyDist = "";
+                bool okDist = false;
+                try { okDist = IsPlausibleRouteWithReason(byDist, origin, finishIn, out whyDist); }
+                catch { okDist = false; whyDist = "exc"; }
+                if (okDist)
+                {
+                    var pts = ResamplePolyline(byDist, 5f);
+                    snap = BuildSnapshotFromPoints(origin, finishIn, pts, "GpsDist(t" + t + ")");
+                    detail = $"{attempts};t={t};byDist n={nDist} OK;src={snap.Source};pts={snap.Points.Count};len={snap.TotalLength:F0}";
+                    return true;
+                }
+                try { byIdx = SampleGpsByIndex(origin, finishIn, routeLen, t); }
+                catch { byIdx = null; }
+                int nIdx = byIdx != null ? byIdx.Count : -1;
+                string whyIdx = "";
+                bool okIdx = false;
+                try { okIdx = IsPlausibleRouteWithReason(byIdx, origin, finishIn, out whyIdx); }
+                catch { okIdx = false; whyIdx = "exc"; }
+                if (okIdx)
+                {
+                    var pts = ResamplePolyline(byIdx, 5f);
+                    snap = BuildSnapshotFromPoints(origin, finishIn, pts, "GpsIdx(t" + t + ")");
+                    detail = $"{attempts};t={t};byDist n={nDist} fail({whyDist});byIdx n={nIdx} OK;src={snap.Source};pts={snap.Points.Count};len={snap.TotalLength:F0}";
+                    return true;
+                }
+                attempts += $";t{t}:dist n={nDist}({whyDist}) idx n={nIdx}({whyIdx})";
+            }
+            detail = attempts + ";no-plausible-gps";
+            return false;
+        }
+
+        private static RouteSnapshot BuildSnapshotFromPoints(Vector3 origin, Vector3 finishIn,
+            List<Vector3> pts, string how)
+        {
+            var s = new RouteSnapshot
+            {
+                Source = how,
+                Finish = finishIn,
+                Origin = origin,
+                GpsSamples = pts != null ? pts.Count : 0,
+            };
+            if (pts != null)
+            {
+                foreach (var p in pts) s.Points.Add(p);
+            }
+            float acc = 0f;
+            s.CumulativeS.Add(0f);
+            for (int i = 1; i < s.Points.Count; i++)
+            {
+                acc += RaceMath.FlatDistance(s.Points[i - 1], s.Points[i]);
+                s.CumulativeS.Add(acc);
+            }
+            s.TotalLength = acc;
+            return s;
+        }
+
+        private static bool IsPlausibleRouteWithReason(List<Vector3> pts, Vector3 origin,
+            Vector3 finishIn, out string why)
+        {
+            why = "null";
+            if (pts == null) return false;
+            if (pts.Count < 5) { why = $"too-few-samples n={pts.Count}"; return false; }
+            float dStart = RaceMath.FlatDistance(pts[0], origin);
+            float dEnd = RaceMath.FlatDistance(pts[pts.Count - 1], finishIn);
+            float closestStart = float.MaxValue;
+            float closestEnd = float.MaxValue;
+            for (int i = 0; i < System.Math.Min(pts.Count, 12); i++)
+                closestStart = System.Math.Min(closestStart, RaceMath.FlatDistance(pts[i], origin));
+            for (int i = System.Math.Max(0, pts.Count - 12); i < pts.Count; i++)
+                closestEnd = System.Math.Min(closestEnd, RaceMath.FlatDistance(pts[i], finishIn));
+            if (System.Math.Min(dStart, closestStart) > 220f) { why = $"start-far dStart={dStart:F0} closest={closestStart:F0}"; return false; }
+            if (System.Math.Min(dEnd, closestEnd) > 260f) { why = $"end-far dEnd={dEnd:F0} closest={closestEnd:F0}"; return false; }
+            float straight = RaceMath.FlatDistance(origin, finishIn);
+            float len = 0f;
+            for (int i = 1; i < pts.Count; i++) len += RaceMath.FlatDistance(pts[i - 1], pts[i]);
+            if (len < straight * 0.6f) { why = $"too-short len={len:F0} straight={straight:F0}"; return false; }
+            if (len > straight * 4f + 1500f) { why = $"too-long len={len:F0} straight={straight:F0}"; return false; }
+            if (len < 60f) { why = $"len-too-small {len:F0}"; return false; }
+            why = $"ok len={len:F0}";
+            return true;
+        }
+
         /// Called by RaceBrain during the first seconds if Build() fell back
         /// before the GPS route existed (blip route takes a frame or two to
         /// compute). Returns true when an upgrade happened.

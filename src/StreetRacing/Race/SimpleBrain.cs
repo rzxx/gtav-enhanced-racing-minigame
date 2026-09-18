@@ -242,6 +242,124 @@ namespace StreetRacing.Race
             catch (Exception ex) { try { reason = "exc:" + ex.Message; } catch { } return false; }
         }
 
+        /// Arming-handoff start: uses ONE already-accepted GPS snapshot.
+        /// NEVER calls GTA GPS natives (no Build, no TryUpgrade, no sampling).
+        /// Localization (route.Update) against the rival's current pose is the
+        /// only per-start computation. Driving / speed / join logic below is
+        /// identical to Start; only the geometry source differs.
+        public void StartFromSnapshot(Ped driver, Vehicle vehicle, RouteSnapshot snapshot, float cruise,
+            int style, DriverProfile profile, RaceTelemetry telemetry,
+            int refreshMs, int stuckMs, bool debugViz,
+            float simpleCruiseCap, bool enablePassing, bool useGtaRejoin, int armingBeginMs)
+        {
+            if (snapshot == null || snapshot.Points == null || snapshot.Points.Count < 2)
+            {
+                try { telemetry?.Event(0, "SNAPSHOT_INVALID", "null-or-too-few-points"); } catch { }
+                throw new InvalidOperationException("accepted snapshot missing");
+            }
+            bool isGps = false;
+            try { isGps = snapshot.Source != null && snapshot.Source.StartsWith("Gps"); } catch { }
+            if (!isGps)
+            {
+                try { telemetry?.Event(0, "SNAPSHOT_INVALID", $"non-gps src={snapshot.Source};never-fallback"); } catch { }
+                throw new InvalidOperationException("non-gps snapshot rejected src=" + snapshot.Source);
+            }
+            this.driver = driver;
+            this.vehicle = vehicle;
+            this.finish = snapshot.Finish;
+            this.cruiseSetting = cruise;
+            this.simpleCruiseCap = simpleCruiseCap > 1f ? simpleCruiseCap : 18f;
+            this.style = style;
+            this.profile = profile ?? DriverProfile.FromName("balanced");
+            this.telemetry = telemetry;
+            // Continuous lifecycle timeline: arming events already used
+            // t = Game.GameTime - armingBeginMs. Keep the same origin so
+            // RACE_START continues after ARM_READY instead of restarting at 0.
+            int nowGame = 0;
+            try { nowGame = Game.GameTime; } catch { }
+            t0 = (armingBeginMs > 0 && armingBeginMs <= nowGame) ? armingBeginMs : nowGame;
+
+            try { route.Reset(); } catch { }
+            try { corridor.Reset(); } catch { }
+            try { trajViz.Reset(); } catch { }
+            try { speedViz.Reset(); } catch { }
+
+            Vector3 origin;
+            try { origin = vehicle.Position; } catch { origin = Game.Player.Character.Position; }
+            float originHeading = SafeHeading(vehicle);
+            float originSpeed = 0f;
+            try { originSpeed = vehicle.Speed; } catch { }
+            // SINGLE authoritative geometry: copy accepted snapshot, no GPS natives.
+            route.ImportSnapshot(snapshot);
+            capability.Seed(vehicle);
+            LookaheadM = this.profile.LookaheadForSpeed(0f);
+            try { corridor.Update(route, origin, LookaheadM, nowGame); } catch { }
+            try { route.Update(origin, originHeading, 0f, nowGame, corridor.HalfWidth); } catch { }
+
+            actuator = new DirectActuator();
+            actuator.Attach(driver, vehicle, EffectiveCruise(), style, refreshMs, stuckMs);
+            viz.Enabled = debugViz;
+
+            hasKin = false;
+            lastSpeed = originSpeed;
+            lastPos = origin;
+            lastKinT = t0;
+            lastHealth = -1f;
+            lastAccelLong = 0f;
+            lastSlipDeg = 0f;
+            lastYawRate = 0f;
+            lastPlanMs = 0;
+            lastCorrMs = 0;
+            lastTeleMs = 0;
+            lastGpsRetryMs = 0;
+            lastGpsMissingLogMs = -100000;
+            lastLostLogMs = -100000;
+            lastLoggedLost = false;
+            TargetSpeed = 0f;
+            SpeedLimit = "Cruise";
+            ActualSpeed = originSpeed;
+            FinishGap = RaceMath.FlatDistance(origin, this.finish);
+            maneuverPlanId = 0;
+            hasCurrent = false;
+            lastIntentLog = "";
+            lastIntentLogMs = -100000;
+            lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
+            lastEgoHeading = originHeading;
+
+            desiredRoadSpeed = EffectiveCruise();
+            commandedSpeed = RaceMath.Clamp(originSpeed, 0f, EffectiveCruise());
+            commandedInit = true;
+            prevPlanMs = t0;
+
+            bool needJoin = Math.Abs(route.Lateral) > JoinLatThreshM
+                || Math.Abs(route.HeadingErrorDeg) > JoinHeadThreshDeg;
+            joined = !needJoin;
+            joinState = IsGpsSource() ? (joined ? "Track" : "Join") : "GpsWait";
+
+            Running = true;
+
+            try
+            {
+                string poseChk = PoseConnector.SelfTest();
+                string steerChk = DirectActuator.SteeringSignSelfTest();
+                int tEv = 0;
+                try { tEv = nowGame - t0; } catch { }
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};gpsOnly=1;recovery=OFF;passing=OFF;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                string vStart = "";
+                try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
+                catch { vStart = "validate-exc"; }
+                telemetry?.Event(tEv, "START_POSE", $"egoHead={originHeading:F0};routeHead={route.RouteHeadingDeg:F0};headErr={route.HeadingErrorDeg:F0};lat={route.Lateral:F1};dist={route.DistToRoute:F1};s={route.AlongS:F0};startValid={vStart};join={joinState};needJoin={needJoin};fromSnapshot=1;noSecondGps=1");
+                if (!IsGpsSource())
+                    telemetry?.Event(tEv, "SNAPSHOT_MISMATCH", $"non-gps after import src={route.Source};should-never-happen");
+                if (poseChk != "OK")
+                    telemetry?.Event(tEv, "POSE_CONNECTOR_FAIL", $"selftest={poseChk}");
+                if (steerChk != "OK")
+                    telemetry?.Event(tEv, "STEER_SIGN_FAIL", $"selftest={steerChk}");
+            }
+            catch { }
+        }
+
         /// GPS-only gate for Simple mode. FallbackWalk / StraightFallback are
         /// never valid control references (they step/snap toward the finish
         /// and can teleport progress while the car sits still).
