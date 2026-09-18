@@ -187,8 +187,11 @@ namespace StreetRacing
                 {
                     committedLat = chosen.LateralM;
                     commitStartedMs = nowMs;
-                    commitUntilMs = nowMs + 1800;
-                    committedIntent = committedLat > 0f ? "PassLeft" : "PassRight";
+                    commitUntilMs = nowMs + (chosen.Shape != null && chosen.Shape.StartsWith("Apex") ? 1100 : 1800);
+                    if (chosen.Shape != null && chosen.Shape.StartsWith("Apex"))
+                        committedIntent = "Apex";
+                    else
+                        committedIntent = committedLat > 0f ? "PassLeft" : "PassRight";
                 }
                 else if (nowMs >= commitUntilMs)
                 {
@@ -494,14 +497,19 @@ namespace StreetRacing
                 }
                 if (roadMargin == float.MaxValue) roadMargin = 0f;
 
-                // Progress dominates. Center is mildly preferred, but a clear
-                // side path that preserves several m/s easily wins.
-                float score = mean * 5.0f
-                    + min * 1.5f
-                    + RaceMath.Clamp(minClear, -2f, 6f) * 1.2f
-                    + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.7f
-                    - Math.Abs(shape.CharacteristicLat) * 0.75f
-                    - maxKappa * 22f
+                // Racing objective: maximize ROUTE progress per predicted
+                // travel time, then break ties with clearance/margin/smoothness.
+                // This lets an apex/shortcut win because it gets farther along
+                // the route sooner, not because of a hard-coded "corner line".
+                var predictedArrival = BuildArrivalTimes(ss, desired);
+                float eta = predictedArrival.Count > 0 ? predictedArrival[predictedArrival.Count - 1] : 99f;
+                float referenceProgressRate = totalS / Math.Max(eta, 0.75f);
+                float score = referenceProgressRate * 5.5f
+                    + min * 1.15f
+                    + RaceMath.Clamp(minClear, -2f, 6f) * 1.25f
+                    + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.75f
+                    - Math.Abs(shape.CharacteristicLat) * 0.55f
+                    - maxKappa * 20f
                     - firstTang * 0.08f;
 
                 // Small continuity preference around the current commitment.
@@ -519,7 +527,7 @@ namespace StreetRacing
                 c.Path = path;
                 c.StationS = ss;
                 c.SpeedProfile = new List<float>(desired);
-                c.ArrivalT = BuildArrivalTimes(ss, desired);
+                c.ArrivalT = predictedArrival;
                 c.AimPoint = path[path.Count - 1];
                 c.MinMarginM = roadMargin;
                 c.MaxKappa = maxKappa;
