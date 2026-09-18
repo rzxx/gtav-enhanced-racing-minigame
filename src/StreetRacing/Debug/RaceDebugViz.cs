@@ -67,7 +67,8 @@ namespace StreetRacing.Debug
             try
             {
                 DrawRoute(route);
-                DrawCorridor(corridor);
+                if (roadReference == null)
+                    DrawCorridor(corridor);
                 DrawRoadReference(roadReference);
                 DrawCandidates(traj);
                 DrawActors(perception, egoSpeed);
