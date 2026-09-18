@@ -369,9 +369,11 @@ namespace StreetRacing
 
         private static float AlignHeadingAxis(float h, float reference)
         {
-            return Math.Abs(RaceMath.HeadingDiffDeg(h, reference)) <= 90f
-                ? h
-                : RaceMath.Wrap360(h + 180f);
+            if (Math.Abs(RaceMath.HeadingDiffDeg(h, reference)) <= 90f) return h;
+            float x = h + 180f;
+            while (x >= 360f) x -= 360f;
+            while (x < 0f) x += 360f;
+            return x;
         }
 
         private static Vector3 ClosestPointOnSegment2D(Vector3 p, Vector3 a, Vector3 b)
