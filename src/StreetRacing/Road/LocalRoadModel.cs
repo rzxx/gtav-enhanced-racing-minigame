@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using GTA;
 using GTA.Math;
 using GTA.Native;
 
@@ -203,18 +204,13 @@ namespace StreetRacing
             {
                 try
                 {
-                    var posOut = new OutputArgument();
-                    var headOut = new OutputArgument();
-                    var lanesOut = new OutputArgument();
-                    bool ok = Function.Call<bool>(Hash.GET_NTH_CLOSEST_VEHICLE_NODE_WITH_HEADING,
-                        p.X, p.Y, p.Z, nth,
-                        posOut, headOut, lanesOut,
-                        0, 3.0f, 6.0f);
+                    Vector3 np;
+                    float nh;
+                    int lanes;
+                    bool ok = PathFind.GetNthClosestVehicleNodePositionWithHeading(
+                        p, nth, out np, out nh, out lanes);
                     if (!ok) continue;
 
-                    Vector3 np = posOut.GetResult<Vector3>();
-                    float nh = headOut.GetResult<float>();
-                    int lanes = lanesOut.GetResult<int>();
                     float dist = RaceMath.FlatDistance(p, np);
                     float z = Math.Abs(p.Z - np.Z);
                     float axis = AxisHeadingError(refHeading, nh);
@@ -245,7 +241,7 @@ namespace StreetRacing
                 var fOut = new OutputArgument();
                 var bOut = new OutputArgument();
                 var widthOut = new OutputArgument();
-                bool ok = Function.Call<bool>(Hash.GET_CLOSEST_ROAD,
+                bool ok = Function.Call<bool>((Hash)0x132F52BBA570FE92,
                     p.X, p.Y, p.Z,
                     2.0f, 1,
                     srcOut, dstOut, fOut, bOut, widthOut,
