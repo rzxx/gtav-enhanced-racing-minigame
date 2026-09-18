@@ -84,6 +84,7 @@ namespace StreetRacing.Race
         private int lastLostLogMs = -100000;
         private bool lastLoggedLost;
         private int routeLostSinceMs = -1;
+        private int referenceInvalidSinceMs = -1;
 
         private float lastSpeed;
         private float lastSignedLong;
@@ -199,6 +200,7 @@ namespace StreetRacing.Race
             lastLostLogMs = -100000;
             lastLoggedLost = false;
             routeLostSinceMs = -1;
+            referenceInvalidSinceMs = -1;
             TestFailed = false;
             TestFailureReason = "";
             lastRefRawKappa = 0f;
@@ -346,6 +348,7 @@ namespace StreetRacing.Race
             lastLostLogMs = -100000;
             lastLoggedLost = false;
             routeLostSinceMs = -1;
+            referenceInvalidSinceMs = -1;
             TestFailed = false;
             TestFailureReason = "";
             lastRefRawKappa = 0f;
@@ -705,10 +708,9 @@ namespace StreetRacing.Race
             catch { }
         }
 
-        // --- TRACK: persistent GPS centerline reference.
-        // Geometry is anchored to the ROUTE (PointAtS(AlongS + s)), never
-        // rebuilt through ego. path[0] is the route center at current AlongS,
-        // so Direct's ClosestOnPath reports the TRUE cross-track error.
+        // --- TRACK: executable local road reference.
+        // GPS remains the global route/progress source, but Direct never sees
+        // its raw 5 m zig-zags. DrivingReference creates the smooth local path.
         private ManeuverCommand BuildTrack(Vector3 egoPos, float egoSpeed, float dtPlan)
         {
             float cruise = EffectiveCruise();
@@ -723,8 +725,19 @@ namespace StreetRacing.Race
 
             if (rr == null || !rr.Valid || rr.Path == null || rr.Path.Count < 3)
             {
+                int now = Game.GameTime;
                 lastRefDetail = rr != null ? rr.Detail : "null";
-                try { telemetry?.Event(Game.GameTime - t0, "REFERENCE_INVALID", lastRefDetail); } catch { }
+                if (referenceInvalidSinceMs < 0)
+                {
+                    referenceInvalidSinceMs = now;
+                    try { telemetry?.Event(now - t0, "REFERENCE_INVALID", lastRefDetail); } catch { }
+                }
+                if (!TestFailed && now - referenceInvalidSinceMs >= 1000)
+                {
+                    TestFailed = true;
+                    TestFailureReason = "driving-reference-invalid;" + lastRefDetail;
+                    try { telemetry?.Event(now - t0, "TEST_FAIL", TestFailureReason); } catch { }
+                }
                 var holdPt = new Vector3(egoPos.X + lastEgoFwd.X * 12f, egoPos.Y + lastEgoFwd.Y * 12f, egoPos.Z);
                 return new ManeuverCommand
                 {
@@ -739,6 +752,7 @@ namespace StreetRacing.Race
                 };
             }
 
+            referenceInvalidSinceMs = -1;
             lastRefRawKappa = rr.RawMaxKappa;
             lastRefKappa = rr.MaxKappa;
             lastRefHeadStep = rr.MaxHeadingStepDeg;
