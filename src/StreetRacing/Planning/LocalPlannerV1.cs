@@ -235,7 +235,8 @@ namespace StreetRacing
             result.Detail = $"intent={Intent};lat={chosen.LateralM:F1};score={chosen.Score:F1};"
                 + $"meanV={chosen.MeanSpeed:F1};minV={chosen.MinSpeed:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"clear={chosen.MinPredClearance:F1};usable={usable:F1}";
+                + $"clear={chosen.MinPredClearance:F1};usable={usable:F1};"
+                + $"cands={SummarizeCandidates(LastCandidates)}";
 
             LastChosen = chosen;
             HasChosen = true;
@@ -664,6 +665,27 @@ namespace StreetRacing
             if (RaceMath.FlatLength(d) < 0.2f) return 180f;
             float h = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d));
             return Math.Abs(RaceMath.HeadingDiffDeg(h, egoHeading));
+        }
+
+        private static string SummarizeCandidates(IList<TrajectoryCandidate> candidates)
+        {
+            try
+            {
+                var parts = new List<string>();
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    var c = candidates[i];
+                    if (!string.IsNullOrEmpty(c.RejectReason))
+                    {
+                        parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:X({c.RejectReason})");
+                        continue;
+                    }
+                    string lim = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
+                    parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
+                }
+                return string.Join("|", parts);
+            }
+            catch { return "?"; }
         }
 
         private static int FindClosestIndex(IList<TrajectoryCandidate> candidates, float lat)
