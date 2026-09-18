@@ -381,30 +381,30 @@ namespace StreetRacing
                 m0 = RaceMath.Clamp(m0, -1.35f, 1.35f);
 
                 float totalS = reference.StationS[reference.StationS.Count - 1];
-                float transitionS = RaceMath.Clamp(28f + egoSpeed * 1.4f, 30f, 62f);
-                transitionS = Math.Min(transitionS, Math.Max(18f, totalS * 0.78f));
+                float s1 = totalS * 0.30f;
+                float s2 = totalS * 0.62f;
+                float s3 = totalS;
 
                 for (int i = 0; i < reference.Path.Count; i++)
                 {
                     float baseS = reference.StationS[i];
-                    float lat = HermiteLateral(startLat, m0, targetLat, baseS, transitionS);
+                    float lat = PiecewiseLateral(startLat, m0, shape.K1, shape.K2, shape.K3,
+                        baseS, s1, s2, s3);
                     Vector3 dir = DirectionAt(reference.Path, i);
                     Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
                     Vector3 bp = reference.Path[i];
                     var p = new Vector3(bp.X + left.X * lat, bp.Y + left.Y * lat, bp.Z);
                     if (i == 0) p = egoPos;
 
-                    if (corridor != null)
+                    float leftAvail;
+                    float rightAvail;
+                    ReferenceRoadAt(reference, baseS, out leftAvail, out rightAvail);
+                    float leftAllow = Math.Max(0.4f, leftAvail - VehicleHalfWidthM - RoadMarginM);
+                    float rightAllow = Math.Max(0.4f, rightAvail - VehicleHalfWidthM - RoadMarginM);
+                    if (lat > leftAllow + 0.05f || lat < -rightAllow - 0.05f)
                     {
-                        float half = corridor.HalfWidthAt(baseS);
-                        float actualRoadLat = corridor.LateralAt(p, baseS, route);
-                        float allowed = half - VehicleHalfWidthM - RoadMarginM;
-                        if (allowed < 0.65f) allowed = 0.65f;
-                        if (Math.Abs(actualRoadLat) > allowed + 0.05f)
-                        {
-                            c.RejectReason = $"road-boundary@{baseS:F0}:lat={actualRoadLat:F1}/allow={allowed:F1}";
-                            return c;
-                        }
+                        c.RejectReason = $"road-boundary@{baseS:F0}:lat={lat:F1}/allow=-{rightAllow:F1}..{leftAllow:F1}";
+                        return c;
                     }
 
                     path.Add(p);
@@ -483,11 +483,13 @@ namespace StreetRacing
                 float roadMargin = float.MaxValue;
                 for (int i = 0; i < lats.Count; i++)
                 {
-                    float allowed = corridor != null
-                        ? corridor.HalfWidthAt(reference.StationS[Math.Min(i, reference.StationS.Count - 1)])
-                            - VehicleHalfWidthM
-                        : 5f;
-                    float m = allowed - Math.Abs(lats[i]);
+                    float leftAvail;
+                    float rightAvail;
+                    ReferenceRoadAt(reference, reference.StationS[Math.Min(i, reference.StationS.Count - 1)],
+                        out leftAvail, out rightAvail);
+                    float m = lats[i] >= 0f
+                        ? leftAvail - VehicleHalfWidthM - Math.Abs(lats[i])
+                        : rightAvail - VehicleHalfWidthM - Math.Abs(lats[i]);
                     if (m < roadMargin) roadMargin = m;
                 }
                 if (roadMargin == float.MaxValue) roadMargin = 0f;
@@ -498,13 +500,13 @@ namespace StreetRacing
                     + min * 1.5f
                     + RaceMath.Clamp(minClear, -2f, 6f) * 1.2f
                     + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.7f
-                    - Math.Abs(targetLat) * 0.75f
+                    - Math.Abs(shape.CharacteristicLat) * 0.75f
                     - maxKappa * 22f
                     - firstTang * 0.08f;
 
                 // Small continuity preference around the current commitment.
                 if (Math.Abs(committedLat) > 0.35f)
-                    score -= Math.Abs(targetLat - committedLat) * 0.65f;
+                    score -= Math.Abs(shape.CharacteristicLat - committedLat) * 0.65f;
 
                 string limiting;
                 if (constrainHandle != -1 && desired[0] < roadDesired - 0.25f)
@@ -674,6 +676,68 @@ namespace StreetRacing
                 r.Add(r[i - 1] + ds / v);
             }
             return r;
+        }
+
+        private static float PiecewiseLateral(
+            float d0, float m0, float k1, float k2, float k3,
+            float s, float s1, float s2, float s3)
+        {
+            if (s <= 0f) return d0;
+            if (s <= s1)
+                return HermiteSegment(d0, m0, k1, 0f, s, 0f, s1);
+            if (s <= s2)
+                return HermiteSegment(k1, 0f, k2, 0f, s, s1, s2);
+            return HermiteSegment(k2, 0f, k3, 0f, Math.Min(s, s3), s2, s3);
+        }
+
+        private static float HermiteSegment(
+            float d0, float m0, float d1, float m1,
+            float s, float s0, float s1)
+        {
+            float S = Math.Max(0.5f, s1 - s0);
+            float t = RaceMath.Clamp((s - s0) / S, 0f, 1f);
+            float t2 = t * t;
+            float t3 = t2 * t;
+            float h00 = 2f * t3 - 3f * t2 + 1f;
+            float h10 = t3 - 2f * t2 + t;
+            float h01 = -2f * t3 + 3f * t2;
+            float h11 = t3 - t2;
+            return h00 * d0 + h10 * S * m0 + h01 * d1 + h11 * S * m1;
+        }
+
+        private static void ReferenceRoadAt(
+            DrivingReference.Result reference, float s, out float left, out float right)
+        {
+            left = 4f;
+            right = 4f;
+            try
+            {
+                if (reference.StationS.Count == 0) return;
+                if (s <= 0f)
+                {
+                    left = reference.LeftRoadM[0];
+                    right = reference.RightRoadM[0];
+                    return;
+                }
+                int last = reference.StationS.Count - 1;
+                if (s >= reference.StationS[last])
+                {
+                    left = reference.LeftRoadM[last];
+                    right = reference.RightRoadM[last];
+                    return;
+                }
+                for (int i = 0; i < last; i++)
+                {
+                    float a = reference.StationS[i];
+                    float b = reference.StationS[i + 1];
+                    if (s < a || s > b) continue;
+                    float t = b > a ? (s - a) / (b - a) : 0f;
+                    left = reference.LeftRoadM[i] + (reference.LeftRoadM[i + 1] - reference.LeftRoadM[i]) * t;
+                    right = reference.RightRoadM[i] + (reference.RightRoadM[i + 1] - reference.RightRoadM[i]) * t;
+                    return;
+                }
+            }
+            catch { }
         }
 
         private static float HermiteLateral(float d0, float m0, float d1, float s, float S)
