@@ -888,26 +888,13 @@ namespace StreetRacing.Race
                 if (referenceInvalidSinceMs < 0)
                 {
                     referenceInvalidSinceMs = now;
+                    plannerInvalidSinceMs = now;
                     try { telemetry?.Event(now - t0, "REFERENCE_INVALID", lastRefDetail); } catch { }
                 }
-                if (!TestFailed && now - referenceInvalidSinceMs >= 1000)
-                {
-                    TestFailed = true;
-                    TestFailureReason = "driving-reference-invalid;" + lastRefDetail;
-                    try { telemetry?.Event(now - t0, "TEST_FAIL", TestFailureReason); } catch { }
-                }
-                var holdPt = new Vector3(egoPos.X + lastEgoFwd.X * 12f, egoPos.Y + lastEgoFwd.Y * 12f, egoPos.Z);
-                return new ManeuverCommand
-                {
-                    Path = new List<Vector3> { egoPos, holdPt },
-                    StationS = new List<float> { 0f, 12f },
-                    SpeedProfile = new List<float> { 0f, 0f },
-                    AimPoint = holdPt,
-                    TargetSpeed = 0f,
-                    Style = style,
-                    Reason = "ReferenceInvalid",
-                    Reverse = false,
-                };
+                if (plannerInvalidSinceMs < 0) plannerInvalidSinceMs = now;
+                if (!recovery.Active && now - plannerInvalidSinceMs > 900 && egoSpeed < 3.0f)
+                    EnterRecovery("reference-invalid:" + lastRefDetail, now);
+                return BuildPlannerStop(egoPos, "ReferenceInvalid");
             }
 
             referenceInvalidSinceMs = -1;
@@ -927,15 +914,47 @@ namespace StreetRacing.Race
 
             if (lp == null || !lp.Valid || lp.Chosen.Path == null || lp.Chosen.Path.Count < 3)
             {
-                try { telemetry?.Event(Game.GameTime - t0, "LOCAL_PLAN_INVALID", lp != null ? lp.Detail : "null"); } catch { }
-                var latsFallback = new List<float>(rr.Path.Count);
-                for (int i = 0; i < rr.Path.Count; i++) latsFallback.Add(0f);
-                joinState = "TrackFallback";
-                return BuildCommandFromPath(rr.Path, rr.StationS, latsFallback, egoSpeed, dtPlan, cruise, "TrackFallback", egoPos);
+                int now = Game.GameTime;
+                string why = lp != null ? lp.Detail : "null";
+                if (plannerInvalidSinceMs < 0)
+                {
+                    plannerInvalidSinceMs = now;
+                    try { telemetry?.Event(now - t0, "LOCAL_PLAN_INVALID", why); } catch { }
+                }
+                if (!recovery.Active && now - plannerInvalidSinceMs > 800 && egoSpeed < 3.0f)
+                    EnterRecovery("no-viable-plan:" + why, now);
+                joinState = "PlannerStop";
+                return BuildPlannerStop(egoPos, "PlannerNoViable");
             }
 
+            plannerInvalidSinceMs = -1;
+            referenceInvalidSinceMs = -1;
             joinState = lp.Intent;
             return BuildCommandFromCandidate(lp.Chosen, egoSpeed, dtPlan, cruise, lp.RoadDesired);
+        }
+
+        private ManeuverCommand BuildPlannerStop(Vector3 egoPos, string why)
+        {
+            var p = new Vector3(
+                egoPos.X + lastEgoFwd.X * 10f,
+                egoPos.Y + lastEgoFwd.Y * 10f,
+                egoPos.Z);
+            commandedSpeed = 0f;
+            commandedInit = true;
+            TargetSpeed = 0f;
+            SpeedLimit = why;
+            hasCurrent = false;
+            return new ManeuverCommand
+            {
+                Path = new List<Vector3> { egoPos, p },
+                StationS = new List<float> { 0f, 10f },
+                SpeedProfile = new List<float> { 0f, 0f },
+                AimPoint = p,
+                TargetSpeed = 0f,
+                Style = style,
+                Reason = why,
+                Reverse = false,
+            };
         }
 
         private ManeuverCommand BuildCommandFromCandidate(
