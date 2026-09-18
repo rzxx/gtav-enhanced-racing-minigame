@@ -88,6 +88,7 @@ namespace StreetRacing.Race
         private Vector3 lastPos = Vector3.Zero;
         private bool hasKin;
         private int lastKinT;
+        private float lastKinHeading;
         private float lastHealth = -1f;
         private float lastAccelLong;
         private float lastSlipDeg;
@@ -176,6 +177,7 @@ namespace StreetRacing.Race
             lastSignedLong = originSpeed;
             lastPos = origin;
             lastKinT = t0;
+            lastKinHeading = originHeading;
             lastHealth = -1f;
             lastAccelLong = 0f;
             lastSlipDeg = 0f;
@@ -314,6 +316,7 @@ namespace StreetRacing.Race
             lastSignedLong = originSpeed;
             lastPos = origin;
             lastKinT = t0;
+            lastKinHeading = originHeading;
             lastHealth = -1f;
             lastAccelLong = 0f;
             lastSlipDeg = 0f;
@@ -442,6 +445,7 @@ namespace StreetRacing.Race
                 lastSignedLong = signedLongSpeed;
                 lastPos = egoPos;
                 lastKinT = now;
+                lastKinHeading = egoHeading;
                 try { lastHealth = vehicle.HealthFloat; } catch { lastHealth = -1f; }
                 return;
             }
@@ -462,7 +466,7 @@ namespace StreetRacing.Race
                         {
                             lastGpsRetryMs = now;
                             string ulog;
-                            if (route.TryUpgradeToGps(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth, out ulog))
+                            if (route.TryUpgradeToGps(egoPos, egoHeading, forwardPlanSpeed, now, corridor.HalfWidth, out ulog))
                             {
                                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
                                 try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;{ulog}"); } catch { }
@@ -924,7 +928,7 @@ namespace StreetRacing.Race
             if (dtS <= 0f || dtS > 0.6f) return;
             float accel = (signedLongSpeed - lastSignedLong) / dtS;
             lastAccelLong = accel;
-            float dhDeg = RaceMath.HeadingDiffDeg(egoHeading, lastEgoHeading);
+            float dhDeg = RaceMath.HeadingDiffDeg(egoHeading, lastKinHeading);
             float yawRate = 0f;
             try { yawRate = dhDeg * (float)Math.PI / 180f / dtS; } catch { }
             lastYawRate = yawRate;
@@ -944,6 +948,7 @@ namespace StreetRacing.Race
             }
             catch { }
             lastSlipDeg = slip;
+            lastKinHeading = egoHeading;
 
             // Capability learning WITHOUT ImpactClassifier-driven behavior:
             // gate only on the capability's own stability (slip/yaw) and sane
