@@ -34,6 +34,7 @@ namespace StreetRacing
         public float MinSpeed;            // min of SpeedProfile
         public float RequiredDecel;       // + = need to slow now
         public int CandidateIndex;
+        public string Shape;              // Center / HoldL / PassReturnL / ApexL / ...
         public float FirstTangentErrDeg; // |angle| between ego heading and path[0]->path[1] (pose continuity)
         public float RouteHeadErrDeg;    // route.HeadingErrorDeg at plan time
     }
