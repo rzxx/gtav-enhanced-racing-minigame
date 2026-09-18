@@ -76,9 +76,8 @@ namespace StreetRacing.Race
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
-        // Simple still has one geometric path (no passing yet), but perception
-        // now constrains the SPEED profile of that exact path so the driver can
-        // follow/stop for traffic instead of physically rear-ending it.
+        // Planner V2 evaluates several staged road trajectories against the
+        // persistent world model; path and speed are chosen together.
         private readonly Perception perception = new Perception();
         private readonly LocalPlannerV2 localPlanner = new LocalPlannerV2();
         private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
@@ -277,8 +276,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;localPlanner=V2");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -438,8 +437,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;localPlanner=V2;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -753,7 +752,7 @@ namespace StreetRacing.Race
                     if (route.IsLost && now - lastLostLogMs > 2000)
                     {
                         lastLostLogMs = now;
-                        telemetry?.Event(t, "ROUTE_LOST", $"{route.LossReason};s={route.AlongS:F0};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0};TRACK-ONLY(no-recovery)");
+                        telemetry?.Event(t, "ROUTE_LOST", $"{route.LossReason};s={route.AlongS:F0};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0};recovery-enabled");
                     }
                     else if (!route.IsLost && lastLoggedLost)
                     {
