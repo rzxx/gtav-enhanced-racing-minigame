@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using GTA;
 using GTA.Math;
+using GTA.Native;
 using StreetRacing.Control;
 using StreetRacing.Debug;
 
@@ -70,6 +71,10 @@ namespace StreetRacing.Race
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
+        // Observe-only in Simple for now: actors do NOT affect planning yet.
+        // We need to distinguish physical blockage from Rockstar/vehicle-state
+        // interference before enabling traffic behavior.
+        private readonly Perception perception = new Perception();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
         private readonly DrivingReference drivingReference = new DrivingReference();
@@ -85,6 +90,9 @@ namespace StreetRacing.Race
         private bool lastLoggedLost;
         private int routeLostSinceMs = -1;
         private int referenceInvalidSinceMs = -1;
+        private int stallSinceMs = -1;
+        private int lastStallEventMs = -100000;
+        private bool stallWasActive;
 
         private float lastSpeed;
         private float lastSignedLong;
@@ -164,6 +172,7 @@ namespace StreetRacing.Race
 
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
+            try { perception.Reset(); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -180,6 +189,13 @@ namespace StreetRacing.Race
 
             actuator = new DirectActuator();
             actuator.Attach(driver, vehicle, EffectiveCruise(), style, refreshMs, stuckMs);
+            try
+            {
+                var direct = actuator as DirectActuator;
+                telemetry?.Event(Math.Max(0, Game.GameTime - t0), "OWNERSHIP",
+                    direct != null ? direct.TakeoverDetail : "direct-cast-failed");
+            }
+            catch { }
             viz.Enabled = debugViz;
 
             hasKin = false;
@@ -201,6 +217,9 @@ namespace StreetRacing.Race
             lastLoggedLost = false;
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
+            stallSinceMs = -1;
+            lastStallEventMs = -100000;
+            stallWasActive = false;
             TestFailed = false;
             TestFailureReason = "";
             lastRefRawKappa = 0f;
@@ -311,6 +330,7 @@ namespace StreetRacing.Race
 
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
+            try { perception.Reset(); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -328,6 +348,13 @@ namespace StreetRacing.Race
 
             actuator = new DirectActuator();
             actuator.Attach(driver, vehicle, EffectiveCruise(), style, refreshMs, stuckMs);
+            try
+            {
+                var direct = actuator as DirectActuator;
+                telemetry?.Event(Math.Max(0, Game.GameTime - t0), "OWNERSHIP",
+                    direct != null ? direct.TakeoverDetail : "direct-cast-failed");
+            }
+            catch { }
             viz.Enabled = debugViz;
 
             hasKin = false;
@@ -349,6 +376,9 @@ namespace StreetRacing.Race
             lastLoggedLost = false;
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
+            stallSinceMs = -1;
+            lastStallEventMs = -100000;
+            stallWasActive = false;
             TestFailed = false;
             TestFailureReason = "";
             lastRefRawKappa = 0f;
@@ -563,6 +593,20 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
+            // Observe-only traffic/world scan. Nothing from Perception is
+            // allowed to alter the maneuver in this pass.
+            try
+            {
+                if (IsGpsSource())
+                {
+                    float brakeCap = capability.ABrakeMax > 1f ? capability.ABrakeMax : 6f;
+                    float reactionS = profile != null ? Math.Max(0.5f, profile.SafetyTimeS) : 1f;
+                    perception.Update(vehicle, driver, null, null, forwardPlanSpeed,
+                        brakeCap, reactionS, now, 120, route, corridor);
+                }
+            }
+            catch { }
+
             if (doPlan && IsGpsSource())
             {
                 LookaheadM = profile.LookaheadForSpeed(forwardPlanSpeed);
@@ -662,6 +706,13 @@ namespace StreetRacing.Race
                 }
             }
             catch { }
+
+            try
+            {
+                DetectAndLogStall(now, t, egoPos);
+            }
+            catch { }
+
             try
             {
                 if (viz.Enabled)
@@ -1091,8 +1142,8 @@ namespace StreetRacing.Race
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
                     c.LateralM, c.Score, 0f, 0f,
                     commandedSpeed, egoSpeed, SpeedLimit ?? "Cruise", 0f,
-                    capability.ABrakeMax, capability.ALatMax, 0,
-                    999f, 999f, 0f,
+                    capability.ABrakeMax, capability.ALatMax, perception.Count,
+                    perception.NearestAheadDist, perception.NearestAheadTtc, perception.NearestAheadClosing,
                     actuator.CurrentCruise, actuator.CurrentStyle,
                     route.IsLost ? 1 : 0, "Normal",
                     actuator.ReissueCount, FinishGap,
@@ -1124,6 +1175,93 @@ namespace StreetRacing.Race
                     gear, nextGear, rpm);
             }
             catch { }
+        }
+
+        private void DetectAndLogStall(int now, int t, Vector3 egoPos)
+        {
+            if (actuator == null || vehicle == null || !vehicle.Exists()) return;
+            var pe = actuator.LastError;
+            if (!pe.Valid) return;
+
+            bool candidate = pe.ThrottleActual01 >= 0.85f
+                && pe.BrakeActual01 <= 0.10f
+                && Math.Abs(pe.SignedLongMps) < 1.0f
+                && pe.LocalTargetMps >= 4f;
+
+            if (!candidate)
+            {
+                if (stallWasActive)
+                {
+                    try { telemetry?.Event(t, "STALL_END", $"duration={(now - stallSinceMs) / 1000f:F1}s;vLong={pe.SignedLongMps:F1}"); } catch { }
+                }
+                stallSinceMs = -1;
+                stallWasActive = false;
+                return;
+            }
+
+            if (stallSinceMs < 0) stallSinceMs = now;
+            if (now - stallSinceMs < 600) return;
+
+            bool first = !stallWasActive;
+            stallWasActive = true;
+            if (!first && now - lastStallEventMs < 2000) return;
+            lastStallEventMs = now;
+
+            int gear = 0;
+            int nextGear = 0;
+            float rpm = 0f;
+            bool burnout = false;
+            bool gtaTrafficLight = false;
+            bool seatOk = false;
+            try { gear = vehicle.CurrentGear; } catch { }
+            try { nextGear = vehicle.NextGear; } catch { }
+            try { rpm = vehicle.CurrentRPM; } catch { }
+            try { burnout = vehicle.IsInBurnout; } catch { }
+            try { gtaTrafficLight = vehicle.IsStoppedAtTrafficLights; } catch { }
+            try
+            {
+                var vd = vehicle.Driver;
+                seatOk = vd != null && vd.Exists() && driver != null && driver.Exists() && vd.Handle == driver.Handle;
+            }
+            catch { }
+
+            int density = -1;
+            int nodeFlags = 0;
+            bool nodeOk = false;
+            try
+            {
+                var dOut = new OutputArgument();
+                var fOut = new OutputArgument();
+                nodeOk = Function.Call<bool>(Hash.GET_VEHICLE_NODE_PROPERTIES,
+                    egoPos.X, egoPos.Y, egoPos.Z, dOut, fOut);
+                if (nodeOk)
+                {
+                    density = dOut.GetResult<int>();
+                    nodeFlags = fOut.GetResult<int>();
+                }
+            }
+            catch { }
+
+            bool nodeJunction = (nodeFlags & (1 << 7)) != 0;
+            bool nodeTrafficLight = (nodeFlags & (1 << 8)) != 0;
+            bool nodeGiveWay = (nodeFlags & (1 << 9)) != 0;
+
+            TrackedActor lead = new TrackedActor();
+            bool hasLead = false;
+            try { hasLead = perception.TryGetLeadOnRoute(out lead, route.AlongS, corridor, 25f); } catch { }
+            string leadText = hasLead
+                ? $"kind={lead.Kind};handle={lead.Handle};routeDist={lead.RouteDist:F1};dist={lead.Dist:F1};lat={lead.RouteLateral:F1};leadV={lead.SpeedAlong:F1}"
+                : "none";
+
+            string detail =
+                $"age={(now - stallSinceMs) / 1000f:F1}s;vLong={pe.SignedLongMps:F2};vLat={pe.LateralVelMps:F2};"
+                + $"target={pe.LocalTargetMps:F1};thr={pe.ThrottleActual01:F2};thrP={pe.ThrottlePowerActual01:F2};"
+                + $"brk={pe.BrakeActual01:F2};gear={gear};nextGear={nextGear};rpm={rpm:F2};"
+                + $"burnout={(burnout ? 1 : 0)};gtaTrafficLight={(gtaTrafficLight ? 1 : 0)};seatOk={(seatOk ? 1 : 0)};"
+                + $"nodeOk={(nodeOk ? 1 : 0)};density={density};junction={(nodeJunction ? 1 : 0)};"
+                + $"nodeTrafficLight={(nodeTrafficLight ? 1 : 0)};giveWay={(nodeGiveWay ? 1 : 0)};"
+                + $"lead={leadText};actors={perception.Count}";
+            try { telemetry?.Event(t, first ? "STALL_BEGIN" : "STALL", detail); } catch { }
         }
 
         private static Vector3 PointAtLocalS(List<Vector3> path, List<float> ss, float s)
