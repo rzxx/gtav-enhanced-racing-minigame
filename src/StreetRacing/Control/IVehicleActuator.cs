@@ -22,6 +22,21 @@ namespace StreetRacing.Control
         public float LocalTargetMps;
         public float LookaheadM;
         public int PlanId;
+
+        // Vehicle-state/control observability for the direct controller.
+        // SignedLongMps is positive forward, negative when the car is actually
+        // travelling backwards even though Vehicle.Speed stays positive.
+        public float SignedLongMps;
+        public float LateralVelMps;     // + = moving left in vehicle frame
+        public float SlipDeg;           // velocity direction vs nose (+ left)
+        public float YawRateDegS;       // + = heading rotating left
+        public float DesiredYawRateDegS;
+        public float SteerActualDeg;
+        public float ThrottleActual01;
+        public float ThrottlePowerActual01;
+        public float BrakeActual01;
+        public float SteerSaturationS;
+        public string StabilityMode;    // Normal / Watch / Unstable / ReverseMotion
     }
 
     /// Complete maneuver handed through the actuator seam. Direct executes
