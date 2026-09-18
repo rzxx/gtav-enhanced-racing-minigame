@@ -106,6 +106,9 @@ namespace StreetRacing.Control
             }
             catch { }
             try { trafficLightBefore = vehicle.IsStoppedAtTrafficLights; } catch { }
+            // Block ambient event assignment before we remove the old task;
+            // repeat after re-seating as a defensive ownership assertion.
+            try { Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, driver, true); } catch { }
             try { Function.Call(Hash.SET_PED_KEEP_TASK, driver, false); } catch { }
             try { driver.Task.ClearAllImmediately(); } catch { }
             try
