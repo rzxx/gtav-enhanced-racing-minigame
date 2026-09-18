@@ -99,6 +99,7 @@ namespace StreetRacing.Race
         private int referenceInvalidSinceMs = -1;
         private int plannerInvalidSinceMs = -1;
         private int recoveryEnteredMs = -1;
+        private RecoveryPrimitive.Stage lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
         private int stallSinceMs = -1;
         private int lastStallEventMs = -100000;
         private bool stallWasActive;
@@ -230,6 +231,7 @@ namespace StreetRacing.Race
             referenceInvalidSinceMs = -1;
             plannerInvalidSinceMs = -1;
             recoveryEnteredMs = -1;
+            lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
             lastStallEventMs = -100000;
             stallWasActive = false;
@@ -393,6 +395,7 @@ namespace StreetRacing.Race
             referenceInvalidSinceMs = -1;
             plannerInvalidSinceMs = -1;
             recoveryEnteredMs = -1;
+            lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
             lastStallEventMs = -100000;
             stallWasActive = false;
@@ -574,33 +577,18 @@ namespace StreetRacing.Race
                 }
             }
 
-            // Test-mode invariant: once localization is persistently lost,
-            // stop the experiment instead of letting Track brute-force walls.
-            // Recovery will be a separate, explicit subsystem later.
+            // Route loss is now a recovery trigger, not an immediate test
+            // abort. Keep timing it for diagnostics; recovery gets the chance
+            // to change the pose before we declare the run unrecoverable.
             if (doPlan && IsGpsSource())
             {
                 if (route.IsLost)
                 {
                     if (routeLostSinceMs < 0) routeLostSinceMs = now;
-                    if (!TestFailed && now - routeLostSinceMs >= 1200)
-                    {
-                        TestFailed = true;
-                        TestFailureReason = $"route-lost {route.LossReason};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0};s={route.AlongS:F0}";
-                        joinState = "RouteLostHold";
-                        try { telemetry?.Event(t, "TEST_FAIL", TestFailureReason); } catch { }
-                        SendHold(egoPos, egoFwd, "RouteLostHold");
-                    }
                 }
                 else
                 {
                     routeLostSinceMs = -1;
-                }
-
-                if (TestFailed)
-                {
-                    joinState = "RouteLostHold";
-                    SendHold(egoPos, egoFwd, "RouteLostHold");
-                    goto AfterPlan;
                 }
             }
 
@@ -626,6 +614,90 @@ namespace StreetRacing.Race
 
             if (doPlan && IsGpsSource())
             {
+                bool trafficBlocked = false;
+                try
+                {
+                    trafficBlocked = hasCurrent
+                        && current.ConstrainHandle != -1
+                        && current.TargetSpeed < 3.0f;
+                }
+                catch { }
+
+                if (!recovery.Active)
+                {
+                    if (trafficBlocked)
+                    {
+                        // A legitimate queue is not a geometric failure. Reset
+                        // the primitive's no-progress clock while we wait.
+                        try { recovery.Reset(now); } catch { }
+                    }
+                    else
+                    {
+                        bool shouldRecover = false;
+                        try
+                        {
+                            shouldRecover = recovery.ShouldEnter(route, forwardPlanSpeed, route.AlongS,
+                                false, 0f, lastAccelLong, now);
+                        }
+                        catch { }
+                        if (shouldRecover)
+                            EnterRecovery(route.IsLost ? "route-lost:" + route.LossReason : "pose-or-progress", now);
+                    }
+                }
+
+                if (recovery.Active)
+                {
+                    bool poseRecovered = false;
+                    try
+                    {
+                        poseRecovered = !route.IsLost
+                            && Math.Abs(route.Lateral) < 2.0f
+                            && Math.Abs(route.HeadingErrorDeg) < 12f
+                            && (now - recoveryEnteredMs) > 500;
+                    }
+                    catch { }
+
+                    if (poseRecovered)
+                    {
+                        try { telemetry?.Event(t, "RECOVERY_EXIT", $"stage={recovery.Current};s={route.AlongS:F0};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}"); } catch { }
+                        try { recovery.Exit(now); } catch { }
+                        try { localPlanner.Reset(); } catch { }
+                        lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
+                        recoveryEnteredMs = -1;
+                        plannerInvalidSinceMs = -1;
+                        joined = true;
+                        joinState = "Track";
+                    }
+                    else if (recoveryEnteredMs > 0 && now - recoveryEnteredMs > 18000)
+                    {
+                        TestFailed = true;
+                        TestFailureReason = $"recovery-timeout;stage={recovery.Current};reason={recovery.Reason};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0}";
+                        try { telemetry?.Event(t, "TEST_FAIL", TestFailureReason); } catch { }
+                        SendHold(egoPos, egoFwd, "RecoveryTimeout");
+                        goto AfterPlan;
+                    }
+                    else
+                    {
+                        ManeuverCommand rm = recovery.Tick(route, corridor, egoPos, egoFwd,
+                            egoHeading, forwardPlanSpeed, route.AlongS, now, Math.Min(EffectiveCruise(), 6f));
+                        rm.PlanId = ++maneuverPlanId;
+                        joinState = "Recovery:" + recovery.Current;
+                        TargetSpeed = Math.Max(0f, rm.TargetSpeed);
+                        commandedSpeed = TargetSpeed;
+                        commandedInit = true;
+                        SpeedLimit = rm.Reason ?? joinState;
+                        hasCurrent = false;
+                        if (recovery.Current != lastRecoveryStage)
+                        {
+                            lastRecoveryStage = recovery.Current;
+                            try { telemetry?.Event(t, "RECOVERY_STAGE", $"stage={recovery.Current};reason={recovery.Reason};s={route.AlongS:F0};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}"); } catch { }
+                        }
+                        try { actuator.SetManeuver(rm); } catch { }
+                        LogIntent(t, now);
+                        goto AfterPlan;
+                    }
+                }
+
                 LookaheadM = profile.LookaheadForSpeed(forwardPlanSpeed);
                 float dtPlan = 0.1f;
                 try
@@ -747,6 +819,24 @@ namespace StreetRacing.Race
             lastSignedLong = signedLongSpeed;
             lastPos = egoPos;
             lastKinT = now;
+        }
+
+        private void EnterRecovery(string reason, int now)
+        {
+            if (recovery.Active) return;
+            try
+            {
+                recovery.Enter(reason, now, route.AlongS);
+                recoveryEnteredMs = now;
+                lastRecoveryStage = recovery.Current;
+                plannerInvalidSinceMs = -1;
+                joined = true;
+                joinState = "Recovery:" + recovery.Current;
+                localPlanner.Reset();
+                telemetry?.Event(now - t0, "RECOVERY_ENTER",
+                    $"reason={reason};s={route.AlongS:F0};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}");
+            }
+            catch { }
         }
 
         private void SendHold(Vector3 egoPos, Vector3 egoFwd, string why)
