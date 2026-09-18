@@ -51,6 +51,7 @@ namespace StreetRacing.Control
         public bool HasPlan { get; private set; }
         public int ReissueCount { get; private set; }
         public string LastReason { get; private set; } = "";
+        public string TakeoverDetail { get; private set; } = "";
         public string ActuatorName => "Direct";
         public PathFollowingError LastError { get; private set; } = new PathFollowingError();
 
@@ -85,13 +86,73 @@ namespace StreetRacing.Control
             driver.IsPersistent = true;
             vehicle.IsPersistent = true;
 
-            Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, driver, true);
-            Function.Call(Hash.SET_PED_KEEP_TASK, driver, true);
-            Function.Call(Hash.SET_DRIVER_ABILITY, driver, 1.0f);
-            Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, driver, 1.0f);
-            Function.Call(Hash.SET_DRIVER_RACING_MODIFIER, driver, 1.0f);
+            // DIRECT OWNERSHIP CONTRACT:
+            // The selected rival arrives with Rockstar's ambient vehicle task
+            // already running. ClearAll() maps to CLEAR_PED_TASKS and can leave
+            // the old driving task alive while it winds down. Starting direct
+            // memory control during that window creates two control owners.
+            //
+            // Do not "keep" the ambient task. Kill it immediately, then block
+            // new non-temporary ambient behavior while Direct owns the car.
+            bool seatBefore = false;
+            bool seatAfterClear = false;
+            bool reseated = false;
+            bool trafficLightBefore = false;
+            bool trafficLightAfter = false;
+            try
+            {
+                var vd = vehicle.Driver;
+                seatBefore = vd != null && vd.Exists() && vd.Handle == driver.Handle;
+            }
+            catch { }
+            try { trafficLightBefore = vehicle.IsStoppedAtTrafficLights; } catch { }
+            // Block ambient event assignment before we remove the old task;
+            // repeat after re-seating as a defensive ownership assertion.
+            try { Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, driver, true); } catch { }
+            try { Function.Call(Hash.SET_PED_KEEP_TASK, driver, false); } catch { }
+            try { driver.Task.ClearAllImmediately(); } catch { }
+            try
+            {
+                var vd = vehicle.Driver;
+                seatAfterClear = vd != null && vd.Exists() && vd.Handle == driver.Handle;
+            }
+            catch { }
+            if (!seatAfterClear)
+            {
+                try
+                {
+                    driver.SetIntoVehicle(vehicle, VehicleSeat.Driver);
+                    reseated = true;
+                }
+                catch { }
+            }
 
-            try { driver.Task.ClearAll(); } catch { }
+            try { Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, driver, true); } catch { }
+            try { Function.Call(Hash.SET_PED_KEEP_TASK, driver, false); } catch { }
+            try { Function.Call(Hash.SET_DRIVER_ABILITY, driver, 1.0f); } catch { }
+            try { Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, driver, 1.0f); } catch { }
+            try { Function.Call(Hash.SET_DRIVER_RACING_MODIFIER, driver, 1.0f); } catch { }
+
+            // Clear residual vehicle control state inherited from traffic AI.
+            try { vehicle.Throttle = 0f; } catch { }
+            try { vehicle.ThrottlePower = 0f; } catch { }
+            try { vehicle.BrakePower = 0f; } catch { }
+            try { vehicle.IsHandbrakeForcedOn = false; } catch { }
+            try { vehicle.IsBurnoutForced = false; } catch { }
+            try { trafficLightAfter = vehicle.IsStoppedAtTrafficLights; } catch { }
+
+            bool seatFinal = false;
+            try
+            {
+                var vd = vehicle.Driver;
+                seatFinal = vd != null && vd.Exists() && vd.Handle == driver.Handle;
+            }
+            catch { }
+            TakeoverDetail = $"clear=Immediate;seatBefore={(seatBefore ? 1 : 0)};"
+                + $"seatAfterClear={(seatAfterClear ? 1 : 0)};reseated={(reseated ? 1 : 0)};"
+                + $"seatFinal={(seatFinal ? 1 : 0)};trafficLightBefore={(trafficLightBefore ? 1 : 0)};"
+                + $"trafficLightAfter={(trafficLightAfter ? 1 : 0)};keepTask=0;blockingEvents=1";
+
             HasPlan = false;
             hasManeuver = false;
             ReissueCount = 0;
