@@ -313,21 +313,25 @@ namespace StreetRacing
                 {
                     float baseS = reference.StationS[i];
                     float lat = HermiteLateral(startLat, m0, targetLat, baseS, transitionS);
-                    float allowed = corridor != null
-                        ? corridor.HalfWidthAt(baseS) - VehicleHalfWidthM - RoadMarginM
-                        : 4f;
-                    if (allowed < 0.65f) allowed = 0.65f;
-                    if (Math.Abs(lat) > allowed + 0.05f)
-                    {
-                        c.RejectReason = $"road-boundary@{baseS:F0}";
-                        return c;
-                    }
-
                     Vector3 dir = DirectionAt(reference.Path, i);
                     Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
                     Vector3 bp = reference.Path[i];
                     var p = new Vector3(bp.X + left.X * lat, bp.Y + left.Y * lat, bp.Z);
                     if (i == 0) p = egoPos;
+
+                    if (corridor != null)
+                    {
+                        float half = corridor.HalfWidthAt(baseS);
+                        float actualRoadLat = corridor.LateralAt(p, baseS, route);
+                        float allowed = half - VehicleHalfWidthM - RoadMarginM;
+                        if (allowed < 0.65f) allowed = 0.65f;
+                        if (Math.Abs(actualRoadLat) > allowed + 0.05f)
+                        {
+                            c.RejectReason = $"road-boundary@{baseS:F0}:lat={actualRoadLat:F1}/allow={allowed:F1}";
+                            return c;
+                        }
+                    }
+
                     path.Add(p);
                     lats.Add(lat);
                 }
