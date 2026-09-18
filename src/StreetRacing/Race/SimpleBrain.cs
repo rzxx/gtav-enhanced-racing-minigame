@@ -22,13 +22,13 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// Explicitly DISABLED by construction for this milestone (do not re-add):
-    ///   Perception / civilian traffic avoidance / passing (FOLLOW/PASS) /
+    /// Explicitly DISABLED by construction for this milestone:
+    ///   civilian traffic avoidance / passing (FOLLOW/PASS) /
     ///   player race tactics / candidate trajectory scoring / seven lateral
     ///   choices / Crashed state / ImpactClassifier-driven behavior /
     ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
-    ///   StraightFallback. If the NPC hits traffic, that is acceptable: we are
-    ///   testing route-following competence, not avoidance.
+    ///   StraightFallback. Perception is OBSERVE-ONLY in this pass so traffic
+    ///   can be diagnosed without affecting planning.
     ///
     /// Speed separation (the recursive bug this fixes):
     ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
@@ -1133,9 +1133,21 @@ namespace StreetRacing.Race
                 int gear = 0;
                 int nextGear = 0;
                 float rpm = 0f;
+                int gtaTrafficLight = 0;
+                int burnout = 0;
+                int seatOk = 0;
                 try { gear = vehicle.CurrentGear; } catch { }
                 try { nextGear = vehicle.NextGear; } catch { }
                 try { rpm = vehicle.CurrentRPM; } catch { }
+                try { gtaTrafficLight = vehicle.IsStoppedAtTrafficLights ? 1 : 0; } catch { }
+                try { burnout = vehicle.IsInBurnout ? 1 : 0; } catch { }
+                try
+                {
+                    var vd = vehicle.Driver;
+                    seatOk = vd != null && vd.Exists() && driver != null && driver.Exists()
+                        && vd.Handle == driver.Handle ? 1 : 0;
+                }
+                catch { }
 
                 telemetry.Sample(t, style, joinState,
                     route.AlongS, route.Progress01, LookaheadM,
@@ -1172,7 +1184,8 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.BrakeActual01 : 0f,
                     pe.Valid ? pe.SteerSaturationS : 0f,
                     pe.Valid ? pe.StabilityMode : "",
-                    gear, nextGear, rpm);
+                    gear, nextGear, rpm,
+                    gtaTrafficLight, burnout, seatOk);
             }
             catch { }
         }
