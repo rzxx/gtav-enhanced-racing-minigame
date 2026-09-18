@@ -112,6 +112,16 @@ namespace StreetRacing.Tactics
                     want = rivalIsAhead && rivalDist < 60f ? TacticalMode.Follow : TacticalMode.Cruise;
                     reason = "corner-clear";
                 }
+                else if (Mode == TacticalMode.SideBySide && nowMs - SinceMs > 4000)
+                {
+                    // Timeout first (before the alongside latch below):
+                    // rubbing alongside forever (e.g. both stopped at race
+                    // start) must resolve into a racing mode, not a
+                    // permanent hold. Re-evaluate from Follow/Cruise.
+                    want = rivalIsAhead && rivalDist < 60f ? TacticalMode.Follow : TacticalMode.Cruise;
+                    reason = "side-by-side-timeout";
+                    wantLat = 0f;
+                }
                 else if (alongside)
                 {
                     want = TacticalMode.SideBySide;
@@ -303,7 +313,9 @@ namespace StreetRacing.Tactics
             float leftScore = leftClear + (rivalLat < 0 ? 4f : 0f);
             float rightScore = rightClear + (rivalLat > 0 ? 4f : 0f);
             // Narrow road: stay put unless a side is clearly free.
-            if (corridor.HalfWidth < 4.5f)
+            // Uses the sampled profile ahead, not just the current slice.
+            float narrowHalf = corridor.MinHalfWidthAhead(60f);
+            if (narrowHalf < 4.5f)
             {
                 if (Math.Max(leftClear, rightClear) < need) return rivalLat < 0 ? 1 : -1;
             }
@@ -315,12 +327,32 @@ namespace StreetRacing.Tactics
             float worst = 999f;
             foreach (var a in perception.Actors)
             {
-                if (!a.IsAhead) continue;
-                bool onSide = side > 0 ? a.Lateral > -1f : a.Lateral < 1f;
+                // Route frame first (road-following); ego cone only as fallback.
+                float lat, dist, ttc, closing;
+                bool ahead;
+                if (a.RouteValid)
+                {
+                    lat = a.RouteLateral;
+                    dist = a.RouteDist;
+                    ttc = Math.Min(a.Ttc, a.RouteTtc);
+                    closing = Math.Max(a.ClosingSpeed, a.ClosingAlong);
+                    ahead = dist > -6f && dist < 170f;
+                }
+                else
+                {
+                    if (!a.IsAhead) continue;
+                    lat = a.Lateral;
+                    dist = a.Dist;
+                    ttc = a.Ttc;
+                    closing = a.ClosingSpeed;
+                    ahead = true;
+                }
+                if (!ahead) continue;
+                bool onSide = side > 0 ? lat > -1f : lat < 1f;
                 if (!onSide) continue;
-                if (a.Dist < worst) worst = a.Dist;
-                if (a.Ttc < 3f && a.ClosingSpeed > 2f)
-                    worst = Math.Min(worst, a.Dist * 0.5f);
+                if (dist < worst) worst = dist;
+                if (ttc < 3f && closing > 2f)
+                    worst = Math.Min(worst, dist * 0.5f);
             }
             return worst;
         }
@@ -330,11 +362,28 @@ namespace StreetRacing.Tactics
             float need = profile.ClearanceNeed(14f + egoSpeed * 0.35f);
             foreach (var a in perception.Actors)
             {
-                if (!a.IsAhead) continue;
-                bool onSide = side > 0 ? a.Lateral > -2f : a.Lateral < 2f;
+                float lat, dist, ttc;
+                bool ahead;
+                if (a.RouteValid)
+                {
+                    lat = a.RouteLateral;
+                    dist = a.RouteDist;
+                    ttc = Math.Min(a.Ttc, a.RouteTtc);
+                    ahead = dist > -6f && dist < 170f;
+                }
+                else
+                {
+                    if (!a.IsAhead) continue;
+                    lat = a.Lateral;
+                    dist = a.Dist;
+                    ttc = a.Ttc;
+                    ahead = true;
+                }
+                if (!ahead) continue;
+                bool onSide = side > 0 ? lat > -2f : lat < 2f;
                 if (!onSide) continue;
-                if (a.Dist < need && a.Ttc < 4f) return false;
-                if (a.Kind == ActorKind.Ped && a.Dist < need * 0.7f) return false;
+                if (dist < need && ttc < 4f) return false;
+                if (a.Kind == ActorKind.Ped && dist < need * 0.7f) return false;
             }
             return true;
         }
@@ -344,10 +393,27 @@ namespace StreetRacing.Tactics
             float need = profile.ClearanceNeed(10f + egoSpeed * 0.25f);
             foreach (var a in perception.Actors)
             {
-                if (!a.IsAhead) continue;
-                bool onSide = side > 0 ? a.Lateral > -2.5f : a.Lateral < 2.5f;
+                float lat, dist, ttc;
+                bool ahead;
+                if (a.RouteValid)
+                {
+                    lat = a.RouteLateral;
+                    dist = a.RouteDist;
+                    ttc = Math.Min(a.Ttc, a.RouteTtc);
+                    ahead = dist > -6f && dist < 170f;
+                }
+                else
+                {
+                    if (!a.IsAhead) continue;
+                    lat = a.Lateral;
+                    dist = a.Dist;
+                    ttc = a.Ttc;
+                    ahead = true;
+                }
+                if (!ahead) continue;
+                bool onSide = side > 0 ? lat > -2.5f : lat < 2.5f;
                 if (!onSide) continue;
-                if (a.Dist < need && (a.Ttc < 2.5f || a.Dist < 12f)) return true;
+                if (dist < need && (ttc < 2.5f || dist < 12f)) return true;
             }
             return false;
         }

@@ -9,6 +9,13 @@ namespace StreetRacing
     /// Route understanding: a dense centerline polyline from race start toward
     /// the finish, plus continuous progress / lookahead / loss detection.
     ///
+    /// Source priority:
+    ///   1) GTA's active GPS route (GET_GPS_BLIP_ROUTE_FOUND /
+    ///      GET_POS_ALONG_GPS_TYPE_ROUTE). The race already creates a routed
+    ///      finish blip, so this is the real connected road path — not a guess.
+    ///   2) Connected fallback walk (street-snapped stepping toward finish).
+    ///   3) Straight origin->finish (last resort, still tracked for progress).
+    ///
     /// Why not DriveTo(finish) directly: a 2 km target lets GTA pick either
     /// carriageway at splits and silently drop the route when the target is
     /// unreachable from the current lane. We track a local corridor instead
@@ -19,6 +26,10 @@ namespace StreetRacing
         public readonly List<float> CumulativeS = new List<float>();
         public float TotalLength;
         public bool Built;
+
+        // Where the centerline came from (telemetry / debug).
+        public string Source = "None";
+        public int GpsSamples;
 
         // Tracking state.
         public int NearestIndex;
@@ -58,50 +69,91 @@ namespace StreetRacing
             hasLastHeading = false;
             circleAccumDeg = 0f;
             LastProgressMs = Game.GameTime;
+            Source = "None";
+            GpsSamples = 0;
 
-            // Walk from origin toward finish in ~40 m steps, snapping each probe
-            // to the street network. This follows roads coarsely; the corridor
-            // estimator + local planner handle exact lane geometry at runtime.
-            // If snapping fails we keep the raw probe so the route still exists.
+            // 1) Real connected GPS route first.
             try
             {
-                var flat = new Vector3(finishIn.X - origin.X, finishIn.Y - origin.Y, 0f);
-                if (RaceMath.FlatLength(flat) < 1f) flat = new Vector3(0f, 1f, 0f);
-                flat = RaceMath.FlatNormalize(flat);
-
-                Vector3 cursor = origin;
-                Points.Add(SnapToStreet(origin));
-                for (int i = 0; i < 110; i++)
+                List<Vector3> gps;
+                string how;
+                if (TryBuildFromGps(origin, finishIn, out gps, out how) && gps != null && gps.Count >= 2)
                 {
-                    float remaining = RaceMath.FlatDistance(cursor, finishIn);
-                    if (remaining < 45f) break;
-                    float step = Math.Min(45f, remaining * 0.5f);
-                    if (step < 20f) step = Math.Min(20f, remaining);
-                    // Aim each step slightly toward the finish from the snapped
-                    // cursor so the polyline bends with the road network instead
-                    // of cutting straight across blocks.
-                    var toF = RaceMath.FlatNormalize(new Vector3(finishIn.X - cursor.X, finishIn.Y - cursor.Y, 0f));
-                    var probe = new Vector3(cursor.X + toF.X * step, cursor.Y + toF.Y * step, cursor.Z);
-                    Vector3 snapped = SnapToStreet(probe);
-                    // Guard against the snap collapsing back onto the same node
-                    // (junctions / dual carriageways): nudge forward if stuck.
-                    if (RaceMath.FlatDistance(snapped, cursor) < 5f)
-                    {
-                        var probe2 = new Vector3(probe.X + toF.X * 25f, probe.Y + toF.Y * 25f, probe.Z);
-                        snapped = SnapToStreet(probe2);
-                        if (RaceMath.FlatDistance(snapped, cursor) < 5f) break;
-                    }
-                    Points.Add(snapped);
-                    cursor = snapped;
+                    foreach (var p in gps) Points.Add(p);
+                    Source = how;
+                    GpsSamples = gps.Count;
+                    FinalizeGeometry();
+                    return;
                 }
-                Points.Add(SnapToStreet(finishIn));
+            }
+            catch { }
+
+            // 2) Connected fallback walk (street-snapped stepping).
+            try
+            {
+                if (BuildFallbackWalk(origin, finishIn))
+                {
+                    Source = "FallbackWalk";
+                    FinalizeGeometry();
+                    return;
+                }
+            }
+            catch { }
+
+            // 3) Last resort: straight line so progress tracking still exists.
+            try
+            {
+                Points.Clear();
+                Points.Add(origin);
+                Points.Add(finishIn);
+                Source = "StraightFallback";
+                FinalizeGeometry();
             }
             catch
             {
                 if (Points.Count == 0) Points.Add(origin);
                 Points.Add(finishIn);
+                Source = "StraightFallback";
+                FinalizeGeometry();
             }
+        }
 
+        /// Called by RaceBrain during the first seconds if Build() fell back
+        /// before the GPS route existed (blip route takes a frame or two to
+        /// compute). Returns true when an upgrade happened.
+        public bool TryUpgradeToGps(Vector3 egoPos)
+        {
+            try
+            {
+                if (Built && Source.StartsWith("Gps")) return false;
+                List<Vector3> gps;
+                string how;
+                // Use current ego pos as origin hint for validation, but keep
+                // original start anchored: prepend existing start if GPS starts
+                // ahead of us.
+                if (!TryBuildFromGps(Points.Count > 0 ? Points[0] : egoPos, finish, out gps, out how))
+                    return false;
+                if (gps == null || gps.Count < 2) return false;
+                // Preserve progress: find nearest index on the new polyline.
+                Points.Clear();
+                foreach (var p in gps) Points.Add(p);
+                Source = how;
+                GpsSamples = gps.Count;
+                FinalizeGeometry();
+                // Re-anchor tracking to current position.
+                NearestIndex = 0;
+                AlongS = 0f;
+                MaxS = 0f;
+                hasLastHeading = false;
+                circleAccumDeg = 0f;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private void FinalizeGeometry()
+        {
+            CumulativeS.Clear();
             float s = 0f;
             CumulativeS.Add(0f);
             for (int i = 1; i < Points.Count; i++)
@@ -112,6 +164,230 @@ namespace StreetRacing
             TotalLength = s;
             Built = Points.Count >= 2;
             LastProgressMs = Game.GameTime;
+        }
+
+        // ------------------------------------------------------------------
+        // GPS sampling.
+        //
+        // Natives (from nativedb):
+        //   BOOL GET_GPS_BLIP_ROUTE_FOUND()
+        //   int  GET_GPS_BLIP_ROUTE_LENGTH()
+        //   BOOL GET_POS_ALONG_GPS_TYPE_ROUTE(Vector3* out, BOOL p1, float p2, int p3)
+        //        p3 in {0,1,2} (route type). p2 semantics are undocumented —
+        //        most likely distance-along-route in meters. We probe distance
+        //        first, then index fallback, and validate geometrically so a
+        //        wrong interpretation can never silently corrupt the route.
+        // ------------------------------------------------------------------
+        private static bool TryBuildFromGps(Vector3 origin, Vector3 finishIn,
+            out List<Vector3> pts, out string how)
+        {
+            pts = null;
+            how = "None";
+            bool found = false;
+            try { found = Function.Call<bool>(Hash.GET_GPS_BLIP_ROUTE_FOUND); }
+            catch { return false; }
+            if (!found) return false;
+
+            int routeLen = 0;
+            try { routeLen = Function.Call<int>(Hash.GET_GPS_BLIP_ROUTE_LENGTH); }
+            catch { routeLen = 0; }
+
+            // Candidate route types to try in order. 1 first: in practice the
+            // driving route renders as type 1; 0/2 are alternates.
+            int[] types = { 1, 0, 2 };
+            foreach (int t in types)
+            {
+                // Interpretation A: p2 = distance along route (meters).
+                var byDist = SampleGpsByDistance(origin, finishIn, routeLen, t);
+                if (IsPlausibleRoute(byDist, origin, finishIn))
+                {
+                    pts = ResamplePolyline(byDist, 18f);
+                    how = "GpsDist(t" + t + ")";
+                    return true;
+                }
+                // Interpretation B: p2 = node index 0..len-1.
+                var byIdx = SampleGpsByIndex(origin, finishIn, routeLen, t);
+                if (IsPlausibleRoute(byIdx, origin, finishIn))
+                {
+                    pts = ResamplePolyline(byIdx, 18f);
+                    how = "GpsIdx(t" + t + ")";
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static List<Vector3> SampleGpsByDistance(Vector3 origin, Vector3 finishIn, int routeLen, int type)
+        {
+            var outPts = new List<Vector3>();
+            // Upper bound: route length if it looks like meters, else 9 km cap.
+            float maxD = 9000f;
+            if (routeLen > 200 && routeLen < 15000) maxD = routeLen + 400f;
+            float step = 25f;
+            int failStreak = 0;
+            Vector3 last = Vector3.Zero;
+            bool haveLast = false;
+            for (float d = 0f; d <= maxD; d += step)
+            {
+                Vector3 p;
+                if (!TryGpsPos(true, d, type, out p))
+                {
+                    // Also try p1=false once before giving up on this station.
+                    if (!TryGpsPos(false, d, type, out p))
+                    {
+                        failStreak++;
+                        if (failStreak >= 6 && outPts.Count >= 4) break;
+                        if (d > 1500f && outPts.Count < 3) break;
+                        continue;
+                    }
+                }
+                failStreak = 0;
+                if (p == Vector3.Zero) continue;
+                if (haveLast)
+                {
+                    float gap = RaceMath.FlatDistance(last, p);
+                    if (gap < 4f) continue;          // duplicate sample
+                    if (gap > 400f) break;           // jumped (wrong type?) — stop
+                }
+                outPts.Add(p);
+                last = p;
+                haveLast = true;
+                // Stop once we reach the finish neighbourhood.
+                if (RaceMath.FlatDistance(p, finishIn) < 35f && outPts.Count > 4) break;
+                if (outPts.Count > 420) break;
+            }
+            return outPts;
+        }
+
+        private static List<Vector3> SampleGpsByIndex(Vector3 origin, Vector3 finishIn, int routeLen, int type)
+        {
+            var outPts = new List<Vector3>();
+            if (routeLen < 2 || routeLen > 2000) return outPts;
+            for (int i = 0; i < routeLen; i++)
+            {
+                Vector3 p;
+                if (!TryGpsPos(true, (float)i, type, out p)) continue;
+                if (p == Vector3.Zero) continue;
+                if (outPts.Count > 0 && RaceMath.FlatDistance(outPts[outPts.Count - 1], p) < 2f) continue;
+                outPts.Add(p);
+                if (outPts.Count > 600) break;
+            }
+            return outPts;
+        }
+
+        private static bool TryGpsPos(bool p1, float p2, int type, out Vector3 pos)
+        {
+            pos = Vector3.Zero;
+            try
+            {
+                var outArg = new OutputArgument();
+                bool ok = Function.Call<bool>(Hash.GET_POS_ALONG_GPS_TYPE_ROUTE, outArg, p1, p2, type);
+                if (!ok) return false;
+                pos = outArg.GetResult<Vector3>();
+                if (pos == Vector3.Zero) return false;
+                if (Math.Abs(pos.X) > 9000f || Math.Abs(pos.Y) > 9000f) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsPlausibleRoute(List<Vector3> pts, Vector3 origin, Vector3 finishIn)
+        {
+            if (pts == null || pts.Count < 5) return false;
+            // Must start near origin and end near finish (GPS is player-centric;
+            // allow generous tolerance since rival starts near player).
+            float dStart = RaceMath.FlatDistance(pts[0], origin);
+            float dEnd = RaceMath.FlatDistance(pts[pts.Count - 1], finishIn);
+            // Also accept routes whose closest approach is near (route may start
+            // slightly ahead of us on the road network).
+            float closestStart = float.MaxValue;
+            float closestEnd = float.MaxValue;
+            for (int i = 0; i < Math.Min(pts.Count, 12); i++)
+                closestStart = Math.Min(closestStart, RaceMath.FlatDistance(pts[i], origin));
+            for (int i = Math.Max(0, pts.Count - 12); i < pts.Count; i++)
+                closestEnd = Math.Min(closestEnd, RaceMath.FlatDistance(pts[i], finishIn));
+            if (Math.Min(dStart, closestStart) > 220f) return false;
+            if (Math.Min(dEnd, closestEnd) > 260f) return false;
+            // Total length sanity: must be >= straight-line * 0.7 (not a stub)
+            // and <= straight-line * 4 + 1500 (not a spiral).
+            float straight = RaceMath.FlatDistance(origin, finishIn);
+            float len = 0f;
+            for (int i = 1; i < pts.Count; i++) len += RaceMath.FlatDistance(pts[i - 1], pts[i]);
+            if (len < straight * 0.6f) return false;
+            if (len > straight * 4f + 1500f) return false;
+            if (len < 60f) return false;
+            return true;
+        }
+
+        private static List<Vector3> ResamplePolyline(List<Vector3> src, float step)
+        {
+            var dst = new List<Vector3>();
+            if (src == null || src.Count == 0) return dst;
+            dst.Add(src[0]);
+            float acc = 0f;
+            for (int i = 1; i < src.Count; i++)
+            {
+                float seg = RaceMath.FlatDistance(src[i - 1], src[i]);
+                if (seg < 0.01f) continue;
+                float t = step - acc;
+                var a = src[i - 1];
+                var b = src[i];
+                while (t < seg)
+                {
+                    float f = t / seg;
+                    dst.Add(new Vector3(
+                        a.X + (b.X - a.X) * f,
+                        a.Y + (b.Y - a.Y) * f,
+                        a.Z + (b.Z - a.Z) * f));
+                    t += step;
+                }
+                acc = seg - (t - step);
+                if (acc < 0f) acc = 0f;
+                if (acc >= step) acc -= step;
+            }
+            var last = src[src.Count - 1];
+            if (dst.Count == 0 || RaceMath.FlatDistance(dst[dst.Count - 1], last) > 1f)
+                dst.Add(last);
+            return dst;
+        }
+
+        private static bool BuildFallbackWalkInto(Vector3 origin, Vector3 finishIn, List<Vector3> pts)
+        {
+            pts.Clear();
+            var flat = new Vector3(finishIn.X - origin.X, finishIn.Y - origin.Y, 0f);
+            if (RaceMath.FlatLength(flat) < 1f) flat = new Vector3(0f, 1f, 0f);
+            flat = RaceMath.FlatNormalize(flat);
+
+            Vector3 cursor = origin;
+            pts.Add(SnapToStreet(origin));
+            for (int i = 0; i < 160; i++)
+            {
+                float remaining = RaceMath.FlatDistance(cursor, finishIn);
+                if (remaining < 30f) break;
+                float step = Math.Min(30f, Math.Max(15f, remaining * 0.4f));
+                var toF = RaceMath.FlatNormalize(new Vector3(finishIn.X - cursor.X, finishIn.Y - cursor.Y, 0f));
+                var probe = new Vector3(cursor.X + toF.X * step, cursor.Y + toF.Y * step, cursor.Z);
+                Vector3 snapped = SnapToStreet(probe);
+                if (RaceMath.FlatDistance(snapped, cursor) < 4f)
+                {
+                    var probe2 = new Vector3(probe.X + toF.X * 20f, probe.Y + toF.Y * 20f, probe.Z);
+                    snapped = SnapToStreet(probe2);
+                    if (RaceMath.FlatDistance(snapped, cursor) < 4f) break;
+                }
+                pts.Add(snapped);
+                cursor = snapped;
+            }
+            pts.Add(SnapToStreet(finishIn));
+            return pts.Count >= 2;
+        }
+
+        private bool BuildFallbackWalk(Vector3 origin, Vector3 finishIn)
+        {
+            var tmp = new List<Vector3>();
+            if (!BuildFallbackWalkInto(origin, finishIn, tmp)) return false;
+            Points.Clear();
+            foreach (var p in tmp) Points.Add(p);
+            return Points.Count >= 2;
         }
 
         public void Update(Vector3 egoPos, float egoHeadingDeg, float speed, int nowMs, float corridorHalfWidth)
@@ -260,15 +536,65 @@ namespace StreetRacing
         /// Point on the route `distM` ahead of current AlongS (clamped to finish).
         public Vector3 LookaheadPoint(float distM)
         {
+            return PointAtS(AlongS + distM);
+        }
+
+        /// Route heading at `distM` ahead (for curvature / aim).
+        public float HeadingAhead(float distM)
+        {
+            return HeadingAtS(AlongS + distM);
+        }
+
+        /// Approximate curvature (rad/m) between now and distM ahead.
+        /// Uses smoothed headings so dense GPS points don't inject noise.
+        public float CurvatureAhead(float distM)
+        {
+            if (!Built) return 0f;
+            if (distM < 1f) return 0f;
+            float h0 = HeadingAtS(AlongS + 2f);
+            float h1 = HeadingAtS(AlongS + distM);
+            float dh = RaceMath.HeadingDiffDeg(h1, h0) * (float)Math.PI / 180f;
+            return Math.Abs(dh) / distM;
+        }
+
+        /// Local curvature at absolute arclength s (rad/m), from a centered
+        /// heading window. Used by the speed profiler's braking pass.
+        public float CurvatureAtS(float s, float windowM = 20f)
+        {
+            if (!Built) return 0f;
+            if (windowM < 4f) windowM = 4f;
+            float h0 = HeadingAtS(s - windowM * 0.5f);
+            float h1 = HeadingAtS(s + windowM * 0.5f);
+            float dh = RaceMath.HeadingDiffDeg(h1, h0) * (float)Math.PI / 180f;
+            return Math.Abs(dh) / windowM;
+        }
+
+        public Vector3 PointAtS(float s)
+        {
             if (!Built || Points.Count == 0) return finish;
-            float target = AlongS + distM;
-            if (target >= TotalLength) return Points[Points.Count - 1];
-            for (int i = NearestIndex; i < CumulativeS.Count - 1; i++)
+            if (s <= 0f) return Points[0];
+            if (s >= TotalLength) return Points[Points.Count - 1];
+            int lo = Math.Max(0, NearestIndex - 4);
+            for (int i = lo; i < CumulativeS.Count - 1; i++)
             {
-                if (CumulativeS[i + 1] >= target)
+                if (CumulativeS[i + 1] >= s && s >= CumulativeS[i] - 0.01f)
                 {
                     float segLen = CumulativeS[i + 1] - CumulativeS[i];
-                    float t = segLen > 1e-4f ? (target - CumulativeS[i]) / segLen : 0f;
+                    float t = segLen > 1e-4f ? (s - CumulativeS[i]) / segLen : 0f;
+                    var a = Points[i];
+                    var b = Points[i + 1];
+                    return new Vector3(
+                        a.X + (b.X - a.X) * t,
+                        a.Y + (b.Y - a.Y) * t,
+                        a.Z + (b.Z - a.Z) * t);
+                }
+            }
+            for (int i = 0; i < CumulativeS.Count - 1; i++)
+            {
+                if (CumulativeS[i + 1] >= s)
+                {
+                    float segLen = CumulativeS[i + 1] - CumulativeS[i];
+                    float t = segLen > 1e-4f ? (s - CumulativeS[i]) / segLen : 0f;
                     var a = Points[i];
                     var b = Points[i + 1];
                     return new Vector3(
@@ -280,38 +606,77 @@ namespace StreetRacing
             return Points[Points.Count - 1];
         }
 
-        /// Route heading at `distM` ahead (for curvature / aim).
-        public float HeadingAhead(float distM)
+        public float HeadingAtS(float s)
         {
             if (!Built || Points.Count < 2) return 0f;
-            float target = AlongS + distM;
-            if (target >= TotalLength) target = TotalLength - 1f;
-            if (target < 0f) target = 0f;
-            for (int i = 0; i < CumulativeS.Count - 1; i++)
+            if (s < 0f) s = 0f;
+            if (s >= TotalLength) s = Math.Max(0f, TotalLength - 1f);
+            // Average direction over a small window for stability on dense GPS.
+            float w = 12f;
+            Vector3 a = PointAtS(Math.Max(0f, s - w * 0.5f));
+            Vector3 b = PointAtS(Math.Min(TotalLength, s + w * 0.5f));
+            var d = new Vector3(b.X - a.X, b.Y - a.Y, 0f);
+            if (RaceMath.FlatLength(d) < 0.5f)
             {
-                if (CumulativeS[i + 1] >= target)
+                // Fall back to raw segment.
+                for (int i = 0; i < CumulativeS.Count - 1; i++)
                 {
-                    var a = Points[i];
-                    var b = Points[i + 1];
-                    return RaceMath.HeadingFromVector(RaceMath.FlatNormalize(
-                        new Vector3(b.X - a.X, b.Y - a.Y, 0f)));
+                    if (CumulativeS[i + 1] >= s)
+                    {
+                        var p0 = Points[i];
+                        var p1 = Points[i + 1];
+                        return RaceMath.HeadingFromVector(RaceMath.FlatNormalize(
+                            new Vector3(p1.X - p0.X, p1.Y - p0.Y, 0f)));
+                    }
                 }
+                var l1 = Points[Points.Count - 2];
+                var l2 = Points[Points.Count - 1];
+                return RaceMath.HeadingFromVector(RaceMath.FlatNormalize(
+                    new Vector3(l2.X - l1.X, l2.Y - l1.Y, 0f)));
             }
-            var l1 = Points[Points.Count - 2];
-            var l2 = Points[Points.Count - 1];
-            return RaceMath.HeadingFromVector(RaceMath.FlatNormalize(
-                new Vector3(l2.X - l1.X, l2.Y - l1.Y, 0f)));
+            return RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d));
         }
 
-        /// Approximate curvature (rad/m) between now and distM ahead.
-        public float CurvatureAhead(float distM)
+        public struct RouteProjection
         {
-            if (!Built) return 0f;
-            float h0 = HeadingAhead(0f);
-            float h1 = HeadingAhead(distM);
-            float dh = RaceMath.HeadingDiffDeg(h1, h0) * (float)Math.PI / 180f;
-            if (distM < 1f) return 0f;
-            return Math.Abs(dh) / distM;
+            public float S;
+            public float Lateral; // + = left of route direction
+            public float Dist;
+            public int SegIndex;
+            public Vector3 Closest;
+            public Vector3 Dir;
+        }
+
+        /// Project an arbitrary world point onto the route (full search).
+        /// Used to express actors in route coordinates.
+        public RouteProjection ProjectOntoRoute(Vector3 p)
+        {
+            var r = new RouteProjection { S = AlongS, Lateral = 0f, Dist = 999f, SegIndex = NearestIndex, Closest = p, Dir = new Vector3(0f, 1f, 0f) };
+            if (!Built || Points.Count < 2) return r;
+            float best = float.MaxValue;
+            int bestI = 0;
+            RaceMath.Projection bestPr = new RaceMath.Projection();
+            Vector3 bestDir = r.Dir;
+            for (int i = 0; i < Points.Count - 1; i++)
+            {
+                var a = Points[i];
+                var b = Points[i + 1];
+                var pr = RaceMath.ProjectOnSegment(p, a, b);
+                if (pr.Dist < best)
+                {
+                    best = pr.Dist;
+                    bestI = i;
+                    bestPr = pr;
+                    bestDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                }
+            }
+            r.SegIndex = bestI;
+            r.S = CumulativeS[bestI] + bestPr.Along;
+            r.Dist = best;
+            r.Closest = bestPr.Closest;
+            r.Dir = bestDir;
+            r.Lateral = RaceMath.FlatCross(bestDir, new Vector3(p.X - bestPr.Closest.X, p.Y - bestPr.Closest.Y, 0f));
+            return r;
         }
 
         public float Progress01 => TotalLength > 1f ? RaceMath.Clamp(AlongS / TotalLength, 0f, 1f) : 0f;

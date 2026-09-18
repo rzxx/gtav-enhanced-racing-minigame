@@ -1,0 +1,206 @@
+using System;
+using GTA;
+using GTA.Math;
+
+namespace StreetRacing.Debug
+{
+    /// In-game spatial debug visualization. CSV telemetry remains, but road
+    /// geometry, candidate paths and predictions must be SEEN to be believed.
+    ///
+    /// Draws every tick (markers/lines only persist one frame):
+    ///   route centerline (yellow), corridor left/right edges (green/red),
+    ///   all candidate paths (gray viable / orange blocked), chosen (cyan),
+    ///   actor predictions (kind-colored lines + predicted dots),
+    ///   aim point (cyan sphere) + braking point (red cylinder).
+    ///
+    /// Toggle via StreetRacing.ini [Race] DebugViz=1. Costs ~200 draw calls
+    /// when enabled; leave off for clean races / perf.
+    internal sealed class RaceDebugViz
+    {
+        public bool Enabled;
+
+        public void Draw(
+            RaceRoute route,
+            RoadCorridor corridor,
+            TrajectoryPlanner traj,
+            Perception perception,
+            SpeedPlanner speedPlan,
+            Vector3 egoPos,
+            float egoSpeed,
+            float lookaheadM,
+            float targetSpeed)
+        {
+            if (!Enabled) return;
+            try
+            {
+                DrawRoute(route);
+                DrawCorridor(corridor);
+                DrawCandidates(traj);
+                DrawActors(perception, egoSpeed);
+                DrawAimAndBraking(route, traj, speedPlan);
+            }
+            catch { }
+        }
+
+        private static void DrawRoute(RaceRoute route)
+        {
+            try
+            {
+                if (route == null || !route.Built || route.Points.Count < 2) return;
+                var col = System.Drawing.Color.FromArgb(220, 255, 210, 0);
+                int lo = Math.Max(0, route.NearestIndex - 2);
+                int hi = Math.Min(route.Points.Count - 2, lo + 26);
+                for (int i = lo; i <= hi; i++)
+                {
+                    var a = route.Points[i];
+                    var b = route.Points[i + 1];
+                    World.DrawLine(
+                        new Vector3(a.X, a.Y, a.Z + 1f),
+                        new Vector3(b.X, b.Y, b.Z + 1f), col);
+                }
+                // Finish marker column.
+                try
+                {
+                    World.DrawMarker(MarkerType.Cylinder, route.Finish + new Vector3(0f, 0f, 1f),
+                        new Vector3(), new Vector3(), new Vector3(6f, 6f, 8f),
+                        System.Drawing.Color.FromArgb(200, 255, 220, 0), false, false, false, "", "", false);
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        private static void DrawCorridor(RoadCorridor corridor)
+        {
+            try
+            {
+                if (corridor == null || corridor.Slices.Count < 2) return;
+                var leftCol = System.Drawing.Color.FromArgb(200, 0, 255, 0);
+                var rightCol = System.Drawing.Color.FromArgb(200, 255, 60, 60);
+                for (int i = 0; i < corridor.Slices.Count - 1; i++)
+                {
+                    var a = corridor.Slices[i];
+                    var b = corridor.Slices[i + 1];
+                    if (!a.Valid || !b.Valid) continue;
+                    World.DrawLine(
+                        new Vector3(a.LeftEdge.X, a.LeftEdge.Y, a.LeftEdge.Z + 0.6f),
+                        new Vector3(b.LeftEdge.X, b.LeftEdge.Y, b.LeftEdge.Z + 0.6f), leftCol);
+                    World.DrawLine(
+                        new Vector3(a.RightEdge.X, a.RightEdge.Y, a.RightEdge.Z + 0.6f),
+                        new Vector3(b.RightEdge.X, b.RightEdge.Y, b.RightEdge.Z + 0.6f), rightCol);
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawCandidates(TrajectoryPlanner traj)
+        {
+            try
+            {
+                if (traj == null || traj.LastCandidates.Count == 0) return;
+                foreach (var c in traj.LastCandidates)
+                {
+                    if (c.Path == null || c.Path.Count < 2) continue;
+                    bool isChosen = traj.HasChosen && ReferenceEquals(c.Path, traj.Chosen.Path);
+                    // ReferenceEquals on struct copies won't match; compare Aim+Score instead.
+                    if (traj.HasChosen)
+                        isChosen = c.AimPoint.X == traj.Chosen.AimPoint.X && c.AimPoint.Y == traj.Chosen.AimPoint.Y && c.Score == traj.Chosen.Score;
+                    System.Drawing.Color col;
+                    if (isChosen)
+                        col = System.Drawing.Color.FromArgb(230, 0, 255, 255);
+                    else if (!string.IsNullOrEmpty(c.RejectReason))
+                        col = System.Drawing.Color.FromArgb(160, 255, 150, 0);
+                    else
+                        col = System.Drawing.Color.FromArgb(130, 180, 180, 180);
+                    for (int i = 0; i < c.Path.Count - 1; i++)
+                    {
+                        var a = c.Path[i];
+                        var b = c.Path[i + 1];
+                        World.DrawLine(
+                            new Vector3(a.X, a.Y, a.Z + 0.8f),
+                            new Vector3(b.X, b.Y, b.Z + 0.8f), col);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawActors(Perception perception, float egoSpeed)
+        {
+            try
+            {
+                if (perception == null) return;
+                int drawn = 0;
+                foreach (var a in perception.Actors)
+                {
+                    if (drawn >= 14) break;
+                    bool relevant = a.IsAhead || (a.RouteValid && a.RouteDist > -10f && a.RouteDist < 150f);
+                    if (!relevant) continue;
+                    if (a.Dist > 130f) continue;
+                    System.Drawing.Color col;
+                    switch (a.Kind)
+                    {
+                        case ActorKind.Rival: col = System.Drawing.Color.FromArgb(220, 255, 0, 255); break;
+                        case ActorKind.Ped: col = System.Drawing.Color.FromArgb(220, 255, 140, 0); break;
+                        case ActorKind.Obstacle: col = System.Drawing.Color.FromArgb(220, 255, 0, 0); break;
+                        default: col = System.Drawing.Color.FromArgb(200, 255, 255, 0); break;
+                    }
+                    float dt = 1.5f;
+                    try
+                    {
+                        // Time for ego to reach the actor's station, clamped.
+                        float tReach = a.RouteValid
+                            ? a.RouteDist / Math.Max(egoSpeed, 6f)
+                            : a.Dist / Math.Max(egoSpeed, 6f);
+                        dt = RaceMath.Clamp(tReach, 0.5f, 2.5f);
+                    }
+                    catch { }
+                    Vector3 pred;
+                    try { pred = perception.Predict(a, dt); }
+                    catch { pred = a.Position; }
+                    World.DrawLine(
+                        new Vector3(a.Position.X, a.Position.Y, a.Position.Z + 1f),
+                        new Vector3(pred.X, pred.Y, pred.Z + 1f), col);
+                    try
+                    {
+                        World.DrawMarker(MarkerType.Sphere, pred + new Vector3(0f, 0f, 0.8f),
+                            new Vector3(), new Vector3(), new Vector3(1.2f, 1.2f, 1.2f),
+                            col, false, false, false, "", "", false);
+                    }
+                    catch { }
+                    drawn++;
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawAimAndBraking(RaceRoute route, TrajectoryPlanner traj, SpeedPlanner speedPlan)
+        {
+            try
+            {
+                if (traj != null && traj.HasChosen && traj.Chosen.AimPoint != Vector3.Zero)
+                {
+                    try
+                    {
+                        World.DrawMarker(MarkerType.Sphere, traj.Chosen.AimPoint + new Vector3(0f, 0f, 1f),
+                            new Vector3(), new Vector3(), new Vector3(1.6f, 1.6f, 1.6f),
+                            System.Drawing.Color.FromArgb(230, 0, 255, 255), false, false, false, "", "", false);
+                    }
+                    catch { }
+                }
+                if (route != null && route.Built && speedPlan != null && speedPlan.BrakingPointS >= 0f)
+                {
+                    try
+                    {
+                        Vector3 bp = route.PointAtS(route.AlongS + speedPlan.BrakingPointS);
+                        World.DrawMarker(MarkerType.Cylinder, bp + new Vector3(0f, 0f, 1f),
+                            new Vector3(), new Vector3(), new Vector3(3f, 3f, 6f),
+                            System.Drawing.Color.FromArgb(200, 255, 0, 0), false, false, false, "", "", false);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+    }
+}

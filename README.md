@@ -49,33 +49,38 @@ Then in game press **Insert** to reload scripts (or restart the game).
 | RefreshIntervalMs / StuckTimeoutMs | 2000 / 4000 | actuator refresh + stuck repath |
 | RaceTimeoutMs / CooldownMs | 600000 / 8000 | give-up timer, rest between races |
 | CancelKey | G | cancel active race |
+| DebugViz | 0 | 1 = in-game overlay: route/corridor/candidates/predictions/braking |
+| Actuator | GtaDriver | GtaDriver (experiment) or Direct (steering/throttle/brake) |
 
-## Architecture (v2)
+## Architecture (v2 — trajectory foundations)
 
 ```
 race route -> drivable corridor -> perception/prediction -> tactics
     -> candidate trajectories -> speed profile -> actuator -> DriveV
 ```
 
-- **Route (`Route/RaceRoute.cs`):** dense centerline polyline with continuous progress (`AlongS`), lookahead points, curvature ahead, and loss detection (`AwayFromRoute / WrongDirection / WentBackwards / Circling / NoProgress`). Nearest search prefers same-direction segments so carriageway splits don't snap across; recovery aims at a near route point, never the 2 km finish.
-- **Corridor (`Road/RoadCorridor.cs`):** usable road width + boundaries via `GET_ROAD_BOUNDARY_USING_HEADING`, falling back to an `IS_POINT_ON_ROAD` lateral sweep, then a conservative default. `OffCorridor = max(0, |lateral| - halfWidth)` replaces the retired `offroad_m`, which measured distance to a *future* street node and was invalid as a departure signal.
-- **Perception (`Sense/Perception.cs`):** 10 Hz surround scan with range from stopping distance + margin (80–170 m, not a fixed 40 m cone). Every vehicle / rival / ped / prop-obstacle gets relative velocity, closing speed and TTC; constant-velocity prediction feeds trajectory scoring.
-- **Capability (`Planning/VehicleCapability.cs`):** braking / lateral-g / top-speed estimates seeded from handling data (`BrakeForce`, `TractionCurveMax`) and adapted from plausible tyre samples only — impacts/teleports never train it. No hardcoded vehicle classes.
-- **Trajectories (`Planning/TrajectoryPlanner.cs`):** 5 lateral candidates across the full usable width, scored by clearance to predicted actors, lane-change cost, corner-inside bias and tactical bias. Best wins; rejected alternatives are logged.
-- **Speed (`Planning/SpeedPlanner.cs`):** `min(cruise, curvature limit, obstacle limit, tactical limit)` from measured grip/brakes, with braking-distance feasibility at 40/80/120 m and TTC guards.
-- **Tactics (`Tactics/RaceTactics.cs`):** `Cruise / Follow / AttackSetup / OvertakeLeft / OvertakeRight / Commit / Abort / SideBySide / Defend / CornerPrep / Recovery / Crashed` with explicit commit/abort gates (predicted-clear lane + TTC, gap collapse or corner aborts). Overtakes may cross lanes; traffic/ped awareness is preserved (they score as blocks, the style flag just doesn't queue).
-- **Actuator (`Control/`):** `IVehicleActuator` seam. `GtaDriverActuator` uses the stock driver as a receding-horizon servo to the planned aim point (80–150 m), re-issuing only on plan change / stuck — no long-range `DriveTo(finish)` losses. `DirectActuatorStub` documents the future steering/throttle/brake swap.
-- **Skill (`Core/DriverProfile.cs`):** lookahead time, reaction interval, safety margin/time, grip factor, risk tolerance, corner caution. No random steering noise.
-- **Impacts (`Sense/ImpactClassifier.cs`):** `dec < -12` impossible for tyres; those samples are `Impact`/`Teleport` (position jump, health drop, collision flag), never `HARD_BRAKE`.
+- **Route (`Route/RaceRoute.cs`):** real connected GPS route first (`GET_GPS_BLIP_ROUTE_FOUND` / `GET_POS_ALONG_GPS_TYPE_ROUTE`, validated geometrically across route types 1/0/2, distance- then index-interpretation, resampled ~18 m), with connected street-walk fallback and straight last resort. `Source` (`GpsDist/GpsIdx/FallbackWalk/StraightFallback`) is logged; a `TryUpgradeToGps` pass adopts GPS within ~12 s if the blip route wasn't ready at Start. Progress/loss/recovery as before (same-direction bias, near-point recovery, never the 2 km finish).
+- **Corridor (`Road/RoadCorridor.cs`):** FIXED `GET_ROAD_BOUNDARY_USING_HEADING` (one output, not two — probes left/right via ±90° with width/midpoint validation + on-road cross-check). Sampled profile along the horizon (slices every 10 m to lookahead+60 m, `HalfWidthAt/MinHalfWidthAhead/SliceAt`), not one `HalfWidth`. Sweep fallback, then conservative default.
+- **Perception (`Sense/Perception.cs`):** route-frame actors (`RouteS/RouteLateral/SpeedAlong/ClosingAlong/RouteTtc`) alongside ego-frame; all planning uses the route frame. FIXED `ClosestTtcIndex` (resolved after sort, was invalid). `TryGetLeadOnRoute` for speed following.
+- **Capability (`Planning/VehicleCapability.cs`):** spin/yaw rejection via slip + yaw gates; confidence 0..1 (rises stable, collapses on slide/spin); only stable physical samples adapt brake/lat/top. Impacts/teleports never train it.
+- **Trajectories (`Planning/TrajectoryPlanner.cs`):** 7 smooth sampled paths (smoothstep start→target lateral, stations every 10 m) through corridor slices. Swept scoring: per-station boundaries, path curvature (`MaxKappa`, lateral-g demand), predicted-actor distance to the polyline over transit time, tactical/inside bias. Blocked best yields to first viable unless committed.
+- **Speed (`Planning/SpeedPlanner.cs`):** curvature profile every 10 m to lookahead+80 m with backwards braking pass (`v[i]=min(vAllow[i],sqrt(v[i+1]²+2·a·ds))`), so future corners constrain now. FIXED `CornerCaution` (divide: >1 slower; numbers unchanged). Obstacle speeds from projected `SpeedAlong`, not `Speed*0.7`. `BrakingPointS` + full profile exposed for viz.
+- **Tactics (`Tactics/RaceTactics.cs`):** same modes/gates, now route-aware (`SideClear/Blocked/Clearance` use route lateral/dist; narrow-road uses profile min width).
+- **Actuator (`Control/`):** `IVehicleActuator` seam, planner unchanged. `GtaDriverActuator` = EXPERIMENT (short-horizon servo, rate-limited re-issue; hands point/speed to GTA pathfinding, does not guarantee trajectory). `DirectActuator` = real pure-pursuit + PI longitudinal (`SteeringAngle/Throttle/BrakePower`), selectable via `Actuator=Direct`. Both report `PathFollowingError` (desired vs actual) every plan tick — the decisive measurement.
+- **Viz (`Debug/RaceDebugViz.cs`):** route/corridor/candidates/chosen/predictions/aim/braking markers (`DebugViz=1`).
+- **Skill (`Core/DriverProfile.cs`):** unchanged numbers (no tuning this pass).
+- **Impacts (`Sense/ImpactClassifier.cs`):** unchanged.
 
 ## AI diagnostics (telemetry)
 
 Each race writes `scripts\StreetRacing_race_<id>.csv` (10 Hz) plus `_events.csv`.
 Disable with `TelemetryEnabled=0`. Send both files after test races to tune further.
 
-Samples: `t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,cmdStyle,routeLost,impact,reissue,finishGap`
+Samples: `t_ms,...,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa` (first 31 cols unchanged)
 
-Events: `START / ROUTE / TACTIC / ROUTE_LOST / ROUTE_FOUND / IMPACT / TELEPORT / HARD_BRAKE / CTRL`
+Events: `START / ROUTE / GPS_ROUTE / ACTUATOR / TACTIC / ROUTE_LOST / ROUTE_FOUND / IMPACT / TELEPORT / HARD_BRAKE / CTRL / PATH_ERR`
+
+Decisive test: run 2–3 races with `DebugViz=1`, then read `distToPath/speedErr` + `PATH_ERR` events. If GTA's servo holds <4 m / <4 m/s on twisty roads, it follows; if it repeatedly cuts/swings/caps (expectation: it will not hold precise trajectories under DriveV), set `Actuator=Direct` and re-test — planner output is identical, only the servo changes.
 
 Retired: `offroad_m` (invalid street-node distance), 40 m frontal-only sensing, `dec`-only brake detection, alignment-only wrong-way detection, long-range `DriveTo(finish)`.
 

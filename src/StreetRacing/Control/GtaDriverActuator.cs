@@ -5,11 +5,21 @@ using GTA.Native;
 
 namespace StreetRacing.Control
 {
-    /// Stock GTA driver used as a trajectory/speed servo: we command a
-    /// SHORT-horizon aim point on the planned trajectory (80–150 m), not the
-    /// 2 km finish. That keeps the game pathfinder on the correct carriageway
-    /// and makes unreachable-finish losses structurally impossible — the
-    /// failure mode that killed the old long-range DriveTo.
+    /// EXPERIMENT — stock GTA driver used as a trajectory/speed servo.
+    ///
+    /// We command a SHORT-horizon aim point on the planned trajectory
+    /// (80–150 m), not the 2 km finish. That keeps the game pathfinder on the
+    /// correct carriageway and makes unreachable-finish losses structurally
+    /// impossible — the failure mode that killed the old long-range DriveTo.
+    ///
+    /// DECISIVE LIMITATION: this still hands (point, speed) to GTA's own
+    /// pathfinding, which replans its own lane-level path with its own
+    /// curvature/speed model under DriveV. It therefore DOES NOT guarantee
+    /// execution of our trajectory: our corridor/path/speed work is advisory,
+    /// and the game may cut, swing wide, or cap speed wherever its AI wants.
+    /// Treat every race with this actuator as a measurement of that gap —
+    /// see PathFollowingError (desired path vs actual pose/speed), logged to
+    /// telemetry. If the error stays large, switch to DirectActuator.
     ///
     /// Re-issues are rate-limited (aim moved / speed changed / mode changed /
     /// stuck): per-tick we only refresh cruise + style, which does not stutter.
@@ -25,6 +35,8 @@ namespace StreetRacing.Control
         public bool HasPlan { get; private set; }
         public int ReissueCount { get; private set; }
         public string LastReason { get; private set; } = "";
+        public string ActuatorName => "GtaDriver(experiment)";
+        public PathFollowingError LastError { get; private set; } = new PathFollowingError();
         public bool LastTickReissued { get; private set; }
 
         private int lastRefreshTime;
@@ -126,6 +138,59 @@ namespace StreetRacing.Control
             return false;
         }
 
+        public void UpdatePathError(Vector3 egoPos, float egoHeadingDeg, float egoSpeed,
+            RaceRoute route, TrajectoryCandidate chosen, bool hasChosen, float targetSpeed)
+        {
+            var e = new PathFollowingError { Valid = false };
+            try
+            {
+                if (route == null || !route.Built) { LastError = e; return; }
+                float desiredLat = 0f;
+                float desiredHeading = route.HeadingAtS(route.AlongS + 8f);
+                float distToPath = 999f;
+                if (hasChosen && chosen.Path != null && chosen.Path.Count >= 2)
+                {
+                    desiredLat = chosen.LateralM * 0.15f; // approx near-field desire
+                    // Desired heading from the first path segment (what we asked).
+                    var p0 = chosen.Path[0];
+                    var p1 = chosen.Path[Math.Min(2, chosen.Path.Count - 1)];
+                    var d = new Vector3(p1.X - p0.X, p1.Y - p0.Y, 0f);
+                    if (RaceMath.FlatLength(d) > 0.5f)
+                        desiredHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d));
+                    // Min distance to the polyline (true tracking error).
+                    float best = float.MaxValue;
+                    for (int i = 0; i < chosen.Path.Count - 1; i++)
+                    {
+                        var pr = RaceMath.ProjectOnSegment(egoPos, chosen.Path[i], chosen.Path[i + 1]);
+                        if (pr.Dist < best) best = pr.Dist;
+                    }
+                    distToPath = best;
+                    // Near-field lateral desire: interpolate first stations.
+                    desiredLat = route.Lateral; // fallback
+                    try
+                    {
+                        // Lateral of ego relative to path start frame ≈ route lateral
+                        // minus path's initial lateral (which starts at old ego lat).
+                        desiredLat = 0f;
+                    }
+                    catch { }
+                }
+                e.Valid = true;
+                e.LateralErrM = route.Lateral - desiredLat;
+                // When a chosen path exists, lateral error vs the path polyline
+                // is better expressed as signed cross-track: use dist with sign
+                // from route lateral for now (both share the route frame).
+                e.HeadingErrDeg = RaceMath.HeadingDiffDeg(egoHeadingDeg, desiredHeading);
+                // Note: HeadingDiff(target,current) convention is (target-current);
+                // we want (actual-desired), so negate the helper's order.
+                e.HeadingErrDeg = -e.HeadingErrDeg;
+                e.SpeedErrMps = targetSpeed - egoSpeed;
+                e.DistToPathM = distToPath;
+            }
+            catch { e.Valid = false; }
+            LastError = e;
+        }
+
         public bool Valid()
         {
             return driver != null && driver.Exists() && !driver.IsDead
@@ -185,26 +250,5 @@ namespace StreetRacing.Control
             lastRefreshTime = Game.GameTime;
             ReissueCount++;
         }
-    }
-
-    /// Placeholder for a future direct steering/throttle/brake controller
-    /// (SET_VEHICLE_STEER / throttle natives under DriveV). Kept so the
-    /// planner -> actuator seam is proven swappable; not wired by default.
-    internal sealed class DirectActuatorStub : IVehicleActuator
-    {
-        public Vector3 CurrentAim { get; private set; } = Vector3.Zero;
-        public float CurrentCruise { get; private set; }
-        public int CurrentStyle { get; private set; }
-        public bool HasPlan { get; private set; }
-        public int ReissueCount => 0;
-        public void SetPlan(Vector3 aimPoint, float targetSpeed, int style, string reason)
-        {
-            CurrentAim = aimPoint;
-            CurrentCruise = targetSpeed;
-            CurrentStyle = style;
-            HasPlan = true;
-            throw new NotImplementedException("Direct actuator is a seam placeholder; use GtaDriverActuator.");
-        }
-        public void Clear() { HasPlan = false; }
     }
 }

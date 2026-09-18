@@ -29,6 +29,12 @@ namespace StreetRacing
         public float LookaheadTimeS = 0f;
         public float SafetyMarginM = 0f;
         public float GripFactor = 0f;
+        // Spatial debug overlay (route / corridor / candidates / predictions).
+        public bool DebugViz = false;
+        // Actuator: GtaDriver (experiment: point/speed to GTA pathfinding) or
+        // Direct (steering/throttle/brake, planner unchanged). Default stays
+        // GtaDriver until path-following-error tests decide otherwise.
+        public string ActuatorName = "GtaDriver";
 
         public static StreetRacingConfig Load()
         {
@@ -54,6 +60,8 @@ namespace StreetRacing
                 c.LookaheadTimeS = (float)s.GetValue("Race", "LookaheadTimeS", (double)c.LookaheadTimeS);
                 c.SafetyMarginM = (float)s.GetValue("Race", "SafetyMarginM", (double)c.SafetyMarginM);
                 c.GripFactor = (float)s.GetValue("Race", "GripFactor", (double)c.GripFactor);
+                c.DebugViz = s.GetValue("Race", "DebugViz", c.DebugViz);
+                c.ActuatorName = s.GetValue("Race", "Actuator", c.ActuatorName);
                 var keyName = s.GetValue("Race", "CancelKey", "G");
                 if (Enum.TryParse(keyName, true, out Keys k))
                 {
@@ -69,6 +77,16 @@ namespace StreetRacing
                 // Missing/corrupt ini -> run on defaults.
             }
             return c;
+        }
+
+        public bool UseDirectActuator()
+        {
+            try
+            {
+                string n = (ActuatorName ?? "").Trim().ToLowerInvariant();
+                return n == "direct" || n == "directactuator";
+            }
+            catch { return false; }
         }
 
         /// Resolves the driving style int from preset name or raw override.

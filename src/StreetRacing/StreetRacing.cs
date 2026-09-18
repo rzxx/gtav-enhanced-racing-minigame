@@ -153,7 +153,8 @@ namespace StreetRacing
             try
             {
                 brain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
-                    activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs);
+                    activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
+                    cfg.UseDirectActuator(), cfg.DebugViz);
             }
             catch (Exception ex)
             {
@@ -230,7 +231,7 @@ namespace StreetRacing
                 string msg;
                 try
                 {
-                    msg = $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  {lead} ~s~[{brain.TacticalName} {brain.TargetSpeed:F0}]";
+                    msg = $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  {lead} ~s~[{brain.TacticalName} {brain.TargetSpeed:F0} {brain.RouteSource} {brain.ActuatorName}]";
                 }
                 catch
                 {

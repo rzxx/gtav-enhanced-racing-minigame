@@ -17,6 +17,12 @@ namespace StreetRacing
     /// TTC uses closing speed along the line of sight, not raw distance —
     /// a parked car 40 m ahead at 40 m/s (TTC ~1 s) outranks a car 20 m
     /// behind moving away.
+    ///
+    /// Route-frame fields (RouteS / RouteLateral / SpeedAlong) express the
+    /// same actor in candidate-path coordinates. All planning decisions
+    /// (trajectory scoring, speed limits, tactics) must use the route frame;
+    /// ego-heading Longitudinal/Lateral/IsAhead are kept for telemetry and
+    /// as a fallback when the route is lost.
     internal struct TrackedActor
     {
         public bool Valid;
@@ -26,10 +32,19 @@ namespace StreetRacing
         public float Dist;          // flat distance from ego
         public float Longitudinal;  // + ahead along ego forward
         public float Lateral;       // + left
-        public float ClosingSpeed;  // + = approaching (m/s)
+        public float ClosingSpeed;  // + = approaching (m/s, line-of-sight)
         public float Ttc;           // s, 999 = separating / static-safe
         public float Speed;         // actor ground speed
         public bool IsAhead;
+
+        // Route frame (valid when RouteValid).
+        public bool RouteValid;
+        public float RouteS;        // absolute arclength of projection
+        public float RouteLateral;  // + = left of route direction
+        public float RouteDist;     // RouteS - egoS (m, + = ahead along route)
+        public float SpeedAlong;    // actor velocity projected on route dir
+        public float ClosingAlong;  // egoSpeedAlong - SpeedAlong (+ = catching)
+        public float RouteTtc;      // s from along-route closing
     }
 
     /// Predictive perception well beyond stopping distance.
@@ -40,6 +55,8 @@ namespace StreetRacing
     /// - Full surround (not a narrow cone); cones are applied at scoring time.
     /// - Relative velocity + TTC for every actor; predictions assume constant
     ///   velocity over the planner horizon (2–3 s).
+    /// - Every actor is additionally projected into route coordinates so
+    ///   collision reasoning follows the road, not just the current nose.
     internal sealed class Perception
     {
         public readonly List<TrackedActor> Actors = new List<TrackedActor>();
@@ -55,6 +72,13 @@ namespace StreetRacing
 
         public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
             float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs = 100)
+        {
+            Update(ego, rivalVehicle, rivalPed, egoSpeed, brakeCap, reactionTimeS, nowMs, minIntervalMs, null, null);
+        }
+
+        public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
+            float brakeCap, float reactionTimeS, int nowMs, int minIntervalMs,
+            RaceRoute route, RoadCorridor corridor)
         {
             if (nowMs - LastScanMs < minIntervalMs) return;
             LastScanMs = nowMs;
@@ -84,6 +108,19 @@ namespace StreetRacing
             RangeM = RaceMath.Clamp(stop + 60f, 80f, 170f);
 
             var left = new Vector3(-fwd.Y, fwd.X, 0f);
+            float egoS = (route != null && route.Built) ? route.AlongS : 0f;
+            // Ego speed along the route (discounts sliding / wrong-way).
+            float egoAlong = egoSpeed;
+            try
+            {
+                if (route != null && route.Built)
+                {
+                    float he = Math.Abs(route.HeadingErrorDeg) * (float)Math.PI / 180f;
+                    egoAlong = egoSpeed * (float)Math.Cos(Math.Min(he, 1.2f));
+                    if (egoAlong < 0f) egoAlong = 0f;
+                }
+            }
+            catch { }
 
             try
             {
@@ -91,7 +128,7 @@ namespace StreetRacing
                 {
                     if (v == null || !v.Exists() || v == ego) continue;
                     AddVehicle(v.Position, SafeVelocity(v), ActorKind.TrafficVehicle,
-                        egoPos, egoVel, fwd, left);
+                        egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
                 }
             }
             catch { }
@@ -109,7 +146,7 @@ namespace StreetRacing
                         if (RaceMath.FlatDistance(a.Position, rv.Position) < 2f) { already = true; break; }
                     }
                     if (!already && RaceMath.FlatDistance(egoPos, rv.Position) < RangeM + 30f)
-                        AddVehicle(rv.Position, SafeVelocity(rv), ActorKind.Rival, egoPos, egoVel, fwd, left);
+                        AddVehicle(rv.Position, SafeVelocity(rv), ActorKind.Rival, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
                     else if (already)
                         MarkRival(rv.Position);
                 }
@@ -120,7 +157,7 @@ namespace StreetRacing
                     {
                         Vector3 rvv = new Vector3();
                         try { rvv = rivalPed.Velocity; } catch { }
-                        AddVehicle(rp, rvv, ActorKind.Rival, egoPos, egoVel, fwd, left);
+                        AddVehicle(rp, rvv, ActorKind.Rival, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
                     }
                 }
             }
@@ -135,7 +172,7 @@ namespace StreetRacing
                     if (p == null || !p.Exists()) continue;
                     Vector3 pv = new Vector3();
                     try { pv = p.Velocity; } catch { }
-                    AddVehicle(p.Position, pv, ActorKind.Ped, egoPos, egoVel, fwd, left);
+                    AddVehicle(p.Position, pv, ActorKind.Ped, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
                 }
             }
             catch { }
@@ -155,14 +192,14 @@ namespace StreetRacing
                     try { pp = pr.Position; } catch { continue; }
                     float pd = RaceMath.FlatDistance(egoPos, pp);
                     if (pd < 4f) continue; // ignore what we're already touching
-                    AddVehicle(pp, new Vector3(), ActorKind.Obstacle, egoPos, egoVel, fwd, left);
+                    AddVehicle(pp, new Vector3(), ActorKind.Obstacle, egoPos, egoVel, fwd, left, route, corridor, egoS, egoAlong);
                     added++;
                 }
             }
             catch { }
 
-            // Summaries for planner + telemetry.
-            float bestTtc = 999f;
+            // Summaries for planner + telemetry (computed BEFORE sort; the
+            // threat index is resolved AFTER sort so it stays valid).
             for (int i = 0; i < Actors.Count; i++)
             {
                 var a = Actors[i];
@@ -179,17 +216,26 @@ namespace StreetRacing
                         }
                     }
                 }
-                if (a.Ttc < bestTtc && a.ClosingSpeed > 0.5f)
-                {
-                    bestTtc = a.Ttc;
-                    ClosestTtcIndex = i;
-                }
             }
 
             // Keep the list bounded + sorted by threat for telemetry stability.
             Actors.Sort((x, y) => x.Ttc.CompareTo(y.Ttc));
             if (Actors.Count > 24)
                 Actors.RemoveRange(24, Actors.Count - 24);
+
+            // Resolve the closest-TTC index AFTER sorting (the old code set it
+            // before Sort, so it pointed at a different actor afterwards).
+            float bestTtc = 999f;
+            ClosestTtcIndex = -1;
+            for (int i = 0; i < Actors.Count; i++)
+            {
+                var a = Actors[i];
+                if (a.ClosingSpeed > 0.5f && a.Ttc < bestTtc)
+                {
+                    bestTtc = a.Ttc;
+                    ClosestTtcIndex = i;
+                }
+            }
         }
 
         public bool TryGetClosestThreat(out TrackedActor actor)
@@ -210,6 +256,25 @@ namespace StreetRacing
             return found;
         }
 
+        /// Nearest actor ahead ON THE ROUTE (not just in the nose cone).
+        /// Used by the speed planner's stopping logic.
+        public bool TryGetLeadOnRoute(out TrackedActor actor, float egoS, RoadCorridor corridor, float maxDistM)
+        {
+            actor = new TrackedActor();
+            float bd = float.MaxValue;
+            bool found = false;
+            foreach (var a in Actors)
+            {
+                if (!a.RouteValid) continue;
+                if (a.RouteDist < -2f || a.RouteDist > maxDistM) continue;
+                float half = corridor != null ? corridor.HalfWidthAt(Math.Max(0f, a.RouteDist)) : 7f;
+                float latTol = half + (a.Kind == ActorKind.Ped ? 1.5f : 2f);
+                if (Math.Abs(a.RouteLateral) > latTol) continue;
+                if (a.RouteDist < bd) { bd = a.RouteDist; actor = a; found = true; }
+            }
+            return found;
+        }
+
         /// Constant-velocity prediction used by trajectory scoring.
         public Vector3 Predict(TrackedActor a, float dt)
         {
@@ -220,7 +285,8 @@ namespace StreetRacing
         }
 
         private void AddVehicle(Vector3 pos, Vector3 vel, ActorKind kind,
-            Vector3 egoPos, Vector3 egoVel, Vector3 fwd, Vector3 left)
+            Vector3 egoPos, Vector3 egoVel, Vector3 fwd, Vector3 left,
+            RaceRoute route, RoadCorridor corridor, float egoS, float egoAlong)
         {
             var to = new Vector3(pos.X - egoPos.X, pos.Y - egoPos.Y, 0f);
             float dist = RaceMath.FlatLength(to);
@@ -236,7 +302,7 @@ namespace StreetRacing
                 if (closing > 0.5f) ttc = dist / closing;
             }
             float spd = RaceMath.FlatLength(vel);
-            Actors.Add(new TrackedActor
+            var a = new TrackedActor
             {
                 Valid = true,
                 Kind = kind,
@@ -249,7 +315,32 @@ namespace StreetRacing
                 Ttc = ttc,
                 Speed = spd,
                 IsAhead = lon > 0f && Math.Abs(RaceMath.SignedAngleDeg(fwd, to)) < 65f,
-            });
+                RouteValid = false,
+                RouteS = 0f,
+                RouteLateral = 999f,
+                RouteDist = 999f,
+                SpeedAlong = 0f,
+                ClosingAlong = 0f,
+                RouteTtc = 999f,
+            };
+            // Route-frame projection (road-following, not nose-following).
+            try
+            {
+                if (route != null && route.Built)
+                {
+                    var pr = route.ProjectOntoRoute(pos);
+                    a.RouteValid = true;
+                    a.RouteS = pr.S;
+                    a.RouteLateral = pr.Lateral;
+                    a.RouteDist = pr.S - egoS;
+                    a.SpeedAlong = RaceMath.FlatDot(new Vector3(vel.X, vel.Y, 0f), pr.Dir);
+                    a.ClosingAlong = egoAlong - a.SpeedAlong;
+                    if (a.ClosingAlong > 0.5f && a.RouteDist > -2f)
+                        a.RouteTtc = a.RouteDist / a.ClosingAlong;
+                }
+            }
+            catch { a.RouteValid = false; }
+            Actors.Add(a);
         }
 
         private void MarkRival(Vector3 rivalPos)

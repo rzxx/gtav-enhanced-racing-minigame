@@ -2,17 +2,25 @@ using System;
 using GTA;
 using GTA.Math;
 using StreetRacing.Control;
+using StreetRacing.Debug;
 using StreetRacing.Tactics;
 
 namespace StreetRacing.Race
 {
-    /// Orchestrator for the new street-racing AI:
+    /// Orchestrator for the street-racing AI:
     ///   route -> corridor -> perception/prediction -> tactics ->
-    ///   trajectories -> speed profile -> actuator (stock DriveTo servo).
+    ///   trajectories -> speed profile -> actuator (+ path-error + debug viz).
+    ///
+    /// Actuator note: the default GtaDriverActuator is an EXPERIMENT — it
+    /// hands (point, speed) to GTA pathfinding and does not guarantee our
+    /// trajectory. PathFollowingError (desired vs actual) is instrumented
+    /// every plan tick to decide whether DirectActuator must take over.
     ///
     /// Tick cadence (script runs at ~20 Hz / 50 ms):
     ///   every tick : ego kinematics + impact classification + capability
-    ///   10 Hz      : perception, route, tactics, trajectory, speed, telemetry
+    ///                + debug viz (markers persist one frame)
+    ///   10 Hz      : perception, route, tactics, trajectory, speed,
+    ///                actuator servo, path-error, telemetry
     ///   5 Hz       : corridor width probes (native-heavy)
     internal sealed class RaceBrain
     {
@@ -32,7 +40,8 @@ namespace StreetRacing.Race
         private readonly TrajectoryPlanner traj = new TrajectoryPlanner();
         private readonly SpeedPlanner speedPlan = new SpeedPlanner();
         private readonly RaceTactics tactics = new RaceTactics();
-        private readonly GtaDriverActuator actuator = new GtaDriverActuator();
+        private readonly RaceDebugViz viz = new RaceDebugViz();
+        private IVehicleActuator actuator;
 
         private int refreshMs = 2000;
         private int stuckMs = 4000;
@@ -40,6 +49,7 @@ namespace StreetRacing.Race
         // Ego kinematics history for accel / impact classification.
         private float lastSpeed;
         private Vector3 lastPos = Vector3.Zero;
+        private Vector3 lastVel = Vector3.Zero;
         private float lastHeading;
         private int lastKinT;
         private float lastHealth = -1f;
@@ -48,12 +58,15 @@ namespace StreetRacing.Race
         private int lastImpactEventMs = -100000;
         private float lastAccelLong;
         private float lastLatAccel;
+        private float lastYawRate;
+        private float lastSlipDeg;
 
         // Scheduling.
         private int lastPercMs;
         private int lastCorrMs;
         private int lastPlanMs;
         private int lastTeleMs;
+        private int lastGpsRetryMs;
 
         // Plan snapshot for telemetry / HUD.
         public string TacticalName => tactics.Mode.ToString();
@@ -66,15 +79,27 @@ namespace StreetRacing.Race
         public float LookaheadM { get; private set; } = 80f;
         public TrajectoryCandidate Chosen => traj.HasChosen ? traj.Chosen : new TrajectoryCandidate();
         public bool Running { get; private set; }
+        public string RouteSource => route.Source;
+        public string ActuatorName => actuator != null ? actuator.ActuatorName : "?";
 
         private TacticalMode lastLoggedTactic = (TacticalMode)(-1);
         private bool lastLoggedLost;
         private string lastLoggedLossReason = "";
         private int lastBrakeEventMs = -100000;
+        private float lastPathErrLat;
+        private float lastPathErrHead;
+        private int lastPathErrLogMs;
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
             int refreshMs, int stuckMs)
+        {
+            Start(driver, vehicle, finish, cruise, style, profile, telemetry, refreshMs, stuckMs, false, false);
+        }
+
+        public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
+            int style, DriverProfile profile, RaceTelemetry telemetry,
+            int refreshMs, int stuckMs, bool useDirect, bool debugViz)
         {
             this.driver = driver;
             this.vehicle = vehicle;
@@ -91,10 +116,13 @@ namespace StreetRacing.Race
             try { origin = vehicle.Position; } catch { origin = Game.Player.Character.Position; }
             route.Build(origin, finish);
             capability.Seed(vehicle);
-            corridor.Update(route, origin, t0);
+            LookaheadM = this.profile.LookaheadForSpeed(0f);
+            corridor.Update(route, origin, LookaheadM, t0);
             route.Update(origin, SafeHeading(vehicle), 0f, t0, corridor.HalfWidth);
 
+            actuator = useDirect ? (IVehicleActuator)new DirectActuator() : (IVehicleActuator)new GtaDriverActuator();
             actuator.Attach(driver, vehicle, cruise, style, refreshMs, stuckMs);
+            viz.Enabled = debugViz;
             tactics.SinceMs = t0;
 
             hasKin = false;
@@ -103,7 +131,8 @@ namespace StreetRacing.Race
 
             try
             {
-                telemetry?.Event(0, "ROUTE", $"pts={route.Points.Count};len={route.TotalLength:F0};prof={this.profile.Name};risk={this.profile.RiskTolerance:F2}");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};prof={this.profile.Name};risk={this.profile.RiskTolerance:F2}");
+                telemetry?.Event(0, "ACTUATOR", $"{actuator.ActuatorName};note={(useDirect ? "direct steering/throttle/brake" : "EXPERIMENT: hands point/speed to GTA pathfinding, does not guarantee trajectory; see pathErr columns")}");
             }
             catch { }
         }
@@ -112,7 +141,7 @@ namespace StreetRacing.Race
         {
             try
             {
-                return Running && actuator.Valid();
+                return Running && actuator != null && actuator.Valid();
             }
             catch { return false; }
         }
@@ -120,7 +149,7 @@ namespace StreetRacing.Race
         public void Stop()
         {
             Running = false;
-            try { actuator.Stop(); } catch { }
+            try { actuator?.Stop(); } catch { }
         }
 
         public void OnTick()
@@ -148,20 +177,21 @@ namespace StreetRacing.Race
             FinishGap = RaceMath.FlatDistance(egoPos, finish);
 
             // --- Every-tick kinematics + impact classification (cheap).
-            UpdateKinematics(now, egoPos, egoSpeed, egoHeading);
+            UpdateKinematics(now, egoPos, egoVel, egoSpeed, egoHeading);
 
             if (!hasKin)
             {
                 hasKin = true;
                 lastSpeed = egoSpeed;
                 lastPos = egoPos;
+                lastVel = egoVel;
                 lastHeading = egoHeading;
                 lastKinT = now;
                 try { lastHealth = vehicle.HealthFloat; } catch { lastHealth = -1f; }
                 return; // need one more sample for accel
             }
 
-            // --- 10 Hz: perception.
+            // --- 10 Hz: perception (route-aware).
             if (now - lastPercMs >= profile.ReactionIntervalMs)
             {
                 lastPercMs = now;
@@ -172,7 +202,8 @@ namespace StreetRacing.Race
                 try
                 {
                     perception.Update(vehicle, playerVeh, playerPed, egoSpeed,
-                        capability.UsableBrake(profile.GripFactor), reactionS, now, profile.ReactionIntervalMs);
+                        capability.UsableBrake(profile.GripFactor), reactionS, now, profile.ReactionIntervalMs,
+                        route, corridor);
                 }
                 catch { }
             }
@@ -184,13 +215,29 @@ namespace StreetRacing.Race
                 lastPlanMs = now;
                 try { route.Update(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth); }
                 catch { }
+
+                // GPS upgrade: the blip route can take a second to compute after
+                // Start; adopt the real connected route as soon as it exists.
+                try
+                {
+                    if (!route.Source.StartsWith("Gps") && now - t0 < 12000 && now - lastGpsRetryMs > 1000)
+                    {
+                        lastGpsRetryMs = now;
+                        if (route.TryUpgradeToGps(egoPos))
+                        {
+                            try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
+                            try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;pts={route.Points.Count};len={route.TotalLength:F0}"); } catch { }
+                        }
+                    }
+                }
+                catch { }
             }
 
             // --- 5 Hz: corridor probes (native-heavy: boundary + sweeps).
             if (now - lastCorrMs >= 200)
             {
                 lastCorrMs = now;
-                try { corridor.Update(route, egoPos, now); } catch { }
+                try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
             if (doPlan)
@@ -225,8 +272,9 @@ namespace StreetRacing.Race
 
                 LookaheadM = profile.LookaheadForSpeed(egoSpeed);
 
-                // Curve limit preview for tactic gating (uses current capability).
-                float aLatPreview = capability.UsableLat(profile.GripFactor);
+                // Curve limit preview for tactic gating (uses current capability
+                // with FIXED corner-caution semantics: divide, not multiply).
+                float aLatPreview = capability.UsableLat(profile.GripFactor) / (profile.CornerCaution * profile.CornerCaution);
                 float k80 = route.CurvatureAhead(80f);
                 float curvePreview = k80 > 1e-5f ? (float)Math.Sqrt(aLatPreview / k80) : cruiseSetting;
 
@@ -256,6 +304,9 @@ namespace StreetRacing.Race
                             CurveCost = 0f,
                             TacticalBias = 0f,
                             RejectReason = route.LossReason,
+                            Path = new System.Collections.Generic.List<Vector3> { egoPos, rec },
+                            MinMarginM = 99f,
+                            MaxKappa = 0f,
                         };
                         traj.LastCandidates.Clear();
                         traj.LastCandidates.Add(chosen);
@@ -268,6 +319,10 @@ namespace StreetRacing.Race
                         speedPlan.ObstacleLimit = target;
                         speedPlan.RequiredDecel = 0f;
                         speedPlan.BrakingNeed = 0f;
+                        speedPlan.ProfileS.Clear();
+                        speedPlan.ProfileAllowed.Clear();
+                        speedPlan.ProfileTarget.Clear();
+                        speedPlan.BrakingPointS = -1f;
                         recoveredTarget = true;
                     }
                     else
@@ -282,6 +337,27 @@ namespace StreetRacing.Race
                 TargetSpeed = target;
                 SpeedLimit = speedPlan.Limiting ?? "Cruise";
 
+                // --- Path-following error: the experiment readout.
+                try
+                {
+                    actuator?.UpdatePathError(egoPos, egoHeading, egoSpeed, route,
+                        traj.HasChosen ? traj.Chosen : new TrajectoryCandidate(),
+                        traj.HasChosen, target);
+                    var pe = actuator.LastError;
+                    if (pe.Valid)
+                    {
+                        lastPathErrLat = pe.LateralErrM;
+                        lastPathErrHead = pe.HeadingErrDeg;
+                        // Sparse log when the servo visibly ignores the plan.
+                        if ((Math.Abs(pe.DistToPathM) > 9f || Math.Abs(pe.SpeedErrMps) > 9f) && now - lastPathErrLogMs > 4000)
+                        {
+                            lastPathErrLogMs = now;
+                            try { telemetry?.Event(t, "PATH_ERR", $"distPath={pe.DistToPathM:F0};headErr={pe.HeadingErrDeg:F0};vErr={pe.SpeedErrMps:F0};act={actuator.ActuatorName}"); } catch { }
+                        }
+                    }
+                }
+                catch { }
+
                 // --- Actuator: short-horizon servo, not long-range DriveTo.
                 bool forceReissue = tactics.ChangedThisTick || recoveredTarget;
                 if (lastLoggedTactic != tactics.Mode) forceReissue = true;
@@ -295,7 +371,7 @@ namespace StreetRacing.Race
                     aim = ClampAimToCorridor(aim, route);
                     actuator.SetPlan(aim, Math.Max(0f, target), style, tactics.Mode.ToString());
                     bool reissued = actuator.OnTick(forceReissue, tactics.Mode.ToString());
-                    if (reissued)
+                    if (reissued && actuator is GtaDriverActuator gta && gta.LastTickReissued)
                     {
                         try
                         {
@@ -309,6 +385,14 @@ namespace StreetRacing.Race
                 EmitTransitionEvents(t, now);
             }
 
+            // --- Spatial debug overlay every tick (markers live one frame).
+            try
+            {
+                if (viz.Enabled)
+                    viz.Draw(route, corridor, traj, perception, speedPlan, egoPos, egoSpeed, LookaheadM, TargetSpeed);
+            }
+            catch { }
+
             // --- 10 Hz telemetry samples.
             if (now - lastTeleMs >= 100)
             {
@@ -318,11 +402,12 @@ namespace StreetRacing.Race
 
             lastSpeed = egoSpeed;
             lastPos = egoPos;
+            lastVel = egoVel;
             lastHeading = egoHeading;
             lastKinT = now;
         }
 
-        private void UpdateKinematics(int now, Vector3 egoPos, float egoSpeed, float egoHeading)
+        private void UpdateKinematics(int now, Vector3 egoPos, Vector3 egoVel, float egoSpeed, float egoHeading)
         {
             if (!hasKin) return;
             float dtS = (now - lastKinT) / 1000f;
@@ -335,7 +420,24 @@ namespace StreetRacing.Race
             lastAccelLong = accel;
             float dhDeg = RaceMath.HeadingDiffDeg(egoHeading, lastHeading);
             float yawRate = dhDeg * (float)Math.PI / 180f / dtS;
+            lastYawRate = yawRate;
             lastLatAccel = egoSpeed * yawRate;
+            // Slip: nose vs velocity direction. Large slip = slide/spin, not grip.
+            float slip = 0f;
+            try
+            {
+                float vFlat = RaceMath.FlatLength(new Vector3(egoVel.X, egoVel.Y, 0f));
+                if (vFlat > 2f && egoSpeed > 2f)
+                {
+                    var velDir = RaceMath.FlatNormalize(new Vector3(egoVel.X, egoVel.Y, 0f));
+                    Vector3 fwd;
+                    try { fwd = RaceMath.FlatNormalize(new Vector3(vehicle.ForwardVector.X, vehicle.ForwardVector.Y, 0f)); }
+                    catch { fwd = RaceMath.VectorFromHeading(egoHeading); }
+                    slip = RaceMath.SignedAngleDeg(fwd, velDir);
+                }
+            }
+            catch { }
+            lastSlipDeg = slip;
 
             float displacement = RaceMath.FlatDistance(egoPos, lastPos);
             float expected = (Math.Abs(egoSpeed) + Math.Abs(lastSpeed)) * 0.5f * dtS;
@@ -358,7 +460,7 @@ namespace StreetRacing.Race
                 try
                 {
                     if (kind == SampleKind.Impact)
-                        telemetry?.Event(now - t0, "IMPACT", $"dec={accel:F0};spd={egoSpeed:F0};dmg={healthDrop:F0};offCorr={corridor.OffCorridor(route.Lateral):F0}");
+                        telemetry?.Event(now - t0, "IMPACT", $"dec={accel:F0};spd={egoSpeed:F0};dmg={healthDrop:F0};offCorr={corridor.OffCorridor(route.Lateral):F0};slip={slip:F0};yaw={yawRate:F2}");
                     else
                         telemetry?.Event(now - t0, "TELEPORT", $"moved={displacement:F0};exp={expected:F0};spd={egoSpeed:F0}");
                 }
@@ -371,10 +473,11 @@ namespace StreetRacing.Race
                 try { telemetry?.Event(now - t0, "HARD_BRAKE", $"spd={egoSpeed:F0};dec={accel:F0}"); } catch { }
             }
 
-            // Capability learns only from plausible tyre samples.
+            // Capability learns only from plausible tyre samples; spin/yaw
+            // rejection happens inside Observe via slip + yaw gates.
             if (kind == SampleKind.Normal || kind == SampleKind.Braking)
             {
-                try { capability.Observe(accel, lastLatAccel, egoSpeed, dtS); } catch { }
+                try { capability.Observe(accel, lastLatAccel, egoSpeed, dtS, yawRate, slip); } catch { }
             }
             if (health >= 0f) lastHealth = health;
         }
@@ -430,6 +533,11 @@ namespace StreetRacing.Race
                     nearTtc = perception.NearestAheadTtc;
                     nearClose = perception.NearestAheadClosing;
                 }
+                float minHalf = corridor.MinHalfWidthAhead(LookaheadM);
+                var pe = actuator != null ? actuator.LastError : new PathFollowingError();
+                float minMargin = traj.HasChosen ? traj.Chosen.MinMarginM : 99f;
+                float maxKappa = traj.HasChosen ? traj.Chosen.MaxKappa : 0f;
+                string chosenReject = traj.HasChosen ? (traj.Chosen.RejectReason ?? "") : "";
                 telemetry.Sample(t, style, tactics.Mode.ToString(),
                     route.AlongS, route.Progress01, LookaheadM,
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
@@ -439,7 +547,13 @@ namespace StreetRacing.Race
                     nearD, nearTtc, nearClose,
                     actuator.CurrentCruise, actuator.CurrentStyle,
                     route.IsLost ? 1 : 0, lastImpact.ToString(),
-                    actuator.ReissueCount, FinishGap);
+                    actuator.ReissueCount, FinishGap,
+                    route.Source ?? "?", minHalf,
+                    pe.Valid ? pe.LateralErrM : 0f, pe.Valid ? pe.HeadingErrDeg : 0f,
+                    pe.Valid ? pe.SpeedErrMps : 0f, pe.Valid ? pe.DistToPathM : 999f,
+                    speedPlan.BrakingPointS, capability.Confidence,
+                    actuator.ActuatorName ?? "?", chosenReject,
+                    minMargin, maxKappa);
             }
             catch { }
         }
@@ -448,7 +562,7 @@ namespace StreetRacing.Race
         {
             try
             {
-                float half = corridor.HalfWidth;
+                float half = corridor.HalfWidthAt(LookaheadM);
                 // Express aim in the ahead-slice frame; pull back if outside.
                 Vector3 center = rt.LookaheadPoint(LookaheadM);
                 float h = rt.HeadingAhead(LookaheadM);
