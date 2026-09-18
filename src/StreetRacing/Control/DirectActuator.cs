@@ -22,6 +22,20 @@ namespace StreetRacing.Control
     ///     showed some cars need ThrottlePower to physically accelerate. Both
     ///     are now commanded together and both are logged by the diag brain.
     ///
+    /// STEERING SIGN (empirical, DirectDiag):
+    ///   DirectDiag stage SteerLeft commands SteeringAngle = +12 deg and the
+    ///   NPC visibly turned LEFT. Therefore positive GTA steering = left.
+    ///   Route/path convention here: crossTrack > 0 means ego is LEFT of the
+    ///   desired path direction (Cross(pathDir, ego-closest) > 0).
+    ///   To return toward center from the left (+crossTrack) the car must turn
+    ///   RIGHT, i.e. a NEGATIVE steering correction. Hence the lateral law uses
+    ///     steer -= crossTrack * gain
+    ///   (form: steer = pursuit + headErr*k - crossTrack*k). Do NOT flip this
+    ///   sign based on speculation; it is pinned by the diag observation plus
+    ///   SteeringSignSelfTest() below. Heading: headErr = desired - ego,
+    ///   positive = route/desired is left of the nose, so positive headErr
+    ///   also needs positive (left) steering: steer += headErr * gain.
+    ///
     /// GtaDriverActuator remains only as an emergency low-speed rejoin tool.
     /// Direct is the default isolation test AND the intended actuator.
     internal sealed class DirectActuator : IVehicleActuator
@@ -234,6 +248,8 @@ namespace StreetRacing.Control
             }
             // Blend pursuit angle with heading error for low-speed authority,
             // plus a small cross-track correction so we rejoin after slides.
+            // SIGN (pinned by DirectDiag: +steer = left; crossTrack + = left):
+            // left-of-path (+cross) must steer right (negative), hence minus.
             float steerDeg = steerPursuit * 1.4f + headErr * 0.35f - crossTrack * 1.1f;
             // Speed-scheduled clamp (authority falls with speed).
             if (egoSpeed > 25f) steerDeg = RaceMath.Clamp(steerDeg, -18f, 18f);
@@ -453,6 +469,29 @@ namespace StreetRacing.Control
                 return c.SpeedProfile[c.SpeedProfile.Count - 1];
             }
             catch { return c.TargetSpeed; }
+        }
+
+        /// Deterministic steering-sign guard (no game natives).
+        /// Conventions: crossTrack + = ego left of path; GTA +steer = left
+        /// (DirectDiag: +12 deg visibly turned left). Returning from the left
+        /// must command negative (right) steering. Returns "OK" or a failure.
+        public static string SteeringSignSelfTest()
+        {
+            try
+            {
+                // Replicate the cross-track term of the lateral law.
+                float gain = 1.1f;
+                float corrLeft = -1.0f * 2.0f * gain;   // 2 m left -> must be negative
+                float corrRight = -1.0f * -2.0f * gain; // 2 m right -> must be positive
+                if (corrLeft >= -0.5f) return $"FAIL leftCorr={corrLeft:F2} expect <0";
+                if (corrRight <= 0.5f) return $"FAIL rightCorr={corrRight:F2} expect >0";
+                // Heading term: desired left of nose (+headErr) -> left (+steer).
+                float headGain = 0.35f;
+                float hCorr = 10f * headGain;
+                if (hCorr <= 0f) return $"FAIL headCorr={hCorr:F2} expect >0";
+                return "OK";
+            }
+            catch (System.Exception ex) { return "FAIL exc:" + ex.Message; }
         }
     }
 

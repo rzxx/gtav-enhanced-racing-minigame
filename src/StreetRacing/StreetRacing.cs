@@ -410,8 +410,34 @@ namespace StreetRacing
                 // crept. If the BUILT route is sideways from the actual start
                 // pose, do not race it — reject instead of recovering from a
                 // bad setup.
+                // Milestone GPS-only gate for Simple: never start vehicle
+                // control on FallbackWalk/StraightFallback (they step/snap and
+                // teleport progress). Reject so the arming logic rerolls or
+                // the player re-tries facing open road.
                 try
                 {
+                    if (cfg.UseSimpleDriver())
+                    {
+                        string src = "";
+                        try { src = simpleBrain.RouteSource ?? "?"; } catch { }
+                        bool isGps = false;
+                        try { isGps = src.StartsWith("Gps"); } catch { }
+                        if (!isGps)
+                        {
+                            try { telemetry?.Event(0, "ARM_REJECT", $"non-gps-route src={src};never-fallback;reroll-or-reject"); } catch { }
+                            try { telemetry?.Close(); } catch { }
+                            telemetry = null;
+                            try { StopAllBrains(); } catch { }
+                            try { finishBlip?.Delete(); } catch { }
+                            try { finishCp?.Delete(); } catch { }
+                            finishBlip = null;
+                            finishCp = null;
+                            cooldownUntil = Game.GameTime + cfg.CooldownMs;
+                            state = RaceState.Cooldown;
+                            Notification.PostTicker("No GPS route here yet. Try facing open road.", false, false);
+                            return;
+                        }
+                    }
                     string sr;
                     bool ok = cfg.UseSimpleDriver()
                         ? simpleBrain.IsStartPoseValid(out sr)
@@ -455,6 +481,26 @@ namespace StreetRacing
                 try { rh = rivalVeh.Heading; } catch { rh = 0f; }
                 var probe = new RaceRoute();
                 probe.Build(rp, dest);
+                // Milestone GPS-only: a globally plausible fallback can still
+                // be geometrically unrelated (step/snap teleport). Simple mode
+                // must reroll/reject instead of driving on it.
+                try
+                {
+                    bool simple = false;
+                    try { simple = cfg != null && cfg.UseSimpleDriver(); } catch { }
+                    if (simple)
+                    {
+                        string src = probe.Source ?? "?";
+                        bool isGps = false;
+                        try { isGps = src.StartsWith("Gps"); } catch { }
+                        if (!isGps)
+                        {
+                            reason = $"src={src};pts={probe.Points.Count};len={probe.TotalLength:F0};non-gps-reject";
+                            return false;
+                        }
+                    }
+                }
+                catch { }
                 // Update once so AlongS/HeadingError reflect the rival pose.
                 try
                 {

@@ -7,7 +7,8 @@ namespace StreetRacing
     /// Enriched race telemetry: every important decision is explainable from
     /// the logs. Samples at 10 Hz + discrete events.
     ///
-    /// samples columns (legacy 42 first, then joint-maneuver extensions, then pose-foundation extensions):
+    /// samples columns (legacy 42 first, then joint-maneuver extensions, then pose-foundation extensions,
+    /// then milestone simple-driver extensions):
     ///   t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,
     ///   headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,
     ///   brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,
@@ -16,7 +17,14 @@ namespace StreetRacing
     ///   brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa,
     ///   chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,
     ///   planId,steerDeg,thr01,brk01,localVTgt,
-    ///   egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m
+    ///   egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m,
+    ///   desRoad_mps,cmd_mps,lookX,lookY,joinState
+    /// Milestone note: v_tgt is the PERSISTENT commanded speed (accel-limited),
+    /// desRoad_mps is the curvature-based desired road speed (cruise-capped,
+    /// braking-feasible at ego), cmd_mps duplicates v_tgt explicitly so
+    /// analysis never confuses desired vs commanded vs actual vs localVTgt.
+    /// pathErrLat must be measured against the PERSISTENT route-anchored
+    /// reference (not an ego-snapped path) so it stays meaningful.
     /// events: START / ROUTE / START_POSE / LOC / RECOVERY_MERGE / ROUTE_INVALID /
     ///   GPS_ROUTE / TACTIC / ROUTE_LOST / ROUTE_FOUND /
     ///   RECOVERY / IMPACT / TELEPORT / HARD_BRAKE / CTRL / ACTUATOR /
@@ -33,7 +41,7 @@ namespace StreetRacing
         {
             samples = new StreamWriter($"scripts\\StreetRacing_race_{raceId}.csv", false);
             events = new StreamWriter($"scripts\\StreetRacing_race_{raceId}_events.csv", false);
-            samples.WriteLine("t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,cmdStyle,routeLost,impact,reissue,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa,chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt,egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m");
+            samples.WriteLine("t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,cmdStyle,routeLost,impact,reissue,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa,chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt,egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m,desRoad_mps,cmd_mps,lookX,lookY,joinState");
             events.WriteLine("t_ms,type,detail");
             Event(0, "START", "style=" + style + ";profile=" + (profile ?? "?"));
         }
@@ -56,18 +64,20 @@ namespace StreetRacing
             float minPredClear, int planId,
             float steerDeg, float thr01, float brk01, float localVTgt,
             float egoHeadDeg, float routeHeadDeg, float firstTangErrDeg,
-            float locExpectedM, float locJumpM)
+            float locExpectedM, float locJumpM,
+            float desRoadMps = 0f, float cmdMps = 0f, float lookX = 0f, float lookY = 0f, string joinState = "")
         {
             if (closed) return;
             samples.WriteLine(string.Format(CultureInfo.InvariantCulture,
-                "{0},{1},{2},{3:F0},{4:F3},{5:F0},{6:F1},{7:F1},{8:F1},{9:F0},{10:F4},{11:F1},{12:F2},{13:F1},{14:F2},{15:F1},{16:F1},{17},{18:F2},{19:F1},{20:F1},{21},{22:F0},{23:F1},{24:F1},{25:F1},{26},{27},{28},{29},{30:F0},{31},{32:F1},{33:F1},{34:F1},{35:F1},{36:F1},{37:F0},{38:F2},{39},{40},{41:F1},{42:F4},{43},{44:F1},{45:F1},{46},{47},{48:F0},{49:F1},{50},{51:F1},{52:F2},{53:F2},{54:F1},{55:F0},{56:F0},{57:F1},{58:F0},{59:F1}",
+                "{0},{1},{2},{3:F0},{4:F3},{5:F0},{6:F1},{7:F1},{8:F1},{9:F0},{10:F4},{11:F1},{12:F2},{13:F1},{14:F2},{15:F1},{16:F1},{17},{18:F2},{19:F1},{20:F1},{21},{22:F0},{23:F1},{24:F1},{25:F1},{26},{27},{28},{29},{30:F0},{31},{32:F1},{33:F1},{34:F1},{35:F1},{36:F1},{37:F0},{38:F2},{39},{40},{41:F1},{42:F4},{43},{44:F1},{45:F1},{46},{47},{48:F0},{49:F1},{50},{51:F1},{52:F2},{53:F2},{54:F1},{55:F0},{56:F0},{57:F1},{58:F0},{59:F1},{60:F1},{61:F1},{62:F0},{63:F0},{64}",
                 t, style, tactical, progM, progPct, lookM, latM, halfW, offCorr, headErr, curv,
                 aimLat, chScore, rejLat, rejScore, vTgt, vAct, vLim, brakeNeed, aBrake, aLat,
                 nActors, nearD, nearTtc, nearClose, cmdCruise, cmdStyle, routeLost, impact, reissue, finishGap,
                 routeSrc ?? "?", minHalfW, pathErrLat, pathErrHead, speedErr, distToPath, brakePtS, capConf,
                 actuator ?? "?", chosenReject ?? "", minMargin, maxKappa,
                 chIdx, chMeanV, chMinV, constrHandle, constrKind ?? "", constrS, minPredClear, planId,
-                steerDeg, thr01, brk01, localVTgt, egoHeadDeg, routeHeadDeg, firstTangErrDeg, locExpectedM, locJumpM));
+                steerDeg, thr01, brk01, localVTgt, egoHeadDeg, routeHeadDeg, firstTangErrDeg, locExpectedM, locJumpM,
+                desRoadMps, cmdMps, lookX, lookY, joinState ?? ""));
             if (++sampleCount % 50 == 0)
             {
                 try { samples.Flush(); events.Flush(); } catch { }

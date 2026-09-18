@@ -7,27 +7,54 @@ using StreetRacing.Debug;
 
 namespace StreetRacing.Race
 {
-    /// Minimal competent driver (collapsed Phases 2-5 foundation).
+    /// Milestone simple driver: competent basic GPS route following, nothing more.
     ///
-    /// Pipeline (deliberately dumb):
-    ///   GPS route -> stable route localization -> ONE pose-feasible center
-    ///   trajectory (PoseConnector, correct +tan sign) -> fixed/moderate
-    ///   curvature-capped speed -> Direct.
+    /// Pipeline (this pass only):
+    ///   valid GPS route
+    ///   -> stable route localization (RaceRoute continuity-aware Update)
+    ///   -> optional ONE-TIME pose join (PoseConnector, only when start is
+    ///      offset/misaligned; latched, never re-entered)
+    ///   -> persistent GPS centerline reference (route-anchored window, NOT
+    ///      rebuilt through ego)
+    ///   -> curvature-based desired road speed (cruise-capped, braking-feasible)
+    ///   -> persistent acceleration-limited commanded speed
+    ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
+    ///   -> Direct steering/throttle/brake.
     ///
-    /// DISABLED here by construction (not tuned around):
-    ///   seven lateral candidates, opponent tactics, overtaking racecraft,
-    ///   collision-avoidance speed planner, Crashed state, dynamic recovery
-    ///   FSM, civilian traffic behavior (unless EnablePassing=1 for the
-    ///   single-blocker Phase-5 scenario).
+    /// Explicitly DISABLED by construction for this milestone (do not re-add):
+    ///   Perception / civilian traffic avoidance / passing (FOLLOW/PASS) /
+    ///   player race tactics / candidate trajectory scoring / seven lateral
+    ///   choices / Crashed state / ImpactClassifier-driven behavior /
+    ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
+    ///   StraightFallback. If the NPC hits traffic, that is acceptable: we are
+    ///   testing route-following competence, not avoidance.
     ///
-    /// Intent (Phase 4): KEEP_LINE default, FOLLOW/PASS_LEFT/PASS_RIGHT for
-    /// one civilian blocker when enabled, RECOVER for the explicit recovery
-    /// primitive. Intent persists with dwell hysteresis; the trajectory is
-    /// generated INSIDE the intent, never by rescoring the whole road width.
+    /// Speed separation (the recursive bug this fixes):
+    ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
+    ///   commandedSpeed  = persistent ramp toward desired (accel/decel limits).
+    ///   actualSpeed     = vehicle.Speed (measured, NEVER feeds desired).
+    ///   localTarget     = SpeedAtS(profile, sEgo) ~= commandedSpeed.
+    /// Telemetry exposes all four separately. SpeedLimit is "Curvature" only
+    /// when the ROAD caps speed; when the ramp lags behind desired it is
+    /// "AccelRamp", never mislabelled as curvature.
     ///
-    /// Success criterion: 1-2 km of ordinary route at ~15-20 m/s without
-    /// leaving the road, stopping for no reason, oscillating, or needing
-    /// special modes.
+    /// Path separation (the ego-anchored bug this fixes):
+    ///   TRACK path geometry is anchored to the ROUTE (PointAtS(AlongS + s)),
+    ///   so cross-track error stays meaningful (2 m left reads ~+2 m).
+    ///   The old KEEP_LINE rebuilt a Hermite through ego every 100 ms, which
+    ///   zeroed the error by construction and hid drift. PoseConnector is used
+    ///   ONLY for the initial JOIN when start pose is offset/misaligned; once
+    ///   aligned we latch to TRACK permanently. No rejoin, no recovery: if the
+    ///   follower stops, leaves the road, misaligns or crashes, the test must
+    ///   FAIL with logs, not hide behind reverse/rejoin.
+    ///
+    /// Steering sign (empirical, DirectDiag):
+    ///   DirectDiag SteerLeft commands SteeringAngle = +12 deg and the NPC
+    ///   visibly turned LEFT, so positive GTA steering = left.
+    ///   crossTrack > 0 means ego is LEFT of the desired path direction.
+    ///   Returning from the left therefore needs RIGHT = negative steering,
+    ///   i.e. steer -= crossTrack * gain. This is verified by
+    ///   DirectActuator.SteeringSignSelfTest() at Start (logged).
     internal sealed class SimpleBrain
     {
         private Ped driver;
@@ -39,25 +66,22 @@ namespace StreetRacing.Race
         private DriverProfile profile;
         private RaceTelemetry telemetry;
         private int t0;
-        private bool enablePassing;
-        private bool useGtaRejoin;
 
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
-        // Viz containers only: single center candidate is published here so
-        // the existing RaceDebugViz draws it without changes. No scoring.
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
         private readonly RaceDebugViz viz = new RaceDebugViz();
-        private readonly ManeuverIntentState intent = new ManeuverIntentState();
-        private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
         private IVehicleActuator actuator;
 
-        private int lastCorrMs;
         private int lastPlanMs;
+        private int lastCorrMs;
         private int lastTeleMs;
         private int lastGpsRetryMs;
+        private int lastGpsMissingLogMs = -100000;
+        private int lastLostLogMs = -100000;
+        private bool lastLoggedLost;
 
         private float lastSpeed;
         private Vector3 lastPos = Vector3.Zero;
@@ -65,7 +89,6 @@ namespace StreetRacing.Race
         private int lastKinT;
         private float lastHealth = -1f;
         private float lastAccelLong;
-        private int lastImpactEventMs = -100000;
         private float lastSlipDeg;
         private float lastYawRate;
 
@@ -77,14 +100,18 @@ namespace StreetRacing.Race
         private Vector3 lastEgoFwd = new Vector3(0f, 1f, 0f);
         private float lastEgoHeading;
 
-        // Single-blocker pass state (Phase 5, gated).
-        private int blockerHandle;
-        private float blockerLat;
-        private float blockerDist;
-        private float blockerSpeedAlong;
+        // --- Milestone persistent state (never reconstructed from actualSpeed).
+        private float desiredRoadSpeed = 18f;
+        private float commandedSpeed;
+        private bool commandedInit;
+        private int prevPlanMs = -1;
+
+        // --- One-time join latch. Once TRACK, never go back (no recovery).
+        private bool joined;
+        private string joinState = "Init";
 
         public bool Running { get; private set; }
-        public string TacticalName => intent.Current.ToString();
+        public string TacticalName => joinState;
         public float TargetSpeed { get; private set; }
         public string SpeedLimit { get; private set; } = "Cruise";
         public float ActualSpeed { get; private set; }
@@ -94,6 +121,15 @@ namespace StreetRacing.Race
         public float LookaheadM { get; private set; } = 70f;
         public string RouteSource => route.Source;
         public string ActuatorName => actuator != null ? actuator.ActuatorName : "?";
+        public float DesiredRoadSpeed => desiredRoadSpeed;
+        public float CommandedSpeed => commandedSpeed;
+        public string JoinState => joinState;
+
+        // Join thresholds: when is PoseConnector actually needed?
+        private const float JoinLatThreshM = 2.0f;
+        private const float JoinHeadThreshDeg = 15f;
+        private const float JoinedLatM = 1.5f;
+        private const float JoinedHeadDeg = 10f;
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -108,20 +144,20 @@ namespace StreetRacing.Race
             this.style = style;
             this.profile = profile ?? DriverProfile.FromName("balanced");
             this.telemetry = telemetry;
-            this.enablePassing = enablePassing;
-            this.useGtaRejoin = useGtaRejoin;
+            // Milestone: passing / GTA rejoin / recovery are hard-disabled,
+            // even if the ini enables them. Log the override explicitly.
             t0 = Game.GameTime;
 
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
-            try { intent.Reset(t0); } catch { }
-            try { recovery.Reset(t0); } catch { }
 
             Vector3 origin;
             try { origin = vehicle.Position; } catch { origin = Game.Player.Character.Position; }
             float originHeading = SafeHeading(vehicle);
+            float originSpeed = 0f;
+            try { originSpeed = vehicle.Speed; } catch { }
             route.Build(origin, finish);
             capability.Seed(vehicle);
             LookaheadM = this.profile.LookaheadForSpeed(0f);
@@ -133,38 +169,64 @@ namespace StreetRacing.Race
             viz.Enabled = debugViz;
 
             hasKin = false;
-            lastSpeed = 0f;
+            lastSpeed = originSpeed;
             lastPos = origin;
             lastKinT = t0;
             lastHealth = -1f;
             lastAccelLong = 0f;
-            lastImpactEventMs = -100000;
-            lastCorrMs = 0;
+            lastSlipDeg = 0f;
+            lastYawRate = 0f;
             lastPlanMs = 0;
+            lastCorrMs = 0;
             lastTeleMs = 0;
             lastGpsRetryMs = 0;
+            lastGpsMissingLogMs = -100000;
+            lastLostLogMs = -100000;
+            lastLoggedLost = false;
             TargetSpeed = 0f;
             SpeedLimit = "Cruise";
-            ActualSpeed = 0f;
+            ActualSpeed = originSpeed;
             FinishGap = RaceMath.FlatDistance(origin, finish);
             maneuverPlanId = 0;
             hasCurrent = false;
             lastIntentLog = "";
             lastIntentLogMs = -100000;
-            blockerHandle = 0;
+            lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
+            lastEgoHeading = originHeading;
+
+            // Persistent speed state: start from actual motion so the first
+            // command is continuous, then ramp toward desired. NEVER from
+            // actual+constant on later ticks (that was the collapse bug).
+            desiredRoadSpeed = EffectiveCruise();
+            commandedSpeed = RaceMath.Clamp(originSpeed, 0f, EffectiveCruise());
+            commandedInit = true;
+            prevPlanMs = t0;
+
+            // Join latch: if start is already aligned, go straight to TRACK.
+            // Otherwise JOIN once until aligned, then latch to TRACK forever.
+            bool needJoin = Math.Abs(route.Lateral) > JoinLatThreshM
+                || Math.Abs(route.HeadingErrorDeg) > JoinHeadThreshDeg;
+            joined = !needJoin;
+            joinState = IsGpsSource() ? (joined ? "Track" : "Join") : "GpsWait";
+
             Running = true;
 
             try
             {
-                string chk = PoseConnector.SelfTest();
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={chk}");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;simple dumb follower (1 center path, no candidates/tactics/traffic);passing={(enablePassing ? "SINGLE-BLOCKER-ON" : "OFF")}");
+                string poseChk = PoseConnector.SelfTest();
+                string steerChk = DirectActuator.SteeringSignSelfTest();
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};gpsOnly=1;recovery=OFF;passing=OFF");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
-                telemetry?.Event(0, "START_POSE", $"egoHead={originHeading:F0};routeHead={route.RouteHeadingDeg:F0};headErr={route.HeadingErrorDeg:F0};lat={route.Lateral:F1};dist={route.DistToRoute:F1};s={route.AlongS:F0};startValid={vStart}");
-                lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
-                lastEgoHeading = originHeading;
+                telemetry?.Event(0, "START_POSE", $"egoHead={originHeading:F0};routeHead={route.RouteHeadingDeg:F0};headErr={route.HeadingErrorDeg:F0};lat={route.Lateral:F1};dist={route.DistToRoute:F1};s={route.AlongS:F0};startValid={vStart};join={joinState};needJoin={needJoin}");
+                if (!IsGpsSource())
+                    telemetry?.Event(0, "GPS_WAIT", $"non-gps at start src={route.Source};holding until GPS (never driving on fallback)");
+                if (poseChk != "OK")
+                    telemetry?.Event(0, "POSE_CONNECTOR_FAIL", $"selftest={poseChk}");
+                if (steerChk != "OK")
+                    telemetry?.Event(0, "STEER_SIGN_FAIL", $"selftest={steerChk}");
             }
             catch { }
         }
@@ -178,6 +240,15 @@ namespace StreetRacing.Race
                 return route.ValidateStart(vehicle.Position, SafeHeading(vehicle), out reason);
             }
             catch (Exception ex) { try { reason = "exc:" + ex.Message; } catch { } return false; }
+        }
+
+        /// GPS-only gate for Simple mode. FallbackWalk / StraightFallback are
+        /// never valid control references (they step/snap toward the finish
+        /// and can teleport progress while the car sits still).
+        public bool IsGpsSource()
+        {
+            try { return route.Built && route.Source != null && route.Source.StartsWith("Gps"); }
+            catch { return false; }
         }
 
         public bool Valid()
@@ -243,21 +314,48 @@ namespace StreetRacing.Race
             {
                 lastPlanMs = now;
                 try { route.Update(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth); } catch { }
-                try
+
+                // GPS-only: retry briefly, never drive on fallback.
+                if (!IsGpsSource())
                 {
-                    if (!route.Source.StartsWith("Gps") && now - t0 < 12000 && now - lastGpsRetryMs > 1000)
+                    joinState = "GpsWait";
+                    try
                     {
-                        lastGpsRetryMs = now;
-                        string ulog;
-                        if (route.TryUpgradeToGps(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth, out ulog))
+                        if (now - t0 < 12000 && now - lastGpsRetryMs > 1000)
                         {
-                            try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
-                            try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;{ulog}"); } catch { }
-                            try { hasCurrent = false; } catch { }
+                            lastGpsRetryMs = now;
+                            string ulog;
+                            if (route.TryUpgradeToGps(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth, out ulog))
+                            {
+                                try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
+                                try { telemetry?.Event(t, "GPS_ROUTE", $"upgraded;{ulog}"); } catch { }
+                                try { hasCurrent = false; } catch { }
+                                // Re-evaluate join latch on the fresh geometry.
+                                bool needJoin = Math.Abs(route.Lateral) > JoinLatThreshM
+                                    || Math.Abs(route.HeadingErrorDeg) > JoinHeadThreshDeg;
+                                joined = !needJoin;
+                                joinState = joined ? "Track" : "Join";
+                                try { telemetry?.Event(t, "GPS_OK", $"src={route.Source};join={joinState};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}"); } catch { }
+                            }
                         }
                     }
+                    catch { }
+                    if (!IsGpsSource())
+                    {
+                        // HOLD: do not control the car from fallback geometry.
+                        // Keep logging so the test FAILS visibly instead of
+                        // driving off on a snapped walk.
+                        SendHold(egoPos, egoFwd, "GpsMissing");
+                        if (now - lastGpsMissingLogMs > 2000)
+                        {
+                            lastGpsMissingLogMs = now;
+                            try { telemetry?.Event(t, "GPS_MISSING", $"src={route.Source};holding;never-fallback;elapsed={(now - t0) / 1000f:F0}s"); } catch { }
+                        }
+                        LogIntent(t, now);
+                        // Fall through to actuator tick + telemetry below.
+                        goto AfterPlan;
+                    }
                 }
-                catch { }
             }
 
             if (now - lastCorrMs >= 200)
@@ -266,98 +364,76 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            if (doPlan)
+            if (doPlan && IsGpsSource())
             {
                 LookaheadM = profile.LookaheadForSpeed(egoSpeed);
-                // --- Corroborated contact evidence for recovery entry.
-                bool hasCollided = false;
-                float healthDrop = 0f;
-                try { hasCollided = vehicle.HasCollided; } catch { }
+                float dtPlan = 0.1f;
                 try
                 {
-                    float h = vehicle.HealthFloat;
-                    if (lastHealth > 0f) healthDrop = lastHealth - h;
-                }
-                catch { }
-
-                bool wantRecovery = false;
-                string recWhy = "";
-                try
-                {
-                    if (recovery.ShouldEnter(route, egoSpeed, route.AlongS, hasCollided, healthDrop, lastAccelLong, now))
+                    if (prevPlanMs > 0)
                     {
-                        wantRecovery = true;
-                        if (route.IsLost) recWhy = "route:" + route.LossReason;
-                        else if (Math.Abs(route.HeadingErrorDeg) > RaceRoute.PlanInvalidHeadErrDeg) recWhy = $"headErr {route.HeadingErrorDeg:F0}";
-                        else if (hasCollided || healthDrop >= 4f) recWhy = "contact-corroborated";
-                        else recWhy = "no-progress";
+                        dtPlan = (now - prevPlanMs) / 1000f;
+                        if (dtPlan < 0.03f) dtPlan = 0.03f;
+                        if (dtPlan > 0.5f) dtPlan = 0.5f;
                     }
                 }
-                catch { }
+                catch { dtPlan = 0.1f; }
+                prevPlanMs = now;
 
+                // One-time join: only when NOT yet joined and still misaligned.
+                // Once joined, stay in TRACK forever (no rejoin, no recovery).
                 ManeuverCommand m;
-                if (wantRecovery && !recovery.Active)
+                if (!joined)
                 {
-                    try { recovery.Enter(recWhy, now, route.AlongS); } catch { }
-                    try { intent.Force(ManeuverIntent.RECOVER, recWhy, now); } catch { }
-                    try { telemetry?.Event(t, "RECOVER_ENTER", $"{recWhy};s={route.AlongS:F0};headErr={route.HeadingErrorDeg:F0}"); } catch { }
-                }
-
-                if (recovery.Active)
-                {
-                    try { intent.Force(ManeuverIntent.RECOVER, recovery.Reason, now); } catch { }
-                    float recCruise = Math.Min(EffectiveCruise(), 8f);
-                    m = recovery.Tick(route, corridor, egoPos, egoFwd, egoHeading, egoSpeed, route.AlongS, now, recCruise);
-                    m.Style = style;
-                    m.PlanId = ++maneuverPlanId;
-                    // Exit when route is healthy and we are moving again.
-                    bool healthy = !route.IsLost && Math.Abs(route.HeadingErrorDeg) <= RaceRoute.PlanInvalidHeadErrDeg;
-                    if (healthy && egoSpeed > 3f && (now - recovery.SinceMs) > 1500)
+                    bool alignedNow = Math.Abs(route.Lateral) <= JoinedLatM
+                        && Math.Abs(route.HeadingErrorDeg) <= JoinedHeadDeg;
+                    if (alignedNow)
                     {
-                        // Require a heading-compatible future merge before exit
-                        // so we rejoin, not just resume into a sideways route.
-                        try
-                        {
-                            Vector3 mp;
-                            float ms;
-                            string md;
-                            if (route.TryGetRecoveryMerge(egoPos, egoHeading, out mp, out ms, out md))
-                            {
-                                recovery.Exit(now);
-                                intent.Force(ManeuverIntent.KEEP_LINE, "recovered", now);
-                                try { telemetry?.Event(t, "RECOVER_EXIT", $"s={route.AlongS:F0};{md}"); } catch { }
-                                m = BuildKeepLine(egoPos, egoSpeed);
-                                m.PlanId = ++maneuverPlanId;
-                            }
-                        }
-                        catch { }
+                        joined = true;
+                        joinState = "Track";
+                        try { telemetry?.Event(t, "JOIN_DONE", $"latched to Track;lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0};s={route.AlongS:F0}"); } catch { }
+                        m = BuildTrack(egoPos, egoSpeed, dtPlan);
                     }
-                    TargetSpeed = Math.Max(0f, m.TargetSpeed);
-                    SpeedLimit = m.Reason ?? "Recovery";
-                    PublishViz(m, egoSpeed, t, egoHeading);
-                    try { actuator.SetManeuver(m); } catch { }
-                    LogIntent(t, now);
+                    else
+                    {
+                        joinState = "Join";
+                        m = BuildJoin(egoPos, egoSpeed, dtPlan);
+                    }
                 }
                 else
                 {
-                    // --- Normal: ONE dumb center trajectory inside KEEP_LINE,
-                    // or single-blocker FOLLOW/PASS when enabled (Phase 5).
-                    UpdateBlockerIntent(egoPos, egoSpeed, now, t);
-                    m = intent.Current == ManeuverIntent.FOLLOW
-                        ? BuildFollow(egoPos, egoSpeed)
-                        : intent.Current == ManeuverIntent.PASS_LEFT || intent.Current == ManeuverIntent.PASS_RIGHT
-                            ? BuildPass(egoPos, egoSpeed)
-                            : BuildKeepLine(egoPos, egoSpeed);
-                    m.PlanId = ++maneuverPlanId;
-                    TargetSpeed = Math.Max(0f, m.TargetSpeed);
-                    SpeedLimit = m.Reason ?? "Cruise";
-                    PublishViz(m, egoSpeed, t, egoHeading);
-                    try { actuator.SetManeuver(m); } catch { }
-                    LogIntent(t, now);
+                    joinState = "Track";
+                    m = BuildTrack(egoPos, egoSpeed, dtPlan);
                 }
+                m.PlanId = ++maneuverPlanId;
+                TargetSpeed = Math.Max(0f, commandedSpeed);
+                // SpeedLimit names the ROAD limit, never the ramp lag.
+                SpeedLimit = m.Reason ?? "Cruise";
+                PublishViz(m, egoSpeed, t, egoHeading);
+                try { actuator.SetManeuver(m); } catch { }
+                LogIntent(t, now);
+
+                // Lost/misaligned is telemetry only: never recover, never
+                // reverse, never rejoin. The run must fail visibly if the
+                // basic follower cannot hold the road.
+                try
+                {
+                    if (route.IsLost && now - lastLostLogMs > 2000)
+                    {
+                        lastLostLogMs = now;
+                        telemetry?.Event(t, "ROUTE_LOST", $"{route.LossReason};s={route.AlongS:F0};dist={route.DistToRoute:F1};headErr={route.HeadingErrorDeg:F0};TRACK-ONLY(no-recovery)");
+                    }
+                    else if (!route.IsLost && lastLoggedLost)
+                    {
+                        try { telemetry?.Event(t, "ROUTE_FOUND", $"s={route.AlongS:F0}"); } catch { }
+                    }
+                    lastLoggedLost = route.IsLost;
+                }
+                catch { }
             }
 
-            try { actuator.OnTick(false, intent.Current.ToString()); } catch { }
+        AfterPlan:
+            try { actuator.OnTick(false, joinState); } catch { }
             try
             {
                 actuator?.UpdatePathError(egoPos, egoHeading, egoSpeed, route,
@@ -382,9 +458,65 @@ namespace StreetRacing.Race
             lastKinT = now;
         }
 
-        // --- Single center path: start from actual pose, continuous forward,
-        // endLat=0 (center), fixed/moderate speed capped by curvature only.
-        private ManeuverCommand BuildKeepLine(Vector3 egoPos, float egoSpeed)
+        private void SendHold(Vector3 egoPos, Vector3 egoFwd, string why)
+        {
+            try
+            {
+                var holdPt = new Vector3(egoPos.X + egoFwd.X * 12f, egoPos.Y + egoFwd.Y * 12f, egoPos.Z);
+                var hold = new ManeuverCommand
+                {
+                    Path = new List<Vector3> { egoPos, holdPt },
+                    StationS = new List<float> { 0f, 12f },
+                    SpeedProfile = new List<float> { 0f, 0f },
+                    AimPoint = holdPt,
+                    TargetSpeed = 0f,
+                    Style = style,
+                    Reason = why,
+                    Reverse = false,
+                    PlanId = maneuverPlanId + 1,
+                };
+                // Do not advance persistent commanded speed while holding for
+                // GPS: the car must launch from rest once GPS arrives.
+                TargetSpeed = 0f;
+                SpeedLimit = why;
+                hasCurrent = false;
+                try { actuator.SetManeuver(hold); } catch { }
+            }
+            catch { }
+        }
+
+        // --- TRACK: persistent GPS centerline reference.
+        // Geometry is anchored to the ROUTE (PointAtS(AlongS + s)), never
+        // rebuilt through ego. path[0] is the route center at current AlongS,
+        // so Direct's ClosestOnPath reports the TRUE cross-track error.
+        private ManeuverCommand BuildTrack(Vector3 egoPos, float egoSpeed, float dtPlan)
+        {
+            float cruise = EffectiveCruise();
+            float look = LookaheadM;
+            int n = Math.Max(5, Math.Min(33, (int)Math.Ceiling(look / 5f) + 1));
+            var path = new List<Vector3>(n);
+            var ss = new List<float>(n);
+            var lats = new List<float>(n);
+            for (int k = 0; k < n; k++)
+            {
+                float s = (k == n - 1) ? look : k * 5f;
+                if (s > look) s = look;
+                Vector3 rp;
+                try { rp = route.PointAtS(route.AlongS + s); }
+                catch { rp = egoPos; }
+                path.Add(rp);
+                ss.Add(s);
+                lats.Add(0f);
+                if (s >= look - 0.01f) break;
+            }
+            return BuildCommandFromPath(path, ss, lats, egoSpeed, dtPlan, cruise, "Track", egoPos);
+        }
+
+        // --- JOIN: one-time pose-feasible merge, only until aligned.
+        // Uses PoseConnector (correct +tan sign) with ego snap at path[0].
+        // Guarded by VerifyToward so a sign regression holds instead of
+        // driving a path that leaves away from the nose.
+        private ManeuverCommand BuildJoin(Vector3 egoPos, float egoSpeed, float dtPlan)
         {
             float cruise = EffectiveCruise();
             float look = LookaheadM;
@@ -394,9 +526,6 @@ namespace StreetRacing.Race
             List<float> ss;
             var path = PoseConnector.BuildPath(route, egoPos, startLat, headErr, 0f, look, 5f, out lats, out ss);
             float firstTang = PoseConnector.FirstTangentErrorDeg(path, lastEgoHeading);
-            // Deterministic guard: connector must leave toward the nose.
-            // If it points away, the sign/conventions regressed — log loudly
-            // and fall back to a straight nose-hold instead of driving it.
             try
             {
                 if (!PoseConnector.VerifyToward(lastEgoHeading, route.RouteHeadingDeg, firstTang))
@@ -417,13 +546,37 @@ namespace StreetRacing.Race
                 }
             }
             catch { }
+            var cmd = BuildCommandFromPath(path, ss, lats, egoSpeed, dtPlan, cruise, "Join", egoPos);
+            // Tag first-tangent info for telemetry via current candidate.
+            return cmd;
+        }
 
-            // Curvature-only speed: v=sqrt(aLat/k), backwards braking pass.
+        // Shared speed logic: curvature -> braking-feasible desired -> persistent
+        // commanded (MoveTowards) -> forward-reachable profile. Actual speed
+        // NEVER redefines desired or commanded.
+        private ManeuverCommand BuildCommandFromPath(List<Vector3> path, List<float> ss, List<float> lats,
+            float egoSpeed, float dtPlan, float cruise, string mode, Vector3 egoPos)
+        {
             float aLat = capability.UsableLat(profile.GripFactor);
             float aBrake = capability.UsableBrake(profile.GripFactor);
             float top = 60f;
             try { top = capability.TopSpeedEst; } catch { }
             int n = path.Count;
+            if (n < 2)
+            {
+                var hold = new List<Vector3> { egoPos, new Vector3(egoPos.X + lastEgoFwd.X * 12f, egoPos.Y + lastEgoFwd.Y * 12f, egoPos.Z) };
+                return new ManeuverCommand
+                {
+                    Path = hold,
+                    StationS = new List<float> { 0f, 12f },
+                    SpeedProfile = new List<float> { 0f, 0f },
+                    AimPoint = hold[1],
+                    TargetSpeed = 0f,
+                    Style = style,
+                    Reason = mode + "-ShortPath",
+                    Reverse = false,
+                };
+            }
             var vAllow = new float[n];
             for (int i = 0; i < n; i++)
             {
@@ -433,35 +586,87 @@ namespace StreetRacing.Race
                 if (top > 5f && vc > top) vc = top;
                 vAllow[i] = vc;
             }
-            var vTgt = new float[n];
-            if (n > 0)
+            // Backwards braking pass: desired at ego already accounts for bends
+            // ahead, so the car brakes BEFORE the bend, not inside it.
+            var vDes = new float[n];
+            vDes[n - 1] = vAllow[n - 1];
+            for (int i = n - 2; i >= 0; i--)
             {
-                vTgt[n - 1] = vAllow[n - 1];
-                for (int i = n - 2; i >= 0; i--)
+                float ds = Math.Max(1f, ss[i + 1] - ss[i]);
+                float vr = (float)Math.Sqrt(vDes[i + 1] * vDes[i + 1] + 2f * aBrake * ds);
+                vDes[i] = Math.Min(vAllow[i], vr);
+            }
+            float desired = vDes[0];
+            if (desired < 0f) desired = 0f;
+            if (desired > cruise) desired = cruise;
+            desiredRoadSpeed = desired;
+
+            // PERSISTENT commanded speed: ramp from PREVIOUS commanded toward
+            // desired at physical limits. dtPlan is the real plan interval.
+            // This is the fix for "actual+1" collapse: error = desired/actual
+            // stays meaningful (e.g. 18 vs 10 -> +8) and Direct can pull.
+            float aAcc = Math.Max(2f, aBrake * 0.55f);
+            float aDec = Math.Max(3f, aBrake);
+            if (!commandedInit)
+            {
+                commandedSpeed = RaceMath.Clamp(egoSpeed, 0f, cruise);
+                commandedInit = true;
+            }
+            else
+            {
+                if (desired > commandedSpeed)
                 {
-                    float ds = Math.Max(1f, ss[i + 1] - ss[i]);
-                    float vr = (float)Math.Sqrt(vTgt[i + 1] * vTgt[i + 1] + 2f * aBrake * ds);
-                    vTgt[i] = Math.Min(vAllow[i], vr);
+                    float step = aAcc * dtPlan;
+                    commandedSpeed = Math.Min(desired, commandedSpeed + step);
                 }
-                // Forward accel feasibility.
-                float aAcc = Math.Max(2f, aBrake * 0.55f);
-                float v0 = vTgt[0] > egoSpeed ? Math.Min(vTgt[0], egoSpeed + 1f) : vTgt[0];
-                vTgt[0] = v0;
-                for (int i = 1; i < n; i++)
+                else if (desired < commandedSpeed)
                 {
-                    float ds = Math.Max(1f, ss[i] - ss[i - 1]);
-                    float vr = (float)Math.Sqrt(vTgt[i - 1] * vTgt[i - 1] + 2f * aAcc * ds);
-                    if (vTgt[i] > vr) vTgt[i] = vr;
+                    float step = aDec * dtPlan;
+                    commandedSpeed = Math.Max(desired, commandedSpeed - step);
                 }
             }
-            var prof = new List<float>(vTgt);
-            float targetNow = prof.Count > 0 ? prof[0] : cruise;
+            if (commandedSpeed < 0f) commandedSpeed = 0f;
+            if (commandedSpeed > cruise) commandedSpeed = cruise;
+
+            // Final executable profile: first point IS the persistent command;
+            // future points respect both the braking-feasible envelope and what
+            // is forward-reachable from the command at full accel.
+            var prof = new List<float>(n);
+            for (int i = 0; i < n; i++)
+            {
+                float s = ss[i];
+                float reach = (float)Math.Sqrt(commandedSpeed * commandedSpeed + 2f * aAcc * Math.Max(0f, s));
+                float v = Math.Min(vDes[i], reach);
+                // Never exceed cruise; never go negative.
+                if (v > cruise) v = cruise;
+                if (v < 0f) v = 0f;
+                prof.Add(v);
+            }
+            // Guarantee prof[0] equals commanded exactly (no interpolation drift).
+            prof[0] = commandedSpeed;
+
             float maxKappa = 0f;
             for (int i = 0; i < n; i++) { float k = CurvatureOfPathAt(path, i); if (k > maxKappa) maxKappa = k; }
+            float firstTang = 0f;
+            try
+            {
+                if (mode == "Join")
+                    firstTang = PoseConnector.FirstTangentErrorDeg(path, lastEgoHeading);
+            }
+            catch { }
+
+            // SpeedLimit names the ROAD vs RAMP bottleneck honestly:
+            // Curvature only when the road itself caps; AccelRamp when the
+            // persistent command still lags behind a higher desired.
+            string limit;
+            if (desired < cruise - 0.5f) limit = "Curvature";
+            else if (commandedSpeed < desired - 0.5f) limit = "AccelRamp";
+            else limit = "Cruise";
+
             current = new TrajectoryCandidate
             {
                 LateralM = 0f,
-                LookaheadM = look,
+                LookaheadM = LookaheadM,
                 AimPoint = path.Count > 0 ? path[path.Count - 1] : egoPos,
                 Score = 0f,
                 ClearanceM = 999f,
@@ -474,8 +679,8 @@ namespace StreetRacing.Race
                 StationS = new List<float>(ss),
                 SpeedProfile = new List<float>(prof),
                 ArrivalT = new List<float>(ss.Count),
-                TargetSpeed = targetNow,
-                SpeedLimiting = targetNow < cruise - 0.5f ? "Curvature" : "Cruise",
+                TargetSpeed = commandedSpeed,
+                SpeedLimiting = limit,
                 ConstrainHandle = -1,
                 ConstrainKind = "",
                 ConstrainS = -1f,
@@ -485,7 +690,7 @@ namespace StreetRacing.Race
                 RequiredDecel = 0f,
                 CandidateIndex = 0,
                 FirstTangentErrDeg = firstTang,
-                RouteHeadErrDeg = headErr,
+                RouteHeadErrDeg = route.HeadingErrorDeg,
             };
             hasCurrent = true;
             return new ManeuverCommand
@@ -494,213 +699,9 @@ namespace StreetRacing.Race
                 StationS = new List<float>(ss),
                 SpeedProfile = new List<float>(prof),
                 AimPoint = current.AimPoint,
-                TargetSpeed = targetNow,
+                TargetSpeed = commandedSpeed,
                 Style = style,
-                Reason = current.SpeedLimiting,
-                Reverse = false,
-            };
-        }
-
-        // --- Phase 5 (gated): one slower/stopped civilian ahead.
-        // FOLLOW if passing is unsafe; else one committed PASS trajectory.
-        private void UpdateBlockerIntent(Vector3 egoPos, float egoSpeed, int now, int t)
-        {
-            if (!enablePassing)
-            {
-                if (intent.Current != ManeuverIntent.KEEP_LINE && intent.Current != ManeuverIntent.RECOVER)
-                    intent.Force(ManeuverIntent.KEEP_LINE, "passing-off", now);
-                blockerHandle = 0;
-                return;
-            }
-            if (intent.Current == ManeuverIntent.RECOVER) return;
-            try
-            {
-                // Lightweight single-blocker scan (no full Perception).
-                int bh = 0;
-                float bLat = 0f;
-                float bDist = 999f;
-                float bSpd = 0f;
-                float best = float.MaxValue;
-                List<Vehicle> near = null;
-                try { near = new List<Vehicle>(World.GetNearbyVehicles(egoPos, 65f)); } catch { near = null; }
-                if (near != null)
-                {
-                    foreach (var v in near)
-                    {
-                        try
-                        {
-                            if (v == null || !v.Exists() || v == vehicle) continue;
-                            Vector3 p = v.Position;
-                            var pr = route.ProjectOntoRoute(p);
-                            float rd = pr.S - route.AlongS;
-                            if (rd < 4f || rd > 55f) continue;
-                            float half = corridor.HalfWidthAt(Math.Max(0f, rd));
-                            if (Math.Abs(pr.Lateral) > half + 2f) continue;
-                            Vector3 vv = new Vector3();
-                            try { vv = v.Velocity; } catch { }
-                            float spdAlong = RaceMath.FlatDot(new Vector3(vv.X, vv.Y, 0f), pr.Dir);
-                            if (rd < best) { best = rd; bh = SafeHandle(v); bLat = pr.Lateral; bDist = rd; bSpd = spdAlong; }
-                        }
-                        catch { }
-                    }
-                }
-                blockerHandle = bh;
-                blockerLat = bLat;
-                blockerDist = bDist;
-                blockerSpeedAlong = bSpd;
-
-                float cruise = EffectiveCruise();
-                bool hasBlocker = bh != 0 && bDist < 55f;
-                // Not slower/stopped relative to us: keep line.
-                if (!hasBlocker || bSpd > cruise - 2f)
-                {
-                    // Pass complete: return to KEEP_LINE (forced: completed).
-                    if (intent.Current == ManeuverIntent.PASS_LEFT || intent.Current == ManeuverIntent.PASS_RIGHT
-                        || intent.Current == ManeuverIntent.FOLLOW)
-                    {
-                        bool cleared = !hasBlocker || bDist > 18f;
-                        if (cleared) intent.Force(ManeuverIntent.KEEP_LINE, "pass-complete", now);
-                        else intent.Request(ManeuverIntent.KEEP_LINE, "blocker-fast", now, false);
-                    }
-                    return;
-                }
-                // Slower/stopped blocker: can we pass? Need road space.
-                float halfAhead = corridor.MinHalfWidthAhead(Math.Min(bDist + 20f, 80f));
-                bool wideEnough = halfAhead >= 5.5f;
-                if (!wideEnough)
-                {
-                    intent.Request(ManeuverIntent.FOLLOW, $"narrow half={halfAhead:F1}", now, false);
-                    if (intent.Current == ManeuverIntent.PASS_LEFT || intent.Current == ManeuverIntent.PASS_RIGHT)
-                        intent.Force(ManeuverIntent.FOLLOW, "unsafe-narrow", now);
-                    return;
-                }
-                // Deliberately choose a side (opposite the blocker, prefer left).
-                ManeuverIntent wantPass = bLat >= 0f ? ManeuverIntent.PASS_RIGHT : ManeuverIntent.PASS_LEFT;
-                if (intent.Current == ManeuverIntent.KEEP_LINE || intent.Current == ManeuverIntent.FOLLOW)
-                {
-                    // Commit to the pass (forced: tactical conditions changed).
-                    intent.Force(wantPass, $"blocker d={bDist:F0} lat={bLat:F1} v={bSpd:F1}", now);
-                    try { telemetry?.Event(t, "PASS_COMMIT", $"{wantPass};blocker#{bh} d={bDist:F0} lat={bLat:F1} v={bSpd:F1} half={halfAhead:F1}"); } catch { }
-                }
-                else if ((intent.Current == ManeuverIntent.PASS_LEFT || intent.Current == ManeuverIntent.PASS_RIGHT)
-                    && intent.Current != wantPass && (now - intent.SinceMs) > 4000)
-                {
-                    // Re-evaluate side only after a long hold (hysteresis).
-                    intent.Force(wantPass, "side-better", now);
-                }
-            }
-            catch { }
-        }
-
-        private ManeuverCommand BuildFollow(Vector3 egoPos, float egoSpeed)
-        {
-            var keep = BuildKeepLine(egoPos, egoSpeed);
-            // Cap speed to the blocker with a gap (no indefinite stop logic:
-            // if the blocker is stopped and the road is wide, UpdateBlockerIntent
-            // already committed to PASS, so FOLLOW here means genuinely unsafe).
-            float cap = Math.Max(blockerSpeedAlong + 1.5f, blockerSpeedAlong < 0.5f ? 0f : 4f);
-            float cruise = EffectiveCruise();
-            if (cap > cruise) cap = cruise;
-            // Apply a stop gap for a stopped blocker we must wait for.
-            if (blockerSpeedAlong < 0.5f && blockerDist < 12f) cap = 0f;
-            var prof = keep.SpeedProfile;
-            for (int i = 0; i < prof.Count; i++) if (prof[i] > cap) prof[i] = cap;
-            keep.SpeedProfile = prof;
-            keep.TargetSpeed = prof.Count > 0 ? prof[0] : cap;
-            keep.Reason = "Follow";
-            if (hasCurrent)
-            {
-                var c = current;
-                c.TargetSpeed = keep.TargetSpeed;
-                c.SpeedLimiting = "Follow";
-                c.SpeedProfile = new List<float>(prof);
-                current = c;
-            }
-            return keep;
-        }
-
-        private ManeuverCommand BuildPass(Vector3 egoPos, float egoSpeed)
-        {
-            float cruise = EffectiveCruise();
-            float look = LookaheadM;
-            float half = corridor.HalfWidthAt(Math.Min(blockerDist + 15f, look));
-            if (half < 2.5f) half = 2.5f;
-            // One feasible pass trajectory: offset to the committed side,
-            // clearing the blocker laterally by car half + margin.
-            float side = intent.Current == ManeuverIntent.PASS_LEFT ? 1f : -1f;
-            float endLat = side * Math.Max(half * 0.55f, Math.Abs(blockerLat) + 2.6f);
-            endLat = RaceMath.Clamp(endLat, -(half + 1f), half + 1f);
-            float startLat = RaceMath.Clamp(route.Lateral, -18f, 18f);
-            float headErr = route.HeadingErrorDeg;
-            List<float> lats;
-            List<float> ss;
-            var path = PoseConnector.BuildPath(route, egoPos, startLat, headErr, endLat, look, 5f, out lats, out ss);
-            float firstTang = PoseConnector.FirstTangentErrorDeg(path, lastEgoHeading);
-            float aLat = capability.UsableLat(profile.GripFactor);
-            float aBrake = capability.UsableBrake(profile.GripFactor);
-            int n = path.Count;
-            var vAllow = new float[n];
-            for (int i = 0; i < n; i++)
-            {
-                float k = CurvatureOfPathAt(path, i);
-                float vc = k < 1e-5f ? cruise : (float)Math.Sqrt(aLat / k);
-                if (vc > cruise) vc = cruise;
-                vAllow[i] = vc;
-            }
-            var vTgt = new float[n];
-            if (n > 0)
-            {
-                vTgt[n - 1] = vAllow[n - 1];
-                for (int i = n - 2; i >= 0; i--)
-                {
-                    float ds = Math.Max(1f, ss[i + 1] - ss[i]);
-                    float vr = (float)Math.Sqrt(vTgt[i + 1] * vTgt[i + 1] + 2f * aBrake * ds);
-                    vTgt[i] = Math.Min(vAllow[i], vr);
-                }
-            }
-            var prof = new List<float>(vTgt);
-            float targetNow = prof.Count > 0 ? prof[0] : cruise;
-            float maxKappa = 0f;
-            for (int i = 0; i < n; i++) { float k = CurvatureOfPathAt(path, i); if (k > maxKappa) maxKappa = k; }
-            current = new TrajectoryCandidate
-            {
-                LateralM = endLat,
-                LookaheadM = look,
-                AimPoint = path.Count > 0 ? path[path.Count - 1] : egoPos,
-                Score = 0f,
-                ClearanceM = 999f,
-                CurveCost = 0f,
-                TacticalBias = 0f,
-                RejectReason = "",
-                Path = path,
-                MinMarginM = MinMargin(lats, ss),
-                MaxKappa = maxKappa,
-                StationS = new List<float>(ss),
-                SpeedProfile = new List<float>(prof),
-                ArrivalT = new List<float>(ss.Count),
-                TargetSpeed = targetNow,
-                SpeedLimiting = intent.Current.ToString(),
-                ConstrainHandle = blockerHandle,
-                ConstrainKind = "TrafficVehicle",
-                ConstrainS = blockerDist,
-                MinPredClearance = 999f,
-                MeanSpeed = Mean(prof),
-                MinSpeed = Min(prof, cruise),
-                RequiredDecel = 0f,
-                CandidateIndex = side > 0 ? 1 : -1,
-                FirstTangentErrDeg = firstTang,
-                RouteHeadErrDeg = headErr,
-            };
-            hasCurrent = true;
-            return new ManeuverCommand
-            {
-                Path = new List<Vector3>(path),
-                StationS = new List<float>(ss),
-                SpeedProfile = new List<float>(prof),
-                AimPoint = current.AimPoint,
-                TargetSpeed = targetNow,
-                Style = style,
-                Reason = intent.Current.ToString(),
+                Reason = limit,
                 Reverse = false,
             };
         }
@@ -739,15 +740,14 @@ namespace StreetRacing.Race
         {
             try
             {
-                string key = intent.Current + "|" + TargetSpeed.ToString("F0") + "|" + SpeedLimit;
+                string key = joinState + "|" + TargetSpeed.ToString("F0") + "|" + SpeedLimit;
                 if (key != lastIntentLog || now - lastIntentLogMs > 4000)
                 {
                     lastIntentLog = key;
                     lastIntentLogMs = now;
                     var c = hasCurrent ? current : new TrajectoryCandidate();
                     telemetry?.Event(t, "INTENT",
-                        $"intent={intent.Current};why={intent.Reason};held={intent.HeldS(now):F1}s;"
-                        + $"lat={c.LateralM:F1};v={TargetSpeed:F1};lim={SpeedLimit};"
+                        $"intent={joinState};desRoad={desiredRoadSpeed:F1};cmd={commandedSpeed:F1};v={TargetSpeed:F1};lim={SpeedLimit};"
                         + $"egoHead={lastEgoHeading:F0};routeHead={route.RouteHeadingDeg:F0};"
                         + $"headErr={route.HeadingErrorDeg:F0};firstTang={c.FirstTangentErrDeg:F1};"
                         + $"maxKappa={c.MaxKappa:F4};s={route.AlongS:F0};{route.LocDetail}");
@@ -784,36 +784,21 @@ namespace StreetRacing.Race
             catch { }
             lastSlipDeg = slip;
 
-            float displacement = RaceMath.FlatDistance(egoPos, lastPos);
-            float expected = (Math.Abs(egoSpeed) + Math.Abs(lastSpeed)) * 0.5f * dtS;
-            float health = -1f;
-            float healthDrop = 0f;
+            // Capability learning WITHOUT ImpactClassifier-driven behavior:
+            // gate only on the capability's own stability (slip/yaw) and sane
+            // dt/speed. No Crashed/recovery coupling here.
             try
             {
-                health = vehicle.HealthFloat;
-                if (lastHealth > 0f) healthDrop = lastHealth - health;
+                if (egoSpeed > 4f)
+                    capability.Observe(accel, latA, egoSpeed, dtS, yawRate, slip);
             }
             catch { }
-            bool collided = false;
-            try { collided = vehicle.HasCollided; } catch { }
-            var kind = ImpactClassifier.Classify(accel, dtS, displacement, expected, healthDrop, collided, egoSpeed);
-            if ((kind == SampleKind.Impact || kind == SampleKind.Teleport) && now - lastImpactEventMs > 1500)
+            try
             {
-                lastImpactEventMs = now;
-                try
-                {
-                    if (kind == SampleKind.Impact)
-                        telemetry?.Event(now - t0, "IMPACT", $"dec={accel:F0};spd={egoSpeed:F0};dmg={healthDrop:F0};slip={slip:F0};yaw={yawRate:F2}");
-                    else
-                        telemetry?.Event(now - t0, "TELEPORT", $"moved={displacement:F0};exp={expected:F0};spd={egoSpeed:F0}");
-                }
-                catch { }
+                float h = vehicle.HealthFloat;
+                if (h >= 0f) lastHealth = h;
             }
-            if (kind == SampleKind.Normal || kind == SampleKind.Braking)
-            {
-                try { capability.Observe(accel, latA, egoSpeed, dtS, yawRate, slip); } catch { }
-            }
-            if (health >= 0f) lastHealth = health;
+            catch { }
         }
 
         private void WriteSample(int t, Vector3 egoPos, float egoSpeed)
@@ -825,13 +810,23 @@ namespace StreetRacing.Race
                 float curv = route.CurvatureAhead(80f);
                 var c = hasCurrent ? current : new TrajectoryCandidate();
                 var pe = actuator != null ? actuator.LastError : new PathFollowingError();
-                telemetry.Sample(t, style, intent.Current.ToString(),
+                // Local pursuit point Direct is actually chasing (sEgo + ld on
+                // the persistent reference), not the distant final aim.
+                // For TRACK this is ~route.PointAtS(AlongS + ld) when aligned.
+                Vector3 lookPt = Vector3.Zero;
+                try
+                {
+                    float ld = pe.Valid ? pe.LookaheadM : RaceMath.Clamp(6f + egoSpeed * 0.7f, 8f, 28f);
+                    lookPt = route.PointAtS(route.AlongS + ld);
+                }
+                catch { try { lookPt = hasCurrent ? current.AimPoint : egoPos; } catch { } }
+                telemetry.Sample(t, style, joinState,
                     route.AlongS, route.Progress01, LookaheadM,
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
                     c.LateralM, c.Score, 0f, 0f,
-                    TargetSpeed, egoSpeed, SpeedLimit ?? "Cruise", 0f,
-                    capability.ABrakeMax, capability.ALatMax, blockerHandle != 0 ? 1 : 0,
-                    blockerHandle != 0 ? blockerDist : 999f, 999f, 0f,
+                    commandedSpeed, egoSpeed, SpeedLimit ?? "Cruise", 0f,
+                    capability.ABrakeMax, capability.ALatMax, 0,
+                    999f, 999f, 0f,
                     actuator.CurrentCruise, actuator.CurrentStyle,
                     route.IsLost ? 1 : 0, "Normal",
                     actuator.ReissueCount, FinishGap,
@@ -845,9 +840,10 @@ namespace StreetRacing.Race
                     c.ConstrainHandle, c.ConstrainKind ?? "", c.ConstrainS,
                     c.MinPredClearance, maneuverPlanId,
                     pe.Valid ? pe.SteerDeg : 0f, pe.Valid ? pe.Throttle01 : 0f,
-                    pe.Valid ? pe.Brake01 : 0f, pe.Valid ? pe.LocalTargetMps : TargetSpeed,
+                    pe.Valid ? pe.Brake01 : 0f, pe.Valid ? pe.LocalTargetMps : commandedSpeed,
                     lastEgoHeading, route.RouteHeadingDeg, c.FirstTangentErrDeg,
-                    route.ExpectedS, route.LocJumpM);
+                    route.ExpectedS, route.LocJumpM,
+                    desiredRoadSpeed, commandedSpeed, lookPt.X, lookPt.Y, joinState);
             }
             catch { }
         }
@@ -902,11 +898,6 @@ namespace StreetRacing.Race
             float m = float.MaxValue;
             foreach (var x in v) if (x < m) m = x;
             return m;
-        }
-
-        private static int SafeHandle(Entity e)
-        {
-            try { return e.Handle; } catch { return 0; }
         }
 
         private static float SafeHeading(Vehicle v)
