@@ -65,6 +65,9 @@ namespace StreetRacing.Control
             HasPlan = false;
             hasManeuver = false;
             ReissueCount = 0;
+            planId = 0;
+            cmd = new ManeuverCommand();
+            LastError = new PathFollowingError { Valid = false };
             speedInt = 0f;
             lastSteer = 0f;
             lastThr = 0f;

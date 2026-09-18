@@ -30,6 +30,22 @@ namespace StreetRacing.Debug
             float lookaheadM,
             float targetSpeed)
         {
+            Draw(route, corridor, traj, perception, speedPlan, egoPos,
+                new Vector3(0f, 1f, 0f), egoSpeed, lookaheadM, targetSpeed);
+        }
+
+        public void Draw(
+            RaceRoute route,
+            RoadCorridor corridor,
+            TrajectoryPlanner traj,
+            Perception perception,
+            SpeedPlanner speedPlan,
+            Vector3 egoPos,
+            Vector3 egoFwd,
+            float egoSpeed,
+            float lookaheadM,
+            float targetSpeed)
+        {
             if (!Enabled) return;
             try
             {
@@ -38,6 +54,40 @@ namespace StreetRacing.Debug
                 DrawCandidates(traj);
                 DrawActors(perception, egoSpeed);
                 DrawAimAndBraking(route, traj, speedPlan);
+                DrawEgoPose(egoPos, egoFwd, route, traj);
+            }
+            catch { }
+        }
+
+        private static void DrawEgoPose(Vector3 egoPos, Vector3 egoFwd, RaceRoute route, TrajectoryPlanner traj)
+        {
+            try
+            {
+                Vector3 fwd = RaceMath.FlatNormalize(new Vector3(egoFwd.X, egoFwd.Y, 0f));
+                var tip = new Vector3(egoPos.X + fwd.X * 22f, egoPos.Y + fwd.Y * 22f, egoPos.Z);
+                World.DrawLine(
+                    new Vector3(egoPos.X, egoPos.Y, egoPos.Z + 1.2f),
+                    new Vector3(tip.X, tip.Y, tip.Z + 1.2f),
+                    System.Drawing.Color.FromArgb(230, 255, 255, 255));
+                // Selected route tangent at ego (magenta): when this is
+                // sideways from the white nose line on a straight road, the
+                // race must not start — localization is wrong.
+                if (route != null && route.Built)
+                {
+                    Vector3 td = route.RouteTangentDir;
+                    try { td = RaceMath.FlatNormalize(new Vector3(td.X, td.Y, 0f)); } catch { }
+                    if (RaceMath.FlatLength(td) > 0.1f)
+                    {
+                        var tTip = new Vector3(egoPos.X + td.X * 18f, egoPos.Y + td.Y * 18f, egoPos.Z);
+                        World.DrawLine(
+                            new Vector3(egoPos.X, egoPos.Y, egoPos.Z + 1.1f),
+                            new Vector3(tTip.X, tTip.Y, tTip.Z + 1.1f),
+                            System.Drawing.Color.FromArgb(230, 255, 0, 255));
+                    }
+                }
+                // First candidate tangent is already visible as the initial
+                // direction of each gray/cyan path: all must begin FORWARD
+                // from the rival and gently spread laterally.
             }
             catch { }
         }

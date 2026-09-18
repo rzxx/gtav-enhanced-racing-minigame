@@ -16,10 +16,13 @@ namespace StreetRacing
     ///   2) Connected fallback walk (street-snapped stepping toward finish).
     ///   3) Straight origin->finish (last resort, still tracked for progress).
     ///
-    /// Why not DriveTo(finish) directly: a 2 km target lets GTA pick either
-    /// carriageway at splits and silently drop the route when the target is
-    /// unreachable from the current lane. We track a local corridor instead
-    /// and always command a short-horizon aim point on the correct side.
+    /// Localization invariant (this pass):
+    ///   Normal tracking answers "which segment near where I was last tick
+    ///   am I on?", NOT "which nearby segment is spatially closest?".
+    ///   Candidates are scored by distance + heading compatibility +
+    ///   continuity around the expected station (predicted from vehicle
+    ///   motion). Large AlongS jumps while the car barely moves are
+    ///   projection jumps, not motion, and are rejected unless recovering.
     internal sealed class RaceRoute
     {
         public readonly List<Vector3> Points = new List<Vector3>();
@@ -44,33 +47,79 @@ namespace StreetRacing
         public int LastProgressMs;
         public float FinishGapEuclid;
 
+        // --- Continuity-aware localization diagnostics / state.
+        // Heading compatibility: normal tracking requires approximately
+        // forward-aligned tangents. dot(routeDir, egoFwd) > 0.5  <=>  <60 deg.
+        public const float SameDirDotMin = 0.5f;
+        // Normal racing planning is invalid beyond ~50 deg. Severe beyond 60.
+        public const float PlanInvalidHeadErrDeg = 50f;
+        public const float SevereHeadErrDeg = 60f;
+        public const float LostHeadErrDeg = 65f;
+
+        public float PrevAlongS;
+        public float ExpectedS;
+        public int LastUpdateMs = -1;
+        public float LastUpdateDtS = 0.1f;
+        public string LocDetail = "";
+        public float LocBestScore = 999f;
+        public float LocSecondScore = 999f;
+        public bool LocAmbiguous;
+        public float LocJumpM;
+        public float RouteHeadingDeg;
+        public Vector3 RouteTangentDir = new Vector3(0f, 1f, 0f);
+
+        public bool PlanInvalid => Math.Abs(HeadingErrorDeg) > PlanInvalidHeadErrDeg;
+        public bool HeadingSevere => Math.Abs(HeadingErrorDeg) > SevereHeadErrDeg;
+
         private float lastHeadingForCircle;
         private float circleAccumDeg;
         private bool hasLastHeading;
         private Vector3 finish = Vector3.Zero;
+        private int headingInvalidSinceMs = -100000;
 
         public Vector3 Finish => finish;
 
-        public void Build(Vector3 origin, Vector3 finishIn)
+        public void Reset()
         {
             Points.Clear();
             CumulativeS.Clear();
             TotalLength = 0f;
             Built = false;
-            finish = finishIn;
+            Source = "None";
+            GpsSamples = 0;
             NearestIndex = 0;
             AlongS = 0f;
             MaxS = 0f;
             Lateral = 0f;
-            DistToRoute = RaceMath.FlatDistance(origin, finishIn);
+            DistToRoute = 999f;
             HeadingErrorDeg = 0f;
             IsLost = false;
             LossReason = "";
+            LostSinceMs = 0;
+            LastProgressMs = 0;
+            FinishGapEuclid = 0f;
+            PrevAlongS = 0f;
+            ExpectedS = 0f;
+            LastUpdateMs = -1;
+            LastUpdateDtS = 0.1f;
+            LocDetail = "";
+            LocBestScore = 999f;
+            LocSecondScore = 999f;
+            LocAmbiguous = false;
+            LocJumpM = 0f;
+            RouteHeadingDeg = 0f;
+            RouteTangentDir = new Vector3(0f, 1f, 0f);
             hasLastHeading = false;
             circleAccumDeg = 0f;
+            headingInvalidSinceMs = -100000;
+        }
+
+        public void Build(Vector3 origin, Vector3 finishIn)
+        {
+            Reset();
+            finish = finishIn;
+            DistToRoute = RaceMath.FlatDistance(origin, finishIn);
             LastProgressMs = Game.GameTime;
-            Source = "None";
-            GpsSamples = 0;
 
             // 1) Real connected GPS route first.
             try
@@ -122,16 +171,7 @@ namespace StreetRacing
         /// before the GPS route existed (blip route takes a frame or two to
         /// compute). Returns true when an upgrade happened.
         /// Invariant: switching FallbackWalk-&gt;GPS must NOT redefine
-        /// progress/heading underneath the planner. The old code reset
-        /// AlongS=0/NearestIndex=0 without reprojecting, so the next plan
-        /// built from s=0 (route behind ego) with a flipped heading
-        /// (&gt;90 deg error) while the actuator still held the old maneuver.
-        /// This version reprojects ego cleanly onto the NEW polyline (full
-        /// search), resets the high-water mark to the new projection, clears
-        /// circling/lost state, and returns an old/new diagnostic string the
-        /// caller must log + use to invalidate the old maneuver (force replan
-        /// + actuator reissue same tick). Prefer GPS before Start (see
-        /// StreetRacing arming); this is the safe fallback when it arrives late.
+        /// progress/heading underneath the planner.
         public bool TryUpgradeToGps(Vector3 egoPos)
         {
             string dummy;
@@ -145,7 +185,6 @@ namespace StreetRacing
             try
             {
                 if (Built && Source.StartsWith("Gps")) return false;
-                // Snapshot old tracking for the upgrade log (setup-failure evidence).
                 float oldS = AlongS;
                 float oldMax = MaxS;
                 float oldLat = Lateral;
@@ -157,9 +196,6 @@ namespace StreetRacing
                 try { oldHead = HeadingAtS(oldS); } catch { }
                 List<Vector3> gps;
                 string how;
-                // Use current ego pos as origin hint for validation, but keep
-                // original start anchored: prepend existing start if GPS starts
-                // ahead of us.
                 if (!TryBuildFromGps(Points.Count > 0 ? Points[0] : egoPos, finish, out gps, out how))
                     return false;
                 if (gps == null || gps.Count < 2) return false;
@@ -168,8 +204,11 @@ namespace StreetRacing
                 Source = how;
                 GpsSamples = gps.Count;
                 FinalizeGeometry();
-                // Clean reproject onto the NEW geometry (full search, not the
-                // windowed Update): ego never jumps to s=0.
+                // Clean reproject onto the NEW geometry: require a
+                // forward-compatible segment (dot > 0.5). Never accept a
+                // sideways projection as healthy and never silently jump to
+                // s=0. If no forward-compatible segment exists, reject the
+                // upgrade (caller keeps the old route).
                 try
                 {
                     int bestSeg = -1;
@@ -184,7 +223,9 @@ namespace StreetRacing
                             var a = Points[i];
                             var b = Points[i + 1];
                             var segDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
-                            if (pass == 0 && RaceMath.FlatDot(segDir, egoFwd) < -0.1f) continue;
+                            float dot = RaceMath.FlatDot(segDir, egoFwd);
+                            if (pass == 0 && dot <= SameDirDotMin) continue;
+                            if (pass == 1 && dot <= 0f) continue;
                             var pr = RaceMath.ProjectOnSegment(egoPos, a, b);
                             if (pr.Dist < bestDist)
                             {
@@ -201,33 +242,36 @@ namespace StreetRacing
                     {
                         NearestIndex = bestSeg;
                         AlongS = CumulativeS[bestSeg] + bestPr.Along;
+                        PrevAlongS = AlongS;
+                        ExpectedS = AlongS;
                         DistToRoute = bestPr.Dist;
                         Lateral = RaceMath.FlatCross(bestDir, new Vector3(egoPos.X - bestPr.Closest.X, egoPos.Y - bestPr.Closest.Y, 0f));
                         float newHead = RaceMath.HeadingFromVector(bestDir);
                         HeadingErrorDeg = RaceMath.HeadingDiffDeg(newHead, egoHeadingDeg);
+                        RouteHeadingDeg = newHead;
+                        RouteTangentDir = bestDir;
+                        LocBestScore = bestDist;
+                        LocSecondScore = 999f;
+                        LocAmbiguous = false;
+                        LocJumpM = 0f;
+                        LocDetail = $"upgrade seg={bestSeg} s={AlongS:F1} dist={bestDist:F1} headErr={HeadingErrorDeg:F0}";
                     }
                     else
                     {
-                        NearestIndex = 0;
-                        AlongS = 0f;
-                        DistToRoute = 999f;
-                        Lateral = 0f;
-                        HeadingErrorDeg = 0f;
+                        return false;
                     }
                 }
                 catch
                 {
-                    NearestIndex = 0;
-                    AlongS = 0f;
+                    return false;
                 }
-                // New geometry has incomparable arclength: reset high-water to
-                // the fresh projection so WentBackwards/NoProgress cannot trip
-                // on old-route mileage. Clear circling + lost (re-evaluated).
                 MaxS = AlongS;
                 LastProgressMs = nowMs;
+                LastUpdateMs = nowMs;
                 FinishGapEuclid = RaceMath.FlatDistance(egoPos, finish);
                 hasLastHeading = false;
                 circleAccumDeg = 0f;
+                headingInvalidSinceMs = -100000;
                 IsLost = false;
                 LossReason = "";
                 float newHeadAt = 0f;
@@ -272,6 +316,12 @@ namespace StreetRacing
         //        most likely distance-along-route in meters. We probe distance
         //        first, then index fallback, and validate geometrically so a
         //        wrong interpretation can never silently corrupt the route.
+        //
+        // Geometry: sample densely (~5 m) so interpolation never cuts city
+        // junctions/bends into bad tangents. Expensive downstream systems may
+        // resample/coarsen separately. Type 1 (mission/blip driving route) is
+        // tried first and wins when plausible; alternates are only probed when
+        // type 1 fails validation.
         // ------------------------------------------------------------------
         private static bool TryBuildFromGps(Vector3 origin, Vector3 finishIn,
             out List<Vector3> pts, out string how)
@@ -287,24 +337,20 @@ namespace StreetRacing
             try { routeLen = Function.Call<int>(Hash.GET_GPS_BLIP_ROUTE_LENGTH); }
             catch { routeLen = 0; }
 
-            // Candidate route types to try in order. 1 first: in practice the
-            // driving route renders as type 1; 0/2 are alternates.
             int[] types = { 1, 0, 2 };
             foreach (int t in types)
             {
-                // Interpretation A: p2 = distance along route (meters).
                 var byDist = SampleGpsByDistance(origin, finishIn, routeLen, t);
                 if (IsPlausibleRoute(byDist, origin, finishIn))
                 {
-                    pts = ResamplePolyline(byDist, 18f);
+                    pts = ResamplePolyline(byDist, 5f);
                     how = "GpsDist(t" + t + ")";
                     return true;
                 }
-                // Interpretation B: p2 = node index 0..len-1.
                 var byIdx = SampleGpsByIndex(origin, finishIn, routeLen, t);
                 if (IsPlausibleRoute(byIdx, origin, finishIn))
                 {
-                    pts = ResamplePolyline(byIdx, 18f);
+                    pts = ResamplePolyline(byIdx, 5f);
                     how = "GpsIdx(t" + t + ")";
                     return true;
                 }
@@ -315,10 +361,9 @@ namespace StreetRacing
         private static List<Vector3> SampleGpsByDistance(Vector3 origin, Vector3 finishIn, int routeLen, int type)
         {
             var outPts = new List<Vector3>();
-            // Upper bound: route length if it looks like meters, else 9 km cap.
             float maxD = 9000f;
             if (routeLen > 200 && routeLen < 15000) maxD = routeLen + 400f;
-            float step = 25f;
+            float step = 5f;
             int failStreak = 0;
             Vector3 last = Vector3.Zero;
             bool haveLast = false;
@@ -327,11 +372,10 @@ namespace StreetRacing
                 Vector3 p;
                 if (!TryGpsPos(true, d, type, out p))
                 {
-                    // Also try p1=false once before giving up on this station.
                     if (!TryGpsPos(false, d, type, out p))
                     {
                         failStreak++;
-                        if (failStreak >= 6 && outPts.Count >= 4) break;
+                        if (failStreak >= 12 && outPts.Count >= 4) break;
                         if (d > 1500f && outPts.Count < 3) break;
                         continue;
                     }
@@ -341,15 +385,14 @@ namespace StreetRacing
                 if (haveLast)
                 {
                     float gap = RaceMath.FlatDistance(last, p);
-                    if (gap < 4f) continue;          // duplicate sample
-                    if (gap > 400f) break;           // jumped (wrong type?) — stop
+                    if (gap < 1.5f) continue;
+                    if (gap > 400f) break;
                 }
                 outPts.Add(p);
                 last = p;
                 haveLast = true;
-                // Stop once we reach the finish neighbourhood.
                 if (RaceMath.FlatDistance(p, finishIn) < 35f && outPts.Count > 4) break;
-                if (outPts.Count > 420) break;
+                if (outPts.Count > 1200) break;
             }
             return outPts;
         }
@@ -365,7 +408,7 @@ namespace StreetRacing
                 if (p == Vector3.Zero) continue;
                 if (outPts.Count > 0 && RaceMath.FlatDistance(outPts[outPts.Count - 1], p) < 2f) continue;
                 outPts.Add(p);
-                if (outPts.Count > 600) break;
+                if (outPts.Count > 1200) break;
             }
             return outPts;
         }
@@ -389,12 +432,8 @@ namespace StreetRacing
         private static bool IsPlausibleRoute(List<Vector3> pts, Vector3 origin, Vector3 finishIn)
         {
             if (pts == null || pts.Count < 5) return false;
-            // Must start near origin and end near finish (GPS is player-centric;
-            // allow generous tolerance since rival starts near player).
             float dStart = RaceMath.FlatDistance(pts[0], origin);
             float dEnd = RaceMath.FlatDistance(pts[pts.Count - 1], finishIn);
-            // Also accept routes whose closest approach is near (route may start
-            // slightly ahead of us on the road network).
             float closestStart = float.MaxValue;
             float closestEnd = float.MaxValue;
             for (int i = 0; i < Math.Min(pts.Count, 12); i++)
@@ -403,8 +442,6 @@ namespace StreetRacing
                 closestEnd = Math.Min(closestEnd, RaceMath.FlatDistance(pts[i], finishIn));
             if (Math.Min(dStart, closestStart) > 220f) return false;
             if (Math.Min(dEnd, closestEnd) > 260f) return false;
-            // Total length sanity: must be >= straight-line * 0.7 (not a stub)
-            // and <= straight-line * 4 + 1500 (not a spiral).
             float straight = RaceMath.FlatDistance(origin, finishIn);
             float len = 0f;
             for (int i = 1; i < pts.Count; i++) len += RaceMath.FlatDistance(pts[i - 1], pts[i]);
@@ -412,6 +449,79 @@ namespace StreetRacing
             if (len > straight * 4f + 1500f) return false;
             if (len < 60f) return false;
             return true;
+        }
+
+        /// LOCAL START validity: global plausibility (start-near / end-near /
+        /// length) is not enough. Before accepting a route for a rival,
+        /// verify near the rival there is a close forward-compatible
+        /// projection and the first tens of meters form a continuous forward
+        /// path with no absurd immediate branch/turn.
+        public bool ValidateStart(Vector3 egoPos, float egoHeadingDeg, out string reason)
+        {
+            reason = "not-built";
+            try
+            {
+                if (!Built || Points.Count < 2) return false;
+                var egoFwd = RaceMath.VectorFromHeading(egoHeadingDeg);
+                int bestSeg = -1;
+                float bestScore = float.MaxValue;
+                float bestDist = float.MaxValue;
+                Vector3 bestDir = new Vector3(0f, 1f, 0f);
+                float bestS = 0f;
+                for (int i = 0; i < Points.Count - 1; i++)
+                {
+                    var a = Points[i];
+                    var b = Points[i + 1];
+                    var segDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                    float dot = RaceMath.FlatDot(segDir, egoFwd);
+                    if (dot <= SameDirDotMin) continue;
+                    var pr = RaceMath.ProjectOnSegment(egoPos, a, b);
+                    float score = pr.Dist + (1f - dot) * 12f;
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestSeg = i;
+                        bestDist = pr.Dist;
+                        bestDir = segDir;
+                        bestS = CumulativeS[i] + pr.Along;
+                    }
+                }
+                if (bestSeg < 0) { reason = "no-fwd-segment"; return false; }
+                if (bestDist > 20f) { reason = $"too-far dist={bestDist:F1} seg={bestSeg}"; return false; }
+                float routeHead = RaceMath.HeadingFromVector(bestDir);
+                float headErr = Math.Abs(RaceMath.HeadingDiffDeg(routeHead, egoHeadingDeg));
+                if (headErr > 45f) { reason = $"head-err {headErr:F0} seg={bestSeg} dist={bestDist:F1}"; return false; }
+                float h0 = HeadingAtS(bestS);
+                float h1 = HeadingAtS(bestS + 10f);
+                float h2 = HeadingAtS(bestS + 20f);
+                float h3 = HeadingAtS(bestS + 30f);
+                if (Math.Abs(RaceMath.HeadingDiffDeg(h1, h0)) > 35f ||
+                    Math.Abs(RaceMath.HeadingDiffDeg(h2, h0)) > 45f ||
+                    Math.Abs(RaceMath.HeadingDiffDeg(h3, h0)) > 60f)
+                {
+                    reason = $"immediate-branch h0={h0:F0} h1={h1:F0} h2={h2:F0} h3={h3:F0}";
+                    return false;
+                }
+                for (int k = 1; k <= 3; k++)
+                {
+                    float d = k * 10f;
+                    Vector3 pt = PointAtS(bestS + d);
+                    var to = new Vector3(pt.X - egoPos.X, pt.Y - egoPos.Y, 0f);
+                    if (RaceMath.FlatLength(to) < 2f) continue;
+                    float bearing = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(to));
+                    float bErr = Math.Abs(RaceMath.HeadingDiffDeg(bearing, egoHeadingDeg));
+                    if (bErr > 70f) { reason = $"not-forward d={d:F0} bErr={bErr:F0}"; return false; }
+                }
+                float curv = CurvatureAtS(bestS + 15f, 30f);
+                if (curv > 0.08f) { reason = $"sharp-start curv={curv:F3}"; return false; }
+                reason = $"ok seg={bestSeg} s={bestS:F0} dist={bestDist:F1} headErr={headErr:F0} h0={h0:F0}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { reason = "exc:" + ex.Message; } catch { }
+                return false;
+            }
         }
 
         private static List<Vector3> ResamplePolyline(List<Vector3> src, float step)
@@ -490,23 +600,49 @@ namespace StreetRacing
             if (!Built || Points.Count < 2) return;
             FinishGapEuclid = RaceMath.FlatDistance(egoPos, finish);
 
-            // Nearest-segment search in a window around the last index (fast
-            // path). Full search when lost or when the window finds nothing
-            // close — keeps splits cheap but recoverable.
+            float prevS = AlongS;
+            float dtS = 0.1f;
+            if (LastUpdateMs >= 0)
+            {
+                dtS = (nowMs - LastUpdateMs) / 1000f;
+                if (dtS < 0f) dtS = 0f;
+                if (dtS > 0.6f) dtS = 0.6f;
+            }
+            LastUpdateDtS = dtS;
+
+            // Predicted progress from vehicle motion along the previous
+            // route tangent. Sideways motion predicts ~0 forward progress.
+            float cosF = 1f;
+            try
+            {
+                float e = Math.Abs(HeadingErrorDeg) * (float)Math.PI / 180f;
+                if (e > 1.2f) e = 1.2f;
+                cosF = (float)Math.Cos(e);
+                if (cosF < 0f) cosF = 0f;
+            }
+            catch { cosF = 1f; }
+            float expectedS = prevS + Math.Max(0f, speed) * dtS * cosF;
+            ExpectedS = expectedS;
+            PrevAlongS = prevS;
+
+            var egoFwd = RaceMath.VectorFromHeading(egoHeadingDeg);
+
+            int lo, hi;
+            bool fullSearch = IsLost || LastUpdateMs < 0;
+            if (fullSearch) { lo = 0; hi = Points.Count - 2; }
+            else
+            {
+                lo = Math.Max(0, NearestIndex - 2);
+                hi = Math.Min(Points.Count - 2, NearestIndex + 6);
+            }
+
             int bestSeg = -1;
             float bestDist = float.MaxValue;
+            float bestScore = float.MaxValue;
+            float secondScore = float.MaxValue;
             RaceMath.Projection bestProj = new RaceMath.Projection();
             Vector3 bestDir = new Vector3(0f, 1f, 0f);
 
-            int lo = Math.Max(0, NearestIndex - 3);
-            int hi = Math.Min(Points.Count - 2, NearestIndex + 12);
-            // When lost, search everything.
-            bool fullSearch = IsLost;
-            if (fullSearch) { lo = 0; hi = Points.Count - 2; }
-
-            // Two-pass: prefer same-direction segments near carriageway splits
-            // so we don't snap across to the opposite carriageway.
-            var egoFwd = RaceMath.VectorFromHeading(egoHeadingDeg);
             for (int pass = 0; pass < 2; pass++)
             {
                 for (int i = lo; i <= hi; i++)
@@ -514,40 +650,128 @@ namespace StreetRacing
                     var a = Points[i];
                     var b = Points[i + 1];
                     var segDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
-                    if (pass == 0)
-                    {
-                        // Pass 0: same-direction segments only.
-                        if (RaceMath.FlatDot(segDir, egoFwd) < -0.1f) continue;
-                    }
+                    float dot = RaceMath.FlatDot(segDir, egoFwd);
+                    if (pass == 0 && dot <= SameDirDotMin) continue;
+                    if (pass == 1 && dot <= 0f) continue;
                     var pr = RaceMath.ProjectOnSegment(egoPos, a, b);
-                    if (pr.Dist < bestDist)
+                    float s = CumulativeS[i] + pr.Along;
+                    float cont = Math.Abs(s - expectedS) * 0.8f;
+                    float headPen = (1f - dot) * 12f;
+                    float score = pr.Dist + headPen + cont;
+                    if (score < bestScore)
                     {
+                        secondScore = bestScore;
+                        bestScore = score;
                         bestDist = pr.Dist;
                         bestSeg = i;
                         bestProj = pr;
                         bestDir = segDir;
                     }
+                    else if (score < secondScore)
+                    {
+                        secondScore = score;
+                    }
                 }
-                if (bestSeg >= 0 && bestDist < 60f) break; // good enough, keep direction bias
+                if (bestSeg >= 0 && bestDist < 60f) break;
                 if (pass == 0)
                 {
                     bestSeg = -1;
                     bestDist = float.MaxValue;
+                    bestScore = float.MaxValue;
+                    secondScore = float.MaxValue;
                 }
             }
 
             if (bestSeg < 0)
             {
-                SetLost(nowMs, "NoSegment", speed);
+                LocDetail = $"no-fwd-seg prev={prevS:F1} exp={expectedS:F1}";
+                LocBestScore = 999f;
+                LocSecondScore = 999f;
+                LocAmbiguous = false;
+                LastUpdateMs = nowMs;
+                SetLost(nowMs, "NoFwdSegment", speed);
                 return;
             }
 
+            float newS = CumulativeS[bestSeg] + bestProj.Along;
+
+            // Jump guard: normal tracking must not jump many meters to another
+            // nearby segment while the car barely moves. If the winner is far
+            // from expected, prefer the best candidate inside the continuity
+            // window when one exists at reasonable distance.
+            if (!fullSearch && Math.Abs(newS - expectedS) > 12f)
+            {
+                int inSeg = -1;
+                float inDist = float.MaxValue;
+                float inScore = float.MaxValue;
+                float inSecond = float.MaxValue;
+                RaceMath.Projection inProj = new RaceMath.Projection();
+                Vector3 inDir = bestDir;
+                for (int i = lo; i <= hi; i++)
+                {
+                    var a = Points[i];
+                    var b = Points[i + 1];
+                    var segDir = RaceMath.FlatNormalize(new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                    float dot = RaceMath.FlatDot(segDir, egoFwd);
+                    if (dot <= SameDirDotMin) continue;
+                    var pr = RaceMath.ProjectOnSegment(egoPos, a, b);
+                    float s = CumulativeS[i] + pr.Along;
+                    if (Math.Abs(s - expectedS) > 12f) continue;
+                    float score = pr.Dist + (1f - dot) * 12f + Math.Abs(s - expectedS) * 0.8f;
+                    if (score < inScore)
+                    {
+                        inSecond = inScore;
+                        inScore = score;
+                        inDist = pr.Dist;
+                        inSeg = i;
+                        inProj = pr;
+                        inDir = segDir;
+                    }
+                    else if (score < inSecond) inSecond = score;
+                }
+                if (inSeg >= 0 && inDist < 45f)
+                {
+                    LocDetail = $"jump-reject winS={newS:F1}->inS={CumulativeS[inSeg] + inProj.Along:F1} prev={prevS:F1} exp={expectedS:F1} winDist={bestDist:F1} inDist={inDist:F1}";
+                    bestSeg = inSeg;
+                    bestDist = inDist;
+                    bestProj = inProj;
+                    bestDir = inDir;
+                    bestScore = inScore;
+                    secondScore = inSecond;
+                    newS = CumulativeS[bestSeg] + bestProj.Along;
+                }
+                else
+                {
+                    LocDetail = $"jump-no-inside winS={newS:F1} prev={prevS:F1} exp={expectedS:F1} dist={bestDist:F1} HOLD+LOST";
+                    LocBestScore = bestScore;
+                    LocSecondScore = secondScore;
+                    LocAmbiguous = (secondScore - bestScore) < 4f;
+                    LocJumpM = newS - prevS;
+                    LastUpdateMs = nowMs;
+                    SetLost(nowMs, "LocJump", speed);
+                    return;
+                }
+            }
+
             NearestIndex = bestSeg;
-            AlongS = CumulativeS[bestSeg] + bestProj.Along;
-            DistToRoute = bestProj.Dist;
+            AlongS = newS;
+            LocJumpM = AlongS - prevS;
+            LocBestScore = bestScore;
+            LocSecondScore = secondScore;
+            LocAmbiguous = (secondScore - bestScore) < 4f;
+            DistToRoute = bestDist;
             Lateral = RaceMath.FlatCross(bestDir, new Vector3(egoPos.X - bestProj.Closest.X, egoPos.Y - bestProj.Closest.Y, 0f));
             float routeHeading = RaceMath.HeadingFromVector(bestDir);
             HeadingErrorDeg = RaceMath.HeadingDiffDeg(routeHeading, egoHeadingDeg);
+            RouteHeadingDeg = routeHeading;
+            RouteTangentDir = bestDir;
+            LastUpdateMs = nowMs;
+            try
+            {
+                float dotBest = RaceMath.FlatDot(bestDir, egoFwd);
+                LocDetail = $"seg={bestSeg} s={AlongS:F1} prev={prevS:F1} exp={expectedS:F1} jump={LocJumpM:F1} dist={bestDist:F1} dot={dotBest:F2} headErr={HeadingErrorDeg:F0} scores={bestScore:F1}/{secondScore:F1}{(LocAmbiguous ? ";AMBIG" : "")}";
+            }
+            catch { LocDetail = $"seg={bestSeg} s={AlongS:F1}"; }
 
             if (AlongS > MaxS + 2f)
             {
@@ -555,7 +779,6 @@ namespace StreetRacing
                 LastProgressMs = nowMs;
             }
 
-            // Circling detector: large cumulative heading change without progress.
             if (!hasLastHeading) { lastHeadingForCircle = egoHeadingDeg; hasLastHeading = true; }
             else
             {
@@ -564,20 +787,36 @@ namespace StreetRacing
                 lastHeadingForCircle = egoHeadingDeg;
                 if (AlongS > MaxS - 5f && nowMs - LastProgressMs > 500)
                 {
-                    // Making progress: decay the accumulator.
                     circleAccumDeg *= 0.9f;
                 }
             }
 
+            // Heading-incompatibility persistence: a single sideways sample
+            // must already gate planning (PlanInvalid, checked by the brain),
+            // but IsLost requires ~400 ms of severe misalignment to avoid
+            // flicker inside intersections.
+            float absHead = Math.Abs(HeadingErrorDeg);
+            if (absHead > LostHeadErrDeg && speed > 3f)
+            {
+                if (headingInvalidSinceMs < 0) headingInvalidSinceMs = nowMs;
+            }
+            else if (absHead <= SevereHeadErrDeg)
+            {
+                headingInvalidSinceMs = -100000;
+            }
+
             bool farOff = DistToRoute > Math.Max(28f, corridorHalfWidth + 16f);
-            bool goingAway = Math.Abs(HeadingErrorDeg) > 100f && speed > 8f;
-            bool wentBackwards = (MaxS - AlongS) > 25f;
+            bool goingAway = absHead > 70f && speed > 5f;
+            bool wentBackwards = (MaxS - AlongS) > 20f;
             bool circling = circleAccumDeg > 300f && (nowMs - LastProgressMs) > 6000;
             bool noProgress = (nowMs - LastProgressMs) > 12000 && speed > 6f && (MaxS - AlongS) > -5f
                 && DistToRoute > corridorHalfWidth + 6f;
+            bool headingLost = headingInvalidSinceMs >= 0 && (nowMs - headingInvalidSinceMs) > 400 && absHead > LostHeadErrDeg;
 
             if (farOff)
                 SetLost(nowMs, "AwayFromRoute", speed);
+            else if (headingLost)
+                SetLost(nowMs, "HeadingIncompatible", speed);
             else if (wentBackwards)
                 SetLost(nowMs, "WentBackwards", speed);
             else if (circling)
@@ -592,15 +831,14 @@ namespace StreetRacing
             }
             else
             {
-                // Recovery: re-acquired when close to the line and roughly aligned,
-                // or simply close and moving toward it.
-                bool aligned = Math.Abs(HeadingErrorDeg) < 60f;
-                if (DistToRoute < corridorHalfWidth + 8f && (aligned || speed < 4f))
+                bool aligned = Math.Abs(HeadingErrorDeg) < 45f;
+                if (DistToRoute < corridorHalfWidth + 6f && (aligned || speed < 3f))
                 {
                     IsLost = false;
                     LossReason = "";
                     LastProgressMs = nowMs;
                     circleAccumDeg = 0f;
+                    headingInvalidSinceMs = -100000;
                 }
             }
         }
@@ -615,7 +853,6 @@ namespace StreetRacing
             }
             else
             {
-                // Keep the first reason while lost (more diagnostic than flapping).
                 if (string.IsNullOrEmpty(LossReason)) LossReason = reason;
             }
         }
@@ -626,6 +863,7 @@ namespace StreetRacing
             LossReason = "";
             LastProgressMs = nowMs;
             circleAccumDeg = 0f;
+            headingInvalidSinceMs = -100000;
         }
 
         /// Point on the route `distM` ahead of current AlongS (clamped to finish).
@@ -706,14 +944,12 @@ namespace StreetRacing
             if (!Built || Points.Count < 2) return 0f;
             if (s < 0f) s = 0f;
             if (s >= TotalLength) s = Math.Max(0f, TotalLength - 1f);
-            // Average direction over a small window for stability on dense GPS.
             float w = 12f;
             Vector3 a = PointAtS(Math.Max(0f, s - w * 0.5f));
             Vector3 b = PointAtS(Math.Min(TotalLength, s + w * 0.5f));
             var d = new Vector3(b.X - a.X, b.Y - a.Y, 0f);
             if (RaceMath.FlatLength(d) < 0.5f)
             {
-                // Fall back to raw segment.
                 for (int i = 0; i < CumulativeS.Count - 1; i++)
                 {
                     if (CumulativeS[i + 1] >= s)
@@ -735,7 +971,7 @@ namespace StreetRacing
         public struct RouteProjection
         {
             public float S;
-            public float Lateral; // + = left of route direction
+            public float Lateral;
             public float Dist;
             public int SegIndex;
             public Vector3 Closest;
@@ -776,13 +1012,70 @@ namespace StreetRacing
 
         public float Progress01 => TotalLength > 1f ? RaceMath.Clamp(AlongS / TotalLength, 0f, 1f) : 0f;
 
-        /// Recovery aim: a near route point just ahead of the projection, never
-        /// the distant finish — this is what fixes carriageway-split losses.
+        /// Recovery aim: prefer a heading-compatible future merge station.
+        /// Falls back to a near point ahead (never the distant finish).
         public Vector3 RecoveryTarget()
         {
-            // Aim ~40 m ahead of the nearest point so the actuator rejoins the
-            // route in the correct direction instead of U-turning to the finish.
             return LookaheadPoint(40f);
+        }
+
+        /// Find a future route station that is spatially reachable AND
+        /// heading-compatible for a low-speed merge. Rejects U-turn-like
+        /// merges. Returns false when no sane merge exists (caller must
+        /// stop/crawl instead of commanding a point on the invalid route).
+        public bool TryGetRecoveryMerge(Vector3 egoPos, float egoHeadingDeg,
+            out Vector3 target, out float mergeS, out string detail)
+        {
+            target = LookaheadPoint(40f);
+            mergeS = AlongS + 40f;
+            detail = "none";
+            try
+            {
+                if (!Built || Points.Count < 2) { detail = "not-built"; return false; }
+                float bestScore = float.MaxValue;
+                float bestS = -1f;
+                Vector3 bestPt = target;
+                float bestHeadErr = 999f;
+                float bestBErr = 999f;
+                float bestDist = 999f;
+                float sMax = Math.Min(TotalLength - 2f, AlongS + 150f);
+                for (float s = AlongS + 10f; s <= sMax; s += 5f)
+                {
+                    Vector3 pt = PointAtS(s);
+                    float rh = HeadingAtS(s);
+                    float headErr = Math.Abs(RaceMath.HeadingDiffDeg(rh, egoHeadingDeg));
+                    if (headErr > 45f) continue;
+                    var to = new Vector3(pt.X - egoPos.X, pt.Y - egoPos.Y, 0f);
+                    float dist = RaceMath.FlatLength(to);
+                    if (dist < 1f) continue;
+                    if (dist > 100f) continue;
+                    float bearing = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(to));
+                    float bErr = Math.Abs(RaceMath.HeadingDiffDeg(bearing, egoHeadingDeg));
+                    if (bErr > 65f) continue;
+                    float alongGap = s - AlongS;
+                    if (dist > alongGap + 40f) continue;
+                    float score = headErr * 1.0f + bErr * 0.6f + dist * 0.15f + Math.Max(0f, alongGap - 60f) * 0.2f;
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestS = s;
+                        bestPt = pt;
+                        bestHeadErr = headErr;
+                        bestBErr = bErr;
+                        bestDist = dist;
+                    }
+                }
+                if (bestS < 0f) { detail = "no-compatible-merge"; return false; }
+                target = bestPt;
+                mergeS = bestS;
+                detail = $"s={bestS:F0} headErr={bestHeadErr:F0} bErr={bestBErr:F0} dist={bestDist:F0} score={bestScore:F1}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { detail = "exc:" + ex.Message; } catch { }
+                return false;
+            }
         }
 
         private static Vector3 SnapToStreet(Vector3 p)
@@ -797,8 +1090,7 @@ namespace StreetRacing
         }
 
         /// True road-network distance remaining when the native cooperates;
-        /// falls back to route arclength. Used to spot wrong-carriageway
-        /// situations where Euclid barely moves but travel distance spikes.
+        /// falls back to route arclength.
         public static float TravelDistance(Vector3 a, Vector3 b)
         {
             try

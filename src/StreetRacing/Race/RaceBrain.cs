@@ -91,6 +91,7 @@ namespace StreetRacing.Race
         private TacticalMode lastLoggedTactic = (TacticalMode)(-1);
         private bool lastLoggedLost;
         private string lastLoggedLossReason = "";
+        private bool lastLoggedInvalid;
         private int lastBrakeEventMs = -100000;
         private float lastPathErrLat;
         private float lastPathErrHead;
@@ -103,6 +104,14 @@ namespace StreetRacing.Race
         private float lastChosenSpeed = -1f;
         private string lastChosenLimit = "";
         private bool pendingForceReissue;
+
+        // Localization / recovery logging.
+        private float lastLocLogS = -9999f;
+        private int lastLocLogMs = -100000;
+        private int lastMergeLogMs = -100000;
+        private float lastMergeLogS = -9999f;
+        private Vector3 _lastEgoFwd = new Vector3(0f, 1f, 0f);
+        private float _lastEgoHeading;
 
         // Self-ped diagnosis: handles to correlate Ped@s=0 blockers.
         // Observed clearance -1.6/-1.7m == 0-(1.15+0.45): zero center distance
@@ -133,25 +142,70 @@ namespace StreetRacing.Race
             this.stuckMs = stuckMs;
             t0 = Game.GameTime;
 
+            // --- Full deterministic reset: every race begins clean. RaceBrain
+            // is reused across races; without explicit resets the second race
+            // inherits Crashed/Recovery, PlanId~344, stale tracks, hysteresis.
+            try { route.Reset(); } catch { }
+            try { corridor.Reset(); } catch { }
+            try { perception.Reset(); } catch { }
+            try { traj.Reset(); } catch { }
+            try { speedPlan.Reset(); } catch { }
+            try { tactics.Reset(t0); } catch { }
+
             Vector3 origin;
             try { origin = vehicle.Position; } catch { origin = Game.Player.Character.Position; }
+            float originHeading = SafeHeading(vehicle);
             route.Build(origin, finish);
             capability.Seed(vehicle);
             LookaheadM = this.profile.LookaheadForSpeed(0f);
             corridor.Update(route, origin, LookaheadM, t0);
-            route.Update(origin, SafeHeading(vehicle), 0f, t0, corridor.HalfWidth);
+            route.Update(origin, originHeading, 0f, t0, corridor.HalfWidth);
 
             actuator = useDirect ? (IVehicleActuator)new DirectActuator() : (IVehicleActuator)new GtaDriverActuator();
             actuator.Attach(driver, vehicle, cruise, style, refreshMs, stuckMs);
             viz.Enabled = debugViz;
-            tactics.SinceMs = t0;
 
+            // Kinematics / scheduling / logging: race-local, always reset.
             hasKin = false;
+            lastSpeed = 0f;
+            lastPos = origin;
+            lastVel = new Vector3();
+            lastHeading = originHeading;
+            lastKinT = t0;
             lastHealth = -1f;
+            lastImpact = SampleKind.Normal;
+            lastImpactEventMs = -100000;
+            lastAccelLong = 0f;
+            lastLatAccel = 0f;
+            lastYawRate = 0f;
+            lastSlipDeg = 0f;
+            lastPercMs = 0;
+            lastCorrMs = 0;
+            lastPlanMs = 0;
+            lastTeleMs = 0;
+            lastGpsRetryMs = 0;
+            TargetSpeed = 0f;
+            SpeedLimit = "Cruise";
+            ActualSpeed = 0f;
+            FinishGap = RaceMath.FlatDistance(origin, finish);
+            lastLoggedTactic = (TacticalMode)(-1);
+            lastLoggedLost = false;
+            lastLoggedLossReason = "";
+            lastLoggedInvalid = false;
+            lastBrakeEventMs = -100000;
+            lastPathErrLat = 0f;
+            lastPathErrHead = 0f;
+            lastPathErrLogMs = 0;
             maneuverPlanId = 0;
             lastPlanLogId = -1;
             lastChosenLat = 999f;
+            lastChosenSpeed = -1f;
+            lastChosenLimit = "";
             pendingForceReissue = true;
+            lastLocLogS = -9999f;
+            lastLocLogMs = -100000;
+            lastMergeLogMs = -100000;
+            lastMergeLogS = -9999f;
             Running = true;
 
             try
@@ -168,8 +222,49 @@ namespace StreetRacing.Race
                 telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};prof={this.profile.Name};risk={this.profile.RiskTolerance:F2}");
                 telemetry?.Event(0, "OPP_DRIVER", $"oppDriverHandle={oppDriverHandle};egoVehHandle={egoVehicleHandle};selfPedClearExpect=-1.6m(0-(1.15+0.45))");
                 telemetry?.Event(0, "ACTUATOR", $"{actuator.ActuatorName};joint maneuver (path+speed) -> {(useDirect ? "Direct 20Hz path/speed execution" : "GtaDriver baseline servo (diagnostic only)")}");
+                // Pose-foundation invariant at start: every candidate must
+                // begin approximately along the rival heading on a straight
+                // road. Log the full pose so straight-road tests report
+                // heading / route heading / error / progress from tick 0.
+                try
+                {
+                    Vector3 fwd0 = RaceMath.VectorFromHeading(originHeading);
+                    float rh0 = route.RouteHeadingDeg;
+                    string vStart = "";
+                    try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
+                    catch { vStart = "validate-exc"; }
+                    telemetry?.Event(0, "START_POSE", $"egoHead={originHeading:F0};routeHead={rh0:F0};headErr={route.HeadingErrorDeg:F0};lat={route.Lateral:F1};dist={route.DistToRoute:F1};s={route.AlongS:F0};exp={route.ExpectedS:F0};loc={route.LocDetail};startValid={vStart}");
+                    // Next ~50-100 m of route for geometry audit.
+                    try
+                    {
+                        string rp = "";
+                        for (float d = 0f; d <= 100f; d += 10f)
+                        {
+                            Vector3 p = route.PointAtS(route.AlongS + d);
+                            rp += $"{d:F0}:({p.X:F0},{p.Y:F0}) ";
+                        }
+                        telemetry?.Event(0, "ROUTE_AHEAD", rp.Trim());
+                    }
+                    catch { }
+                    _lastEgoFwd = fwd0;
+                    _lastEgoHeading = originHeading;
+                }
+                catch { }
             }
             catch { }
+        }
+
+        public bool IsStartPoseValid(out string reason)
+        {
+            reason = "unknown";
+            try
+            {
+                if (vehicle == null || !vehicle.Exists()) { reason = "no-vehicle"; return false; }
+                Vector3 p = vehicle.Position;
+                float h = SafeHeading(vehicle);
+                return route.ValidateStart(p, h, out reason);
+            }
+            catch (Exception ex) { try { reason = "exc:" + ex.Message; } catch { } return false; }
         }
 
         public bool Valid()
@@ -210,6 +305,7 @@ namespace StreetRacing.Race
             catch { return; }
             ActualSpeed = egoSpeed;
             FinishGap = RaceMath.FlatDistance(egoPos, finish);
+            try { _lastEgoFwd = egoFwd; _lastEgoHeading = egoHeading; } catch { }
 
             UpdateKinematics(now, egoPos, egoVel, egoSpeed, egoHeading);
 
@@ -251,6 +347,43 @@ namespace StreetRacing.Race
             {
                 lastPlanMs = now;
                 try { route.Update(egoPos, egoHeading, egoSpeed, now, corridor.HalfWidth); }
+                catch { }
+                try { _lastEgoFwd = egoFwd; _lastEgoHeading = egoHeading; } catch { }
+
+                // Localization audit: log significant jumps/ambiguity with
+                // full pose so a sideways route is visible before any crash.
+                try
+                {
+                    bool jumpBig = Math.Abs(route.LocJumpM) > 6f;
+                    bool logLoc = jumpBig || route.LocAmbiguous || lastLocLogS < -9000f;
+                    if (logLoc && now - lastLocLogMs > 400)
+                    {
+                        lastLocLogMs = now;
+                        lastLocLogS = route.AlongS;
+                        telemetry?.Event(t, "LOC", $"egoHead={egoHeading:F0};routeHead={route.RouteHeadingDeg:F0};headErr={route.HeadingErrorDeg:F0};seg={route.NearestIndex};prevS={route.PrevAlongS:F0};newS={route.AlongS:F0};expS={route.ExpectedS:F0};jump={route.LocJumpM:F1};dist={route.DistToRoute:F1};lat={route.Lateral:F1};{route.LocDetail}");
+                        if (route.LocAmbiguous)
+                        {
+                            try
+                            {
+                                string rp = "";
+                                for (float d = 0f; d <= 60f; d += 10f)
+                                {
+                                    Vector3 p = route.PointAtS(route.AlongS + d);
+                                    rp += $"{d:F0}:({p.X:F0},{p.Y:F0}) ";
+                                }
+                                telemetry?.Event(t, "ROUTE_AHEAD", rp.Trim());
+                            }
+                            catch { }
+                        }
+                    }
+                    else if (now - lastLocLogMs > 5000)
+                    {
+                        // Heartbeat so progress stability over the first 3 s
+                        // is auditable even without jumps.
+                        lastLocLogMs = now;
+                        lastLocLogS = route.AlongS;
+                    }
+                }
                 catch { }
 
                 try
@@ -336,46 +469,108 @@ namespace StreetRacing.Race
                 bool recoveredTarget = false;
                 try
                 {
-                    if (route.IsLost || tactics.Mode == TacticalMode.Recovery || tactics.Mode == TacticalMode.Crashed)
+                    // Hard route/plan validity invariant: never issue a normal
+                    // 15-20 m/s maneuver when the local route tangent is
+                    // grossly incompatible with vehicle heading. That state
+                    // means wrong-branch localization or a required special
+                    // merge — crawl via pose-aware recovery instead.
+                    bool headingInvalid = false;
+                    try { headingInvalid = route.Built && Math.Abs(route.HeadingErrorDeg) > RaceRoute.PlanInvalidHeadErrDeg; }
+                    catch { headingInvalid = false; }
+                    bool needRecovery = route.IsLost || headingInvalid
+                        || tactics.Mode == TacticalMode.Recovery || tactics.Mode == TacticalMode.Crashed;
+                    if (needRecovery)
                     {
-                        Vector3 rec = route.RecoveryTarget();
-                        float recS = 40f;
-                        chosen = new TrajectoryCandidate
+                        string mergeDetail = "none";
+                        Vector3 mergePt = route.RecoveryTarget();
+                        float mergeS = route.AlongS + 40f;
+                        bool haveMerge = false;
+                        try { haveMerge = route.TryGetRecoveryMerge(egoPos, egoHeading, out mergePt, out mergeS, out mergeDetail); }
+                        catch { haveMerge = false; }
+                        try
                         {
-                            LateralM = 0f,
-                            LookaheadM = 40f,
-                            AimPoint = rec,
-                            Score = 0f,
-                            ClearanceM = 999f,
-                            CurveCost = 0f,
-                            TacticalBias = 0f,
-                            RejectReason = route.LossReason,
-                            Path = new System.Collections.Generic.List<Vector3> { egoPos, rec },
-                            StationS = new System.Collections.Generic.List<float> { 0f, recS },
-                            SpeedProfile = new System.Collections.Generic.List<float> { Math.Min(cruiseSetting, 11f), Math.Min(cruiseSetting, 11f) },
-                            ArrivalT = new System.Collections.Generic.List<float> { 0f, 4f },
-                            MinMarginM = 99f,
-                            MaxKappa = 0f,
-                            TargetSpeed = Math.Min(cruiseSetting, 11f),
-                            SpeedLimiting = "Recovery",
-                            ConstrainHandle = -1,
-                            ConstrainKind = "",
-                            ConstrainS = -1f,
-                            MinPredClearance = 999f,
-                            MeanSpeed = Math.Min(cruiseSetting, 11f),
-                            MinSpeed = Math.Min(cruiseSetting, 11f),
-                            RequiredDecel = 0f,
-                            CandidateIndex = -1,
-                        };
-                        traj.LastCandidates.Clear();
-                        traj.LastCandidates.Add(chosen);
-                        traj.Chosen = chosen;
-                        traj.HasChosen = true;
-                        traj.BrakingPointS = -1f;
-                        traj.PlanId++;
-                        target = chosen.TargetSpeed;
-                        limiting = "Recovery";
-                        recoveredTarget = true;
+                            if (haveMerge && (now - lastMergeLogMs > 1000 || Math.Abs(mergeS - lastMergeLogS) > 5f))
+                            {
+                                lastMergeLogMs = now;
+                                lastMergeLogS = mergeS;
+                                telemetry?.Event(t, "RECOVERY_MERGE", $"have=1;{mergeDetail};headErr={route.HeadingErrorDeg:F0};dist={route.DistToRoute:F1};s={route.AlongS:F0};loss={route.LossReason}");
+                            }
+                            else if (!haveMerge && now - lastMergeLogMs > 2000)
+                            {
+                                lastMergeLogMs = now;
+                                telemetry?.Event(t, "RECOVERY_MERGE", $"have=0;{mergeDetail};headErr={route.HeadingErrorDeg:F0};dist={route.DistToRoute:F1};s={route.AlongS:F0};loss={route.LossReason}");
+                            }
+                        }
+                        catch { }
+                        TrajectoryCandidate rec = new TrajectoryCandidate();
+                        bool recOk = false;
+                        string recWhy = "";
+                        try { recOk = TryBuildRecoveryConnector(egoPos, egoFwd, egoHeading, egoSpeed, mergePt, mergeS, haveMerge, mergeDetail, headingInvalid, out rec, out recWhy); }
+                        catch { recOk = false; }
+                        if (recOk)
+                        {
+                            chosen = rec;
+                            traj.LastCandidates.Clear();
+                            traj.LastCandidates.Add(chosen);
+                            traj.Chosen = chosen;
+                            traj.HasChosen = true;
+                            traj.BrakingPointS = -1f;
+                            traj.PlanId++;
+                            target = chosen.TargetSpeed;
+                            limiting = chosen.SpeedLimiting;
+                            recoveredTarget = true;
+                        }
+                        else
+                        {
+                            // Infeasible merge (U-turn-like) or no merge:
+                            // hold position safely, never command cruise
+                            // into a sideways route.
+                            try { telemetry?.Event(t, "ROUTE_INVALID", $"hold;why={recWhy};headErr={route.HeadingErrorDeg:F0};seg={route.NearestIndex};s={route.AlongS:F0};dist={route.DistToRoute:F1};loss={route.LossReason};{route.LocDetail}"); } catch { }
+                            var holdPath = new System.Collections.Generic.List<Vector3>
+                            {
+                                egoPos,
+                                new Vector3(egoPos.X + egoFwd.X * 12f, egoPos.Y + egoFwd.Y * 12f, egoPos.Z)
+                            };
+                            float holdV = 0f;
+                            chosen = new TrajectoryCandidate
+                            {
+                                LateralM = 0f,
+                                LookaheadM = 12f,
+                                AimPoint = holdPath[1],
+                                Score = -99f,
+                                ClearanceM = 999f,
+                                CurveCost = 0f,
+                                TacticalBias = 0f,
+                                RejectReason = string.IsNullOrEmpty(recWhy) ? "recovery-hold" : recWhy,
+                                Path = holdPath,
+                                StationS = new System.Collections.Generic.List<float> { 0f, 12f },
+                                SpeedProfile = new System.Collections.Generic.List<float> { holdV, holdV },
+                                ArrivalT = new System.Collections.Generic.List<float> { 0f, 4f },
+                                MinMarginM = 99f,
+                                MaxKappa = 0f,
+                                TargetSpeed = holdV,
+                                SpeedLimiting = headingInvalid ? "PoseHold" : "RecoveryHold",
+                                ConstrainHandle = -1,
+                                ConstrainKind = "",
+                                ConstrainS = -1f,
+                                MinPredClearance = 999f,
+                                MeanSpeed = holdV,
+                                MinSpeed = holdV,
+                                RequiredDecel = 0f,
+                                CandidateIndex = -2,
+                                FirstTangentErrDeg = 0f,
+                                RouteHeadErrDeg = route.HeadingErrorDeg,
+                            };
+                            traj.LastCandidates.Clear();
+                            traj.LastCandidates.Add(chosen);
+                            traj.Chosen = chosen;
+                            traj.HasChosen = true;
+                            traj.BrakingPointS = -1f;
+                            traj.PlanId++;
+                            target = holdV;
+                            limiting = chosen.SpeedLimiting;
+                            recoveredTarget = true;
+                        }
                     }
                     else
                     {
@@ -385,6 +580,20 @@ namespace StreetRacing.Race
                             capability, egoPos, egoFwd, egoSpeed, LookaheadM, cruiseSetting);
                         target = chosen.TargetSpeed;
                         limiting = string.IsNullOrEmpty(chosen.SpeedLimiting) ? "Cruise" : chosen.SpeedLimiting;
+                        // Double-guard: planner must never return cruise when
+                        // the route just went heading-invalid between Update
+                        // and Plan. Force a crawl hold instead.
+                        if (Math.Abs(route.HeadingErrorDeg) > RaceRoute.PlanInvalidHeadErrDeg && target > 6f)
+                        {
+                            try { telemetry?.Event(t, "ROUTE_INVALID", $"clamp-cruise;headErr={route.HeadingErrorDeg:F0};wasV={target:F1};seg={route.NearestIndex};{route.LocDetail}"); } catch { }
+                            target = 4f;
+                            limiting = "PoseHold";
+                            var cg = chosen;
+                            cg.TargetSpeed = target;
+                            cg.SpeedLimiting = limiting;
+                            chosen = cg;
+                            traj.Chosen = cg;
+                        }
                     }
                 }
                 catch { }
@@ -470,7 +679,9 @@ namespace StreetRacing.Race
                             det = $"id={maneuverPlanId};chIdx={ch.CandidateIndex};lat={ch.LateralM:F1};v={target:F1};lim={limiting};"
                                 + $"clear={ch.MinPredClearance:F1};constr={ch.ConstrainKind}#{ch.ConstrainHandle}@{(ch.ConstrainS >= 0 ? ch.ConstrainS.ToString("F0") : "-")};"
                                 + $"oppDrv={oppDriverHandle};egoVeh={egoVehicleHandle};"
-                                + $"meanV={ch.MeanSpeed:F1};minV={ch.MinSpeed:F1};prof={prof};score={ch.Score:F2};why={what.Trim()}";
+                                + $"meanV={ch.MeanSpeed:F1};minV={ch.MinSpeed:F1};prof={prof};score={ch.Score:F2};why={what.Trim()};"
+                                + $"egoHead={egoHeading:F0};routeHead={route.RouteHeadingDeg:F0};headErr={route.HeadingErrorDeg:F0};"
+                                + $"firstTangErr={ch.FirstTangentErrDeg:F1};maxKappa={ch.MaxKappa:F4};seg={route.NearestIndex};s={route.AlongS:F0};expS={route.ExpectedS:F0};{route.LocDetail}";
                         }
                         catch { det = what; }
                         try { telemetry?.Event(t, "PLAN", det); } catch { }
@@ -532,6 +743,9 @@ namespace StreetRacing.Race
                 bool forceReissue = tactics.ChangedThisTick || recoveredTarget || routeUpgradedThisTick;
                 if (lastLoggedTactic != tactics.Mode) forceReissue = true;
                 if (route.IsLost != lastLoggedLost) forceReissue = true;
+                bool curInvalid = false;
+                try { curInvalid = route.Built && Math.Abs(route.HeadingErrorDeg) > RaceRoute.PlanInvalidHeadErrDeg; } catch { }
+                if (curInvalid != lastLoggedInvalid) forceReissue = true;
                 pendingForceReissue = forceReissue;
                 try
                 {
@@ -630,7 +844,7 @@ namespace StreetRacing.Race
             try
             {
                 if (viz.Enabled)
-                    viz.Draw(route, corridor, traj, perception, speedPlan, egoPos, egoSpeed, LookaheadM, TargetSpeed);
+                    viz.Draw(route, corridor, traj, perception, speedPlan, egoPos, egoFwd, egoSpeed, LookaheadM, TargetSpeed);
             }
             catch { }
 
@@ -734,6 +948,13 @@ namespace StreetRacing.Race
                     telemetry?.Event(t, "ROUTE_FOUND", $"prog={route.AlongS:F0}");
                 lastLoggedLost = route.IsLost;
                 lastLoggedLossReason = route.LossReason ?? "";
+                bool curInvalid = false;
+                try { curInvalid = route.Built && Math.Abs(route.HeadingErrorDeg) > RaceRoute.PlanInvalidHeadErrDeg; } catch { }
+                if (curInvalid && !lastLoggedInvalid)
+                    telemetry?.Event(t, "ROUTE_INVALID", $"headErr={route.HeadingErrorDeg:F0};seg={route.NearestIndex};s={route.AlongS:F0};dist={route.DistToRoute:F1};{route.LocDetail}");
+                else if (!curInvalid && lastLoggedInvalid)
+                    telemetry?.Event(t, "ROUTE_VALID", $"headErr={route.HeadingErrorDeg:F0};s={route.AlongS:F0}");
+                lastLoggedInvalid = curInvalid;
             }
             catch { }
         }
@@ -775,6 +996,12 @@ namespace StreetRacing.Race
                 float maxKappa = traj.HasChosen ? traj.Chosen.MaxKappa : 0f;
                 string chosenReject = traj.HasChosen ? (traj.Chosen.RejectReason ?? "") : "";
                 var ch = traj.HasChosen ? traj.Chosen : new TrajectoryCandidate();
+                float egoHeadLog = 0f;
+                float routeHeadLog = 0f;
+                float firstTangLog = 0f;
+                try { egoHeadLog = _lastEgoHeading; } catch { }
+                try { routeHeadLog = route.RouteHeadingDeg; } catch { }
+                try { firstTangLog = ch.FirstTangentErrDeg; } catch { }
                 telemetry.Sample(t, style, tactics.Mode.ToString(),
                     route.AlongS, route.Progress01, LookaheadM,
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
@@ -796,9 +1023,156 @@ namespace StreetRacing.Race
                     ch.ConstrainHandle, ch.ConstrainKind ?? "", ch.ConstrainS,
                     ch.MinPredClearance, maneuverPlanId,
                     pe.Valid ? pe.SteerDeg : 0f, pe.Valid ? pe.Throttle01 : 0f,
-                    pe.Valid ? pe.Brake01 : 0f, pe.Valid ? pe.LocalTargetMps : TargetSpeed);
+                    pe.Valid ? pe.Brake01 : 0f, pe.Valid ? pe.LocalTargetMps : TargetSpeed,
+                    egoHeadLog, routeHeadLog, firstTangLog,
+                    route.ExpectedS, route.LocJumpM);
             }
             catch { }
+        }
+
+        /// Pose-aware low-speed recovery connector to a heading-compatible
+        /// merge station. Uses the SAME Hermite continuity as normal
+        /// candidates (d(0)=current lateral, d'(0)=-tan(headErr), d(S)=0,
+        /// d'(S)=0) so recovery never commands an instantaneous heading
+        /// change. Rejects U-turn-like merges (huge initial curvature).
+        private bool TryBuildRecoveryConnector(Vector3 egoPos, Vector3 egoFwd, float egoHeading,
+            float egoSpeed, Vector3 mergePt, float mergeS, bool haveMerge, string mergeDetail,
+            bool headingInvalid, out TrajectoryCandidate rec, out string why)
+        {
+            rec = new TrajectoryCandidate();
+            why = "";
+            try
+            {
+                if (!haveMerge)
+                {
+                    why = $"no-merge;{mergeDetail}";
+                    return false;
+                }
+                float lookahead = mergeS - route.AlongS;
+                if (lookahead < 15f) lookahead = 15f;
+                if (lookahead > 80f) lookahead = 80f;
+                float startLat = RaceMath.Clamp(route.Lateral, -18f, 18f);
+                float headErr = route.HeadingErrorDeg;
+                System.Collections.Generic.List<float> pathLats;
+                System.Collections.Generic.List<float> pathS;
+                var path = TrajectoryPlanner.BuildPoseAwarePath(route, egoPos, startLat, headErr, 0f,
+                    lookahead, 5f, out pathLats, out pathS);
+                if (path == null || path.Count < 3)
+                {
+                    why = "short-path";
+                    return false;
+                }
+                var kappa = new System.Collections.Generic.List<float>(path.Count);
+                for (int i = 0; i < path.Count; i++) kappa.Add(0f);
+                float maxKappa = 0f;
+                float minMargin = float.MaxValue;
+                for (int k = 0; k < path.Count; k++)
+                {
+                    float s = pathS[k];
+                    float half = corridor.HalfWidthAt(s);
+                    float margin = half - Math.Abs(pathLats[k]);
+                    if (margin < minMargin) minMargin = margin;
+                    if (k >= 1)
+                    {
+                        var d0 = new Vector3(path[k].X - path[k - 1].X, path[k].Y - path[k - 1].Y, 0f);
+                        Vector3 d1 = d0;
+                        if (k + 1 < path.Count)
+                            d1 = new Vector3(path[k + 1].X - path[k].X, path[k + 1].Y - path[k].Y, 0f);
+                        float l0 = RaceMath.FlatLength(d0);
+                        float l1 = RaceMath.FlatLength(d1);
+                        if (l0 > 0.5f && l1 > 0.5f)
+                        {
+                            float dh = Math.Abs(RaceMath.SignedAngleDeg(d0, d1)) * (float)Math.PI / 180f;
+                            float kk = dh / Math.Max((l0 + l1) * 0.5f, 1f);
+                            kappa[k] = kk;
+                            if (kk > maxKappa) maxKappa = kk;
+                        }
+                    }
+                }
+                float firstTang = TrajectoryPlanner.FirstTangentErrorDeg(path, egoFwd);
+                // U-turn / impossible merge: huge curvature even at crawl.
+                // At 5 m/s, kappa 0.15 needs 3.75 m/s^2 — feasible but sharp;
+                // beyond 0.25 (4 m radius) it is a spin, not a merge.
+                if (maxKappa > 0.25f)
+                {
+                    why = $"infeasible-kappa maxKappa={maxKappa:F3} firstTang={firstTang:F0} {mergeDetail}";
+                    return false;
+                }
+                if (minMargin < -3f)
+                {
+                    why = $"offroad margin={minMargin:F1}";
+                    return false;
+                }
+                float aLatRaw = capability.UsableLat(profile.GripFactor);
+                float cc = profile.CornerCaution;
+                if (cc < 0.5f) cc = 0.5f;
+                if (cc > 2f) cc = 2f;
+                float aLatEff = aLatRaw / (cc * cc);
+                float aBrake = capability.UsableBrake(profile.GripFactor);
+                float topSpeed = 60f;
+                try { topSpeed = capability.TopSpeedEst; } catch { }
+                float recCruise = Math.Min(cruiseSetting, headingInvalid ? 5f : 8f);
+                float[] vAllow;
+                float[] vTgt;
+                float[] arrivalT;
+                int cHandle;
+                string cKind;
+                float cS;
+                float minPredClear;
+                try
+                {
+                    SpeedPlanner.ProfileForPath(path, pathS, kappa, pathLats, route.AlongS,
+                        perception, corridor, egoSpeed, recCruise, aLatEff, aBrake, topSpeed,
+                        profile, recCruise,
+                        out vAllow, out vTgt, out arrivalT, out cHandle, out cKind, out cS, out minPredClear);
+                }
+                catch
+                {
+                    why = "speed-prof-exc";
+                    return false;
+                }
+                float meanV = 0f;
+                float minV = float.MaxValue;
+                for (int i = 0; i < vTgt.Length; i++) { meanV += vTgt[i]; if (vTgt[i] < minV) minV = vTgt[i]; }
+                if (vTgt.Length > 0) meanV /= vTgt.Length; else { meanV = recCruise; minV = recCruise; }
+                float targetNow = vTgt.Length > 0 ? vTgt[0] : recCruise;
+                rec = new TrajectoryCandidate
+                {
+                    LateralM = 0f,
+                    LookaheadM = lookahead,
+                    AimPoint = path[path.Count - 1],
+                    Score = 0f,
+                    ClearanceM = minPredClear,
+                    CurveCost = 0f,
+                    TacticalBias = 0f,
+                    RejectReason = "",
+                    Path = path,
+                    MinMarginM = minMargin == float.MaxValue ? 99f : minMargin,
+                    MaxKappa = maxKappa,
+                    StationS = new System.Collections.Generic.List<float>(pathS),
+                    SpeedProfile = new System.Collections.Generic.List<float>(vTgt),
+                    ArrivalT = new System.Collections.Generic.List<float>(arrivalT),
+                    TargetSpeed = targetNow,
+                    SpeedLimiting = headingInvalid ? "PoseMerge" : "RecoveryMerge",
+                    ConstrainHandle = cHandle,
+                    ConstrainKind = cKind ?? "",
+                    ConstrainS = cS,
+                    MinPredClearance = minPredClear,
+                    MeanSpeed = meanV,
+                    MinSpeed = minV == float.MaxValue ? recCruise : minV,
+                    RequiredDecel = 0f,
+                    CandidateIndex = -1,
+                    FirstTangentErrDeg = firstTang,
+                    RouteHeadErrDeg = headErr,
+                };
+                why = $"ok mergeS={mergeS:F0} maxKappa={maxKappa:F3} firstTang={firstTang:F1} v={targetNow:F1} {mergeDetail}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { why = "exc:" + ex.Message; } catch { why = "exc"; }
+                return false;
+            }
         }
 
         private Vector3 ClampAimToCorridor(Vector3 aim, RaceRoute rt)

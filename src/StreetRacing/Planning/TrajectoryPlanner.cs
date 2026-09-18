@@ -33,6 +33,8 @@ namespace StreetRacing
         public float MinSpeed;            // min of SpeedProfile
         public float RequiredDecel;       // + = need to slow now
         public int CandidateIndex;
+        public float FirstTangentErrDeg; // |angle| between ego heading and path[0]->path[1] (pose continuity)
+        public float RouteHeadErrDeg;    // route.HeadingErrorDeg at plan time
     }
 
     /// JOINT trajectory + speed planner.
@@ -55,6 +57,14 @@ namespace StreetRacing
     ///
     /// Street-racing rules: the whole carriageway is drivable. Oncoming-lane
     /// use is allowed but penalised by risk unless tactics commits.
+    ///
+    /// Pose continuity (this pass): every candidate begins from the actual
+    /// vehicle POSE (position + heading), not just position. Lateral profile
+    /// d(s) is a cubic Hermite with d(0)=current lateral, d'(0)=-tan(headErr)
+    /// (ego heading relative to route), d(S)=desired lateral, d'(S)=0
+    /// (merge parallel). The first meters therefore continue in the direction
+    /// the car already travels; a required ~90 deg merge produces huge
+    /// curvature/infeasibility instead of maxKappa~0.01.
     internal sealed class TrajectoryPlanner
     {
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
@@ -63,9 +73,20 @@ namespace StreetRacing
         public float BrakingPointS = -1f;
         public int PlanId;
 
-        private const float StationDs = 10f;
+        private const float StationDs = 5f;
         private float lastEndLat;
         private bool hasLast;
+
+        public void Reset()
+        {
+            LastCandidates.Clear();
+            HasChosen = false;
+            BrakingPointS = -1f;
+            PlanId = 0;
+            lastEndLat = 0f;
+            hasLast = false;
+            Chosen = new TrajectoryCandidate();
+        }
 
         public TrajectoryCandidate Plan(
             RaceRoute route,
@@ -110,8 +131,34 @@ namespace StreetRacing
             if (halfAtLook > 18f) halfAtLook = 18f;
 
             float startLat = 0f;
+            float routeHeadErr = 0f;
             try { startLat = route.Lateral; } catch { }
+            try { routeHeadErr = route.HeadingErrorDeg; } catch { }
             startLat = RaceMath.Clamp(startLat, -18f, 18f);
+            if (routeHeadErr > 180f) routeHeadErr = 180f;
+            if (routeHeadErr < -180f) routeHeadErr = -180f;
+
+            // Initial lateral slope from current heading relative to route:
+            // d'(0) = -tan(headErr). Positive headErr (route left of nose)
+            // means driving right of route => lateral decreasing => m0<0.
+            float m0;
+            try
+            {
+                float eRad = routeHeadErr * (float)Math.PI / 180f;
+                // Clamp to ~63 deg so the Hermite stays finite; beyond ~50 deg
+                // the brain must already gate to crawl/recovery — the huge
+                // curvature produced even with clamped m0 still marks the
+                // maneuver infeasible.
+                if (eRad > 1.1f) eRad = 1.1f;
+                if (eRad < -1.1f) eRad = -1.1f;
+                m0 = -(float)Math.Tan(eRad);
+                if (m0 > 2f) m0 = 2f;
+                if (m0 < -2f) m0 = -2f;
+            }
+            catch { m0 = 0f; }
+
+            float egoHeadingDeg = 0f;
+            try { egoHeadingDeg = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(egoFwd)); } catch { }
 
             float bias = tactics.DesiredLateral;
             float[] fracs = { -0.85f, -0.55f, -0.30f, 0f, 0.30f, 0.55f, 0.85f };
@@ -124,7 +171,7 @@ namespace StreetRacing
             if (curveAhead > 0.002f)
                 insideBias = turnDir * RaceMath.Clamp(curveAhead * 900f, 0f, 0.5f);
 
-            int nStations = Math.Max(4, Math.Min(17, (int)Math.Ceiling(lookaheadM / StationDs) + 1));
+            int nStations = Math.Max(5, Math.Min(33, (int)Math.Ceiling(lookaheadM / StationDs) + 1));
 
             float aLatRaw = cap.UsableLat(profile.GripFactor);
             float cc = profile.CornerCaution;
@@ -143,16 +190,24 @@ namespace StreetRacing
                 float endLat = (f + bias * 0.35f + insideBias * 0.5f) * halfAtLook;
                 endLat = RaceMath.Clamp(endLat, -halfAtLook * 1.05f - 1f, halfAtLook * 1.05f + 1f);
 
+                // Pose-aware Hermite: d(0)=startLat, d'(0)=m0, d(S)=endLat, d'(S)=0.
                 var path = new List<Vector3>(nStations);
                 var pathLats = new List<float>(nStations);
                 var pathS = new List<float>(nStations);
+                float S = Math.Max(lookaheadM, 10f);
                 for (int k = 0; k < nStations; k++)
                 {
                     float s = k == nStations - 1 ? lookaheadM : k * StationDs;
                     if (s > lookaheadM) s = lookaheadM;
-                    float t = lookaheadM > 1f ? s / lookaheadM : 1f;
-                    float sm = t * t * (3f - 2f * t);
-                    float lat = startLat + (endLat - startLat) * sm;
+                    float t = S > 1f ? s / S : 1f;
+                    if (t < 0f) t = 0f;
+                    if (t > 1f) t = 1f;
+                    float t2 = t * t;
+                    float t3 = t2 * t;
+                    float h00 = 2f * t3 - 3f * t2 + 1f;
+                    float h10 = t3 - 2f * t2 + t;
+                    float h01 = -2f * t3 + 3f * t2;
+                    float lat = h00 * startLat + h10 * S * m0 + h01 * endLat;
                     Vector3 rp = route.PointAtS(route.AlongS + s);
                     float h = route.HeadingAtS(route.AlongS + s);
                     var dir = RaceMath.VectorFromHeading(h);
@@ -165,6 +220,24 @@ namespace StreetRacing
                 }
                 if (path.Count > 0) path[0] = new Vector3(egoPos.X, egoPos.Y, path[0].Z);
                 Vector3 aim = path[path.Count - 1];
+
+                // First-tangent pose error: angle between where the nose
+                // points and where the candidate initially goes. Healthy
+                // pose-aware candidates are ~0-10 deg here by construction.
+                float firstTangErr = 0f;
+                try
+                {
+                    if (path.Count >= 2)
+                    {
+                        var d01 = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+                        if (RaceMath.FlatLength(d01) > 0.5f)
+                        {
+                            float h01 = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d01));
+                            firstTangErr = Math.Abs(RaceMath.HeadingDiffDeg(h01, egoHeadingDeg));
+                        }
+                    }
+                }
+                catch { firstTangErr = 0f; }
 
                 // Swept margin + per-station curvature.
                 float minMargin = float.MaxValue;
@@ -313,6 +386,14 @@ namespace StreetRacing
                           : cKind.ToLowerInvariant().Contains("rival") ? "rival" : "traffic"
                         : "traffic";
                 }
+                // Pose infeasibility: a huge initial-merge curvature at speed
+                // is not a racing maneuver, even if later stations look
+                // straight. Mark explicitly so telemetry/viz shows why the
+                // brain must crawl instead of commanding cruise.
+                if (string.IsNullOrEmpty(blockReason) && Math.Abs(routeHeadErr) > 50f)
+                    blockReason = "pose-incompatible";
+                else if (string.IsNullOrEmpty(blockReason) && firstTangErr > 25f)
+                    blockReason = "pose-kink";
 
                 var c = new TrajectoryCandidate
                 {
@@ -340,6 +421,8 @@ namespace StreetRacing
                     MinSpeed = minV == float.MaxValue ? cruise : minV,
                     RequiredDecel = reqDecel,
                     CandidateIndex = ci,
+                    FirstTangentErrDeg = firstTangErr,
+                    RouteHeadErrDeg = routeHeadErr,
                 };
                 LastCandidates.Add(c);
             }
@@ -389,6 +472,94 @@ namespace StreetRacing
             catch { }
 
             return Chosen;
+        }
+
+        /// Shared pose-aware connector: Hermite d(0)=d0, d'(0)=m0FromHeadErr,
+        /// d(S)=d1, d'(S)=0. Used by normal candidates and by recovery merges
+        /// so both share identical pose continuity (never an instantaneous
+        /// heading change at s=0).
+        public static List<Vector3> BuildPoseAwarePath(RaceRoute route, Vector3 egoPos,
+            float startLat, float headErrDeg, float endLat, float lookaheadM,
+            float stationDs, out List<float> pathLats, out List<float> pathS)
+        {
+            pathLats = new List<float>();
+            pathS = new List<float>();
+            var path = new List<Vector3>();
+            try
+            {
+                float eRad = headErrDeg * (float)Math.PI / 180f;
+                if (eRad > 1.1f) eRad = 1.1f;
+                if (eRad < -1.1f) eRad = -1.1f;
+                float m0 = -(float)Math.Tan(eRad);
+                if (m0 > 2f) m0 = 2f;
+                if (m0 < -2f) m0 = -2f;
+                float S = Math.Max(lookaheadM, 10f);
+                int n = Math.Max(5, Math.Min(33, (int)Math.Ceiling(lookaheadM / stationDs) + 1));
+                for (int k = 0; k < n; k++)
+                {
+                    float s = k == n - 1 ? lookaheadM : k * stationDs;
+                    if (s > lookaheadM) s = lookaheadM;
+                    float t = S > 1f ? s / S : 1f;
+                    if (t < 0f) t = 0f;
+                    if (t > 1f) t = 1f;
+                    float t2 = t * t;
+                    float t3 = t2 * t;
+                    float h00 = 2f * t3 - 3f * t2 + 1f;
+                    float h10 = t3 - 2f * t2 + t;
+                    float h01 = -2f * t3 + 3f * t2;
+                    float lat = h00 * startLat + h10 * S * m0 + h01 * endLat;
+                    Vector3 rp = route.PointAtS(route.AlongS + s);
+                    float h = route.HeadingAtS(route.AlongS + s);
+                    var dir = RaceMath.VectorFromHeading(h);
+                    var leftV = new Vector3(-dir.Y, dir.X, 0f);
+                    path.Add(new Vector3(rp.X + leftV.X * lat, rp.Y + leftV.Y * lat, rp.Z));
+                    pathLats.Add(lat);
+                    pathS.Add(s);
+                    if (s >= lookaheadM - 0.01f) break;
+                }
+                if (path.Count > 0) path[0] = new Vector3(egoPos.X, egoPos.Y, path[0].Z);
+            }
+            catch { }
+            return path;
+        }
+
+        public static float FirstTangentErrorDeg(IList<Vector3> path, Vector3 egoFwd)
+        {
+            try
+            {
+                if (path == null || path.Count < 2) return 0f;
+                var d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+                if (RaceMath.FlatLength(d) < 0.5f) return 0f;
+                float hPath = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(d));
+                float hEgo = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(egoFwd));
+                return Math.Abs(RaceMath.HeadingDiffDeg(hPath, hEgo));
+            }
+            catch { return 0f; }
+        }
+
+        public static float MaxCurvatureOf(IList<Vector3> path)
+        {
+            try
+            {
+                float mx = 0f;
+                for (int k = 1; k < path.Count; k++)
+                {
+                    var d0 = new Vector3(path[k].X - path[k - 1].X, path[k].Y - path[k - 1].Y, 0f);
+                    Vector3 d1 = d0;
+                    if (k + 1 < path.Count)
+                        d1 = new Vector3(path[k + 1].X - path[k].X, path[k + 1].Y - path[k].Y, 0f);
+                    float l0 = RaceMath.FlatLength(d0);
+                    float l1 = RaceMath.FlatLength(d1);
+                    if (l0 > 0.5f && l1 > 0.5f)
+                    {
+                        float dh = Math.Abs(RaceMath.SignedAngleDeg(d0, d1)) * (float)Math.PI / 180f;
+                        float kk = dh / Math.Max((l0 + l1) * 0.5f, 1f);
+                        if (kk > mx) mx = kk;
+                    }
+                }
+                return mx;
+            }
+            catch { return 0f; }
         }
 
         private static float TacticalCap(Tactics.TacticalMode mode, Perception perception,

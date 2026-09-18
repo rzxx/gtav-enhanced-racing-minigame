@@ -57,8 +57,16 @@ namespace StreetRacing.Control
 
             lastPos = vehicle.Position;
             lastMoveTime = Game.GameTime;
+            lastRefreshTime = 0;
             HasPlan = false;
             ReissueCount = 0;
+            hasIssued = false;
+            lastIssueAimX = 0f;
+            lastIssueAimY = 0f;
+            lastIssueCruise = 0f;
+            lastIssueStyle = 0;
+            LastError = new PathFollowingError { Valid = false };
+            LastTickReissued = false;
         }
 
         public void SetPlan(Vector3 aimPoint, float targetSpeed, int style, string reason)

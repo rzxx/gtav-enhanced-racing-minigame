@@ -49,6 +49,7 @@ namespace StreetRacing
         private int pendingSince;
         private int pendingStyle;
         private DriverProfile pendingProfile;
+        private int pendingAttempts;
 
         public StreetRacing()
         {
@@ -114,6 +115,71 @@ namespace StreetRacing
                 bool timedOut = Game.GameTime - pendingSince > 1500;
                 if (gpsReady || timedOut)
                 {
+                    // LOCAL START validity gate: a globally plausible GPS
+                    // polyline (starts within 220 m, ends near finish) can
+                    // still be ~90 deg sideways from the rival (wrong branch /
+                    // carriageway split). Verify near the rival there is a
+                    // close forward-compatible projection and the first tens
+                    // of meters run forward before releasing. On failure,
+                    // reroll the destination (new finish + new blip route)
+                    // instead of trying to recover from a bad setup.
+                    string startWhy = "";
+                    bool startOk = false;
+                    try { startOk = ValidateRouteForRival(pendingOppVehicle, pendingFinish, out startWhy); }
+                    catch { startOk = false; startWhy = "validate-exc"; }
+                    if (!startOk)
+                    {
+                        pendingAttempts++;
+                        if (pendingAttempts >= 3)
+                        {
+                            try { telemetry?.Event(0, "ARM_REJECT", $"no-sane-forward-route attempts={pendingAttempts};{startWhy}"); } catch { }
+                            Notification.PostTicker("No sane forward route for a race here. Try facing open road.", false, false);
+                            CancelPending();
+                            pendingAttempts = 0;
+                            return;
+                        }
+                        // Reroll: pick a fresh finish, re-point the blip, and
+                        // re-arm for its GPS route.
+                        try
+                        {
+                            var pcR = Game.Player.Character;
+                            Vector3 oR = pcR.IsInVehicle() ? pcR.CurrentVehicle.Position : pcR.Position;
+                            Vector3 hR = pcR.IsInVehicle() ? pcR.CurrentVehicle.ForwardVector : new Vector3(0f, 1f, 0f);
+                            if (FinishPicker.TryPick(oR, hR, cfg.MinDistance, cfg.MaxDistance, out var spot2))
+                            {
+                                pendingFinish = spot2;
+                                pendingSince = Game.GameTime;
+                                try { finishBlip?.Delete(); } catch { }
+                                try
+                                {
+                                    finishBlip = World.CreateBlip(pendingFinish);
+                                    finishBlip.Sprite = BlipSprite.Standard;
+                                    finishBlip.Color = BlipColor.Yellow;
+                                    finishBlip.IsShortRange = false;
+                                    finishBlip.ShowRoute = true;
+                                    finishBlip.Name = "Race Finish";
+                                }
+                                catch { }
+                                try { finishCp?.Delete(); } catch { }
+                                try
+                                {
+                                    finishCp = World.CreateCheckpoint(
+                                        CheckpointIcon.CylinderCheckerboard,
+                                        pendingFinish,
+                                        pendingFinish + new Vector3(0f, 0f, 10f),
+                                        cfg.FinishRadius,
+                                        Color.FromArgb(220, 255, 210, 0));
+                                }
+                                catch { }
+                                return;
+                            }
+                        }
+                        catch { }
+                        Notification.PostTicker("No sane forward route for a race here. Try facing open road.", false, false);
+                        CancelPending();
+                        pendingAttempts = 0;
+                        return;
+                    }
                     // Release with whatever route exists (GPS preferred); the
                     // Brain logs src + upgrades cleanly if this was a fallback.
                     oppVehicle = pendingOppVehicle;
@@ -124,6 +190,7 @@ namespace StreetRacing
                     hasPending = false;
                     pendingOppVehicle = null;
                     pendingOppDriver = null;
+                    pendingAttempts = 0;
                     StartRaceNow(timedOut && !gpsReady ? "fallback-timeout" : "gps-ready");
                 }
                 return;
@@ -165,6 +232,7 @@ namespace StreetRacing
             pendingStyle = cfg.ResolveDrivingStyle();
             pendingProfile = cfg.ResolveDriverProfile();
             pendingSince = Game.GameTime;
+            pendingAttempts = 0;
             hasPending = true;
 
             try
@@ -221,6 +289,30 @@ namespace StreetRacing
                 brain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
                     activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
                     cfg.UseDirectActuator(), cfg.DebugViz);
+                // Final start-line gate: the temp-route check above used the
+                // arming-time pose; the rival may have crept. If the BUILT
+                // route is sideways from the actual start pose, do not race
+                // it — reject instead of recovering from a bad setup.
+                try
+                {
+                    string sr;
+                    if (!brain.IsStartPoseValid(out sr))
+                    {
+                        try { telemetry?.Event(0, "ARM_REJECT", $"built-route-invalid;{sr}"); } catch { }
+                        try { telemetry?.Close(); } catch { }
+                        telemetry = null;
+                        try { brain.Stop(); } catch { }
+                        try { finishBlip?.Delete(); } catch { }
+                        try { finishCp?.Delete(); } catch { }
+                        finishBlip = null;
+                        finishCp = null;
+                        cooldownUntil = Game.GameTime + cfg.CooldownMs;
+                        state = RaceState.Cooldown;
+                        Notification.PostTicker("No sane forward route for a race here. Try facing open road.", false, false);
+                        return;
+                    }
+                }
+                catch { }
             }
             catch (Exception ex)
             {
@@ -232,11 +324,45 @@ namespace StreetRacing
             Notification.PostTicker("Challenge accepted! First to the ~y~yellow marker~s~ wins.", false, false);
         }
 
+        private bool ValidateRouteForRival(Vehicle rivalVeh, Vector3 dest, out string reason)
+        {
+            reason = "no-vehicle";
+            try
+            {
+                if (rivalVeh == null || !rivalVeh.Exists()) return false;
+                Vector3 rp = rivalVeh.Position;
+                float rh = 0f;
+                try { rh = rivalVeh.Heading; } catch { rh = 0f; }
+                var probe = new RaceRoute();
+                probe.Build(rp, dest);
+                // Update once so AlongS/HeadingError reflect the rival pose.
+                try
+                {
+                    float half = 7f;
+                    probe.Update(rp, rh, 0f, Game.GameTime, half);
+                }
+                catch { }
+                bool ok = probe.ValidateStart(rp, rh, out reason);
+                try
+                {
+                    reason = $"src={probe.Source};pts={probe.Points.Count};len={probe.TotalLength:F0};s={probe.AlongS:F0};headErr={probe.HeadingErrorDeg:F0};dist={probe.DistToRoute:F1};" + reason;
+                }
+                catch { }
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                try { reason = "exc:" + ex.Message; } catch { }
+                return false;
+            }
+        }
+
         private void CancelPending()
         {
             hasPending = false;
             pendingOppVehicle = null;
             pendingOppDriver = null;
+            pendingAttempts = 0;
             try { finishBlip?.Delete(); } catch { }
             try { finishCp?.Delete(); } catch { }
             finishBlip = null;

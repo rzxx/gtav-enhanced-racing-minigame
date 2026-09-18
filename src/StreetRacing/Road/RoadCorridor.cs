@@ -51,6 +51,17 @@ namespace StreetRacing
 
         private const float DefaultHalfWidth = 7f;
 
+        public void Reset()
+        {
+            Slices.Clear();
+            ProfileLengthM = 0f;
+            Current = new CorridorSlice();
+            Ahead40 = new CorridorSlice();
+            Ahead80 = new CorridorSlice();
+            Ahead120 = new CorridorSlice();
+            LastProbeMs = 0;
+        }
+
         public void Update(RaceRoute route, Vector3 egoPos, int nowMs)
         {
             Update(route, egoPos, 150f, nowMs);

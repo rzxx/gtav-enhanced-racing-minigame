@@ -36,6 +36,20 @@ namespace StreetRacing
         public readonly List<float> ProfileTarget = new List<float>();
         public float BrakingPointS = -1f;
 
+        public void Reset()
+        {
+            TargetSpeed = 0f;
+            Limiting = "Cruise";
+            CurveLimit = 99f;
+            ObstacleLimit = 99f;
+            RequiredDecel = 0f;
+            BrakingNeed = 0f;
+            ProfileS.Clear();
+            ProfileAllowed.Clear();
+            ProfileTarget.Clear();
+            BrakingPointS = -1f;
+        }
+
         public const float VehicleHalfWidthM = 1.15f;
 
         public static float ActorHalfWidth(ActorKind kind)

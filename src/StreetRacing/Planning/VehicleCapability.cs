@@ -44,6 +44,12 @@ namespace StreetRacing
             Confidence = 0.5f;
             StableSamples = 0;
             UnstableSamples = 0;
+            LastSlipDeg = 0f;
+            LastYawRate = 0f;
+            LastStable = true;
+            obsBrakePeak = 0f;
+            obsLatPeak = 0f;
+            obsTop = 0f;
             try
             {
                 if (v == null || !v.Exists()) return;

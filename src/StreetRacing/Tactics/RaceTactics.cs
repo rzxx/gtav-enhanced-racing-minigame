@@ -39,6 +39,19 @@ namespace StreetRacing.Tactics
         private int commitSince;
         private int abortCooldownUntil;
 
+        public void Reset(int nowMs)
+        {
+            Mode = TacticalMode.Cruise;
+            PrevMode = TacticalMode.Cruise;
+            Reason = "init";
+            SinceMs = nowMs;
+            DesiredLateral = 0f;
+            OvertakeSide = 0;
+            ChangedThisTick = false;
+            commitSince = 0;
+            abortCooldownUntil = 0;
+        }
+
         public void Update(
             RaceRoute route,
             RoadCorridor corridor,
@@ -67,7 +80,10 @@ namespace StreetRacing.Tactics
             float rLat = RaceMath.FlatCross(egoFwd, toRival);
             bool alongside = Math.Abs(rLong) < 9f && Math.Abs(rLat) < 4f && rivalDist < 14f;
 
-            // Priority 0: crash / route loss.
+            // Priority 0: crash / route loss / heading-incompatible route.
+            // A >~60 deg route tangent is not a racing state: it means wrong
+            // branch localization or a required special merge. Crawl via
+            // Recovery instead of commanding cruise into a sideways route.
             if (justImpacted && egoSpeed < 5f)
             {
                 want = TacticalMode.Crashed;
@@ -77,6 +93,11 @@ namespace StreetRacing.Tactics
             {
                 want = TacticalMode.Recovery;
                 reason = "route:" + route.LossReason;
+            }
+            else if (route != null && route.Built && Math.Abs(route.HeadingErrorDeg) > 60f)
+            {
+                want = TacticalMode.Recovery;
+                reason = $"heading-incompatible:{route.HeadingErrorDeg:F0}";
             }
             else if (Mode == TacticalMode.Crashed && egoSpeed > 6f && nowMs - SinceMs > 1200)
             {

@@ -81,6 +81,20 @@ namespace StreetRacing
         public float NearestAheadTtc = 999f;
         public float NearestAheadClosing;
 
+        public void Reset()
+        {
+            Actors.Clear();
+            tracks.Clear();
+            LastScanMs = 0;
+            prevScanMs = 0;
+            ClosestTtcIndex = -1;
+            AheadCount = 0;
+            NearestAheadDist = 999f;
+            NearestAheadTtc = 999f;
+            NearestAheadClosing = 0f;
+            RangeM = 120f;
+        }
+
         // Persistent tracks by entity handle.
         private readonly Dictionary<int, PersistedTrack> tracks = new Dictionary<int, PersistedTrack>();
         private int prevScanMs;
