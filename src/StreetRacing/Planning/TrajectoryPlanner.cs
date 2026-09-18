@@ -34,6 +34,7 @@ namespace StreetRacing
         public float MinSpeed;            // min of SpeedProfile
         public float RequiredDecel;       // + = need to slow now
         public int CandidateIndex;
+        public string Shape;              // Center / HoldL / PassReturnL / ApexL / ...
         public float FirstTangentErrDeg; // |angle| between ego heading and path[0]->path[1] (pose continuity)
         public float RouteHeadErrDeg;    // route.HeadingErrorDeg at plan time
     }
@@ -68,8 +69,8 @@ namespace StreetRacing
     /// travels; a required ~90 deg merge produces huge curvature instead
     /// of maxKappa~0.01.
     /// NOTE: the 7-candidate joint planner below is LEGACY (DriverMode=Legacy).
-    /// The default Simple driver (DriverMode=Simple) builds ONE center path
-    /// via PoseConnector and never scores lateral alternatives.
+    /// Simple has its own LocalPlannerV2; this type remains the shared
+    /// TrajectoryCandidate contract plus legacy implementation/debug surface.
     internal sealed class TrajectoryPlanner
     {
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();

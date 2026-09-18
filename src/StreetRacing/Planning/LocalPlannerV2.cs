@@ -4,17 +4,18 @@ using GTA.Math;
 
 namespace StreetRacing
 {
-    /// Local Planner V1 for the Simple driver.
+    /// Local Planner V2 for the Simple driver.
     ///
     /// Global GPS says WHERE to go. DrivingReference supplies a smooth road
     /// spine. This planner decides WHERE ON THE ROAD to drive for the next
     /// few seconds.
     ///
-    /// V1 intentionally has no semantic lane graph yet. It samples smooth
-    /// lateral alternatives inside RoadCorridor, evaluates each candidate in
-    /// WORLD SPACE against predicted actors, and commits to a useful side long
-    /// enough to make a pass instead of twitching between candidates.
-    internal sealed class LocalPlannerV1
+    /// V2 still has no semantic lane graph, but its action set is no longer
+    /// a handful of parallel rails. It samples multi-stage lateral trajectories
+    /// in the SAME frame as DrivingReference's measured road envelope:
+    /// hold-side passes, pass+return maneuvers, and outside-apex-outside corner
+    /// shapes. Actor conflicts remain WORLD-SPACE authoritative.
+    internal sealed class LocalPlannerV2
     {
         internal sealed class Result
         {
@@ -33,11 +34,21 @@ namespace StreetRacing
         private int commitUntilMs;
         private int commitStartedMs;
         private string committedIntent = "Track";
+        private string committedShape = "";
         private int planId;
 
         private const float VehicleHalfWidthM = 1.15f;
         private const float RoadMarginM = 0.55f;
         private const float MinCandidateSpacingM = 1.15f;
+
+        private struct ShapeSpec
+        {
+            public string Name;
+            public float K1;
+            public float K2;
+            public float K3;
+            public float CharacteristicLat;
+        }
 
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
         public TrajectoryCandidate LastChosen;
@@ -51,6 +62,7 @@ namespace StreetRacing
             commitUntilMs = 0;
             commitStartedMs = 0;
             committedIntent = "Track";
+            committedShape = "";
             planId = 0;
             LastCandidates.Clear();
             LastChosen = new TrajectoryCandidate();
@@ -92,17 +104,16 @@ namespace StreetRacing
                 return result;
             }
 
-            float usable = corridor != null
-                ? corridor.MinHalfWidthAhead(Math.Min(horizon, 70f)) - VehicleHalfWidthM - RoadMarginM
-                : 3.5f;
-            usable = RaceMath.Clamp(usable, 0.75f, 6.0f);
+            float leftUsable;
+            float rightUsable;
+            ReferenceUsableSides(reference, Math.Min(horizon, 75f), out leftUsable, out rightUsable);
 
-            var targetLats = BuildTargets(usable);
+            var shapes = BuildShapes(reference, leftUsable, rightUsable);
             int candidateIndex = 0;
-            foreach (float targetLat in targetLats)
+            foreach (var shape in shapes)
             {
-                var c = BuildCandidate(reference, corridor, route, perception, capability,
-                    profile, egoPos, egoHeading, egoSpeed, cruise, targetLat, candidateIndex++);
+                var c = BuildCandidate(reference, route, perception, capability,
+                    profile, egoPos, egoHeading, egoSpeed, cruise, shape, candidateIndex++);
                 LastCandidates.Add(c);
             }
 
@@ -127,7 +138,9 @@ namespace StreetRacing
                 return result;
             }
 
-            int committedIndex = FindClosestIndex(LastCandidates, committedLat);
+            int committedIndex = !string.IsNullOrEmpty(committedShape)
+                ? FindShapeIndex(LastCandidates, committedShape)
+                : FindClosestIndex(LastCandidates, committedLat);
             bool activeCommit = Math.Abs(committedLat) > 0.35f && nowMs < commitUntilMs;
             if (activeCommit && committedIndex >= 0)
             {
@@ -135,19 +148,38 @@ namespace StreetRacing
                 if (string.IsNullOrEmpty(cc.RejectReason))
                 {
                     // While committed, only abandon for a materially safer/faster
-                    // option. Small score jitter must never make us weave.
+                    // option. Never jump directly from one side of the road to
+                    // the other: unwind through center first.
                     var challenger = LastCandidates[bestIndex];
                     bool committedUnsafe = cc.MinPredClearance < -0.25f || cc.MinSpeed < 1.0f;
-                    bool challengerDecisive = challenger.Score > cc.Score + 9f
+                    bool oppositeSide = Math.Abs(challenger.LateralM) > 0.35f
+                        && Math.Sign(challenger.LateralM) != Math.Sign(committedLat);
+                    bool challengerDecisive = !oppositeSide
+                        && challenger.Score > cc.Score + 9f
                         && challenger.MinPredClearance > cc.MinPredClearance + 0.7f;
-                    if (!committedUnsafe && !challengerDecisive)
+
+                    if (committedUnsafe && centerIndex >= 0 && string.IsNullOrEmpty(center.RejectReason))
+                    {
+                        bestIndex = centerIndex;
+                        committedLat = 0f;
+                        committedShape = "";
+                        committedIntent = "Return";
+                        commitUntilMs = nowMs + 700;
+                    }
+                    else if (!committedUnsafe && !challengerDecisive)
+                    {
                         bestIndex = committedIndex;
+                    }
                 }
                 else if (centerIndex >= 0 && string.IsNullOrEmpty(center.RejectReason))
                 {
                     // Road narrowed / committed corridor disappeared: unwind
                     // through center instead of snapping across to the other side.
                     bestIndex = centerIndex;
+                    committedLat = 0f;
+                    committedShape = "";
+                    committedIntent = "Return";
+                    commitUntilMs = nowMs + 700;
                 }
             }
 
@@ -161,7 +193,11 @@ namespace StreetRacing
             {
                 float speedGain = chosen.MeanSpeed - center.MeanSpeed;
                 float targetGain = chosen.TargetSpeed - center.TargetSpeed;
+                float scoreGain = chosen.Score - center.Score;
+                bool apexChoice = chosen.Shape != null && chosen.Shape.StartsWith("Apex");
                 bool worthPassing = speedGain >= 2.0f || targetGain >= 2.5f
+                    || scoreGain >= 7.0f
+                    || (apexChoice && scoreGain >= 3.0f)
                     || (center.MinSpeed < 3f && chosen.MinSpeed > 6f);
                 if (!worthPassing)
                 {
@@ -177,9 +213,13 @@ namespace StreetRacing
                     || Math.Abs(chosen.LateralM - committedLat) > 0.75f)
                 {
                     committedLat = chosen.LateralM;
+                    committedShape = chosen.Shape ?? "";
                     commitStartedMs = nowMs;
-                    commitUntilMs = nowMs + 1800;
-                    committedIntent = committedLat > 0f ? "PassLeft" : "PassRight";
+                    commitUntilMs = nowMs + (chosen.Shape != null && chosen.Shape.StartsWith("Apex") ? 1100 : 1800);
+                    if (chosen.Shape != null && chosen.Shape.StartsWith("Apex"))
+                        committedIntent = "Apex";
+                    else
+                        committedIntent = committedLat > 0f ? "PassLeft" : "PassRight";
                 }
                 else if (nowMs >= commitUntilMs)
                 {
@@ -195,6 +235,7 @@ namespace StreetRacing
                 if (minCommitSatisfied)
                 {
                     committedLat = 0f;
+                    committedShape = "";
                     committedIntent = "Return";
                     commitUntilMs = nowMs + 700;
                 }
@@ -216,7 +257,9 @@ namespace StreetRacing
             // execution agree after a commitment transition.
             if (Math.Abs(committedLat) > 0.35f)
             {
-                int ci = FindClosestIndex(LastCandidates, committedLat);
+                int ci = !string.IsNullOrEmpty(committedShape)
+                    ? FindShapeIndex(LastCandidates, committedShape)
+                    : FindClosestIndex(LastCandidates, committedLat);
                 if (ci >= 0 && string.IsNullOrEmpty(LastCandidates[ci].RejectReason))
                     chosen = LastCandidates[ci];
             }
@@ -235,7 +278,7 @@ namespace StreetRacing
             result.Detail = $"intent={Intent};lat={chosen.LateralM:F1};score={chosen.Score:F1};"
                 + $"meanV={chosen.MeanSpeed:F1};minV={chosen.MinSpeed:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"clear={chosen.MinPredClearance:F1};usable={usable:F1};"
+                + $"clear={chosen.MinPredClearance:F1};roadLR={leftUsable:F1}/{rightUsable:F1};shape={chosen.Shape};"
                 + $"cands={SummarizeCandidates(LastCandidates)}";
 
             LastChosen = chosen;
@@ -244,28 +287,100 @@ namespace StreetRacing
             return result;
         }
 
-        private static List<float> BuildTargets(float usable)
+        private static List<ShapeSpec> BuildShapes(
+            DrivingReference.Result reference, float leftUsable, float rightUsable)
         {
-            var r = new List<float> { 0f };
-            float inner = Math.Min(2.25f, usable * 0.48f);
-            float outer = Math.Min(4.4f, usable * 0.88f);
+            var r = new List<ShapeSpec>();
+            r.Add(new ShapeSpec { Name = "Center", K1 = 0f, K2 = 0f, K3 = 0f, CharacteristicLat = 0f });
 
-            if (inner >= MinCandidateSpacingM)
+            float lInner = Math.Min(2.2f, leftUsable * 0.55f);
+            float lOuter = Math.Min(4.4f, leftUsable * 0.90f);
+            float rInner = Math.Min(2.2f, rightUsable * 0.55f);
+            float rOuter = Math.Min(4.4f, rightUsable * 0.90f);
+
+            if (lInner >= MinCandidateSpacingM)
             {
-                r.Add(inner);
-                r.Add(-inner);
+                r.Add(new ShapeSpec { Name = "HoldL", K1 = lInner, K2 = lInner, K3 = lInner, CharacteristicLat = lInner });
+                r.Add(new ShapeSpec { Name = "PassReturnL", K1 = lInner, K2 = lInner, K3 = 0f, CharacteristicLat = lInner });
             }
-            if (outer >= inner + MinCandidateSpacingM && outer >= 2.0f)
+            if (rInner >= MinCandidateSpacingM)
             {
-                r.Add(outer);
-                r.Add(-outer);
+                r.Add(new ShapeSpec { Name = "HoldR", K1 = -rInner, K2 = -rInner, K3 = -rInner, CharacteristicLat = -rInner });
+                r.Add(new ShapeSpec { Name = "PassReturnR", K1 = -rInner, K2 = -rInner, K3 = 0f, CharacteristicLat = -rInner });
             }
+            if (lOuter >= lInner + MinCandidateSpacingM && lOuter >= 2.4f)
+                r.Add(new ShapeSpec { Name = "BoldL", K1 = lOuter, K2 = lOuter, K3 = lOuter * 0.65f, CharacteristicLat = lOuter });
+            if (rOuter >= rInner + MinCandidateSpacingM && rOuter >= 2.4f)
+                r.Add(new ShapeSpec { Name = "BoldR", K1 = -rOuter, K2 = -rOuter, K3 = -rOuter * 0.65f, CharacteristicLat = -rOuter });
+
+            try
+            {
+                int mid = Math.Max(1, reference.Path.Count / 2);
+                Vector3 d0 = DirectionAt(reference.Path, 0);
+                Vector3 dm = DirectionAt(reference.Path, mid);
+                float turnDeg = RaceMath.SignedAngleDeg(d0, dm);
+                if (Math.Abs(turnDeg) >= 12f)
+                {
+                    float sign = Math.Sign(turnDeg);
+                    float outsideAvail = sign > 0 ? rightUsable : leftUsable;
+                    float insideAvail = sign > 0 ? leftUsable : rightUsable;
+                    float outside = Math.Min(2.8f, outsideAvail * 0.72f);
+                    float inside = Math.Min(3.2f, insideAvail * 0.82f);
+                    if (outside >= 1.0f && inside >= 1.0f)
+                    {
+                        r.Add(new ShapeSpec
+                        {
+                            Name = sign > 0 ? "ApexL" : "ApexR",
+                            K1 = -sign * outside,
+                            K2 = sign * inside,
+                            K3 = -sign * outside * 0.55f,
+                            CharacteristicLat = sign * inside,
+                        });
+                    }
+                }
+            }
+            catch { }
             return r;
+        }
+
+        private static void ReferenceUsableSides(
+            DrivingReference.Result reference, float horizon,
+            out float left, out float right)
+        {
+            left = 4f;
+            right = 4f;
+            try
+            {
+                var ls = new List<float>();
+                var rs = new List<float>();
+                for (int i = 0; i < reference.Path.Count; i++)
+                {
+                    float s = reference.StationS[i];
+                    if (s > horizon) break;
+                    if (s < 6f) continue; // current pinch is checked point-by-point
+                    if (i < reference.LeftRoadM.Count)
+                        ls.Add(reference.LeftRoadM[i] - VehicleHalfWidthM - RoadMarginM);
+                    if (i < reference.RightRoadM.Count)
+                        rs.Add(reference.RightRoadM[i] - VehicleHalfWidthM - RoadMarginM);
+                }
+                if (ls.Count > 0)
+                {
+                    ls.Sort();
+                    left = ls[(int)Math.Floor((ls.Count - 1) * 0.65f)];
+                }
+                if (rs.Count > 0)
+                {
+                    rs.Sort();
+                    right = rs[(int)Math.Floor((rs.Count - 1) * 0.65f)];
+                }
+            }
+            catch { }
+            left = RaceMath.Clamp(left, 0.4f, 6f);
+            right = RaceMath.Clamp(right, 0.4f, 6f);
         }
 
         private TrajectoryCandidate BuildCandidate(
             DrivingReference.Result reference,
-            RoadCorridor corridor,
             RaceRoute route,
             Perception perception,
             VehicleCapability capability,
@@ -274,13 +389,14 @@ namespace StreetRacing
             float egoHeading,
             float egoSpeed,
             float cruise,
-            float targetLat,
+            ShapeSpec shape,
             int index)
         {
             var c = new TrajectoryCandidate
             {
                 CandidateIndex = index,
-                LateralM = targetLat,
+                Shape = shape.Name,
+                LateralM = shape.CharacteristicLat,
                 LookaheadM = reference.StationS[reference.StationS.Count - 1],
                 RejectReason = "",
                 ConstrainHandle = -1,
@@ -308,30 +424,30 @@ namespace StreetRacing
                 m0 = RaceMath.Clamp(m0, -1.35f, 1.35f);
 
                 float totalS = reference.StationS[reference.StationS.Count - 1];
-                float transitionS = RaceMath.Clamp(28f + egoSpeed * 1.4f, 30f, 62f);
-                transitionS = Math.Min(transitionS, Math.Max(18f, totalS * 0.78f));
+                float s1 = totalS * 0.30f;
+                float s2 = totalS * 0.62f;
+                float s3 = totalS;
 
                 for (int i = 0; i < reference.Path.Count; i++)
                 {
                     float baseS = reference.StationS[i];
-                    float lat = HermiteLateral(startLat, m0, targetLat, baseS, transitionS);
+                    float lat = PiecewiseLateral(startLat, m0, shape.K1, shape.K2, shape.K3,
+                        baseS, s1, s2, s3);
                     Vector3 dir = DirectionAt(reference.Path, i);
                     Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
                     Vector3 bp = reference.Path[i];
                     var p = new Vector3(bp.X + left.X * lat, bp.Y + left.Y * lat, bp.Z);
                     if (i == 0) p = egoPos;
 
-                    if (corridor != null)
+                    float leftAvail;
+                    float rightAvail;
+                    ReferenceRoadAt(reference, baseS, out leftAvail, out rightAvail);
+                    float leftAllow = Math.Max(0.4f, leftAvail - VehicleHalfWidthM - RoadMarginM);
+                    float rightAllow = Math.Max(0.4f, rightAvail - VehicleHalfWidthM - RoadMarginM);
+                    if (lat > leftAllow + 0.05f || lat < -rightAllow - 0.05f)
                     {
-                        float half = corridor.HalfWidthAt(baseS);
-                        float actualRoadLat = corridor.LateralAt(p, baseS, route);
-                        float allowed = half - VehicleHalfWidthM - RoadMarginM;
-                        if (allowed < 0.65f) allowed = 0.65f;
-                        if (Math.Abs(actualRoadLat) > allowed + 0.05f)
-                        {
-                            c.RejectReason = $"road-boundary@{baseS:F0}:lat={actualRoadLat:F1}/allow={allowed:F1}";
-                            return c;
-                        }
+                        c.RejectReason = $"road-boundary@{baseS:F0}:lat={lat:F1}/allow=-{rightAllow:F1}..{leftAllow:F1}";
+                        return c;
                     }
 
                     path.Add(p);
@@ -360,9 +476,12 @@ namespace StreetRacing
                     c.RejectReason = $"pose-discontinuity:{firstTang:F0}";
                     return c;
                 }
-                if (maxKappa > 0.20f && egoSpeed > 7f)
+                // Curvature is normally a SPEED constraint, not a reason to
+                // throw the trajectory away. Only reject near-cusps that the
+                // low-level controller cannot represent at any useful speed.
+                if (maxKappa > 0.45f)
                 {
-                    c.RejectReason = $"kappa:{maxKappa:F3}";
+                    c.RejectReason = $"kappa-pathological:{maxKappa:F3}";
                     return c;
                 }
 
@@ -390,13 +509,32 @@ namespace StreetRacing
                 string constrainKind;
                 float constrainS;
                 float minClear;
-                float[] actorAllow = BuildWorldActorEnvelope(path, ss, perception, egoSpeed,
-                    cruise, profile, out constrainHandle, out constrainKind, out constrainS, out minClear);
+                float[] actorAllow = BuildWorldActorEnvelope(path, ss, roadProfile,
+                    perception, egoSpeed, cruise, profile,
+                    out constrainHandle, out constrainKind, out constrainS, out minClear);
 
                 float[] allow = new float[path.Count];
                 for (int i = 0; i < allow.Length; i++)
                     allow[i] = Math.Min(roadAllow[i], actorAllow[i]);
                 float[] desired = BackwardPass(allow, ss, aBrake);
+
+                // One fixed-point refinement: once the first pass decides we
+                // will slow, actor arrival prediction must use that slower
+                // trajectory instead of pretending we keep current speed.
+                int cHandle2;
+                string cKind2;
+                float cS2;
+                float minClear2;
+                float[] actorAllow2 = BuildWorldActorEnvelope(path, ss, desired,
+                    perception, egoSpeed, cruise, profile,
+                    out cHandle2, out cKind2, out cS2, out minClear2);
+                for (int i = 0; i < allow.Length; i++)
+                    allow[i] = Math.Min(roadAllow[i], actorAllow2[i]);
+                desired = BackwardPass(allow, ss, aBrake);
+                constrainHandle = cHandle2;
+                constrainKind = cKind2;
+                constrainS = cS2;
+                minClear = minClear2;
 
                 float mean = 0f;
                 float min = cruise;
@@ -410,28 +548,35 @@ namespace StreetRacing
                 float roadMargin = float.MaxValue;
                 for (int i = 0; i < lats.Count; i++)
                 {
-                    float allowed = corridor != null
-                        ? corridor.HalfWidthAt(reference.StationS[Math.Min(i, reference.StationS.Count - 1)])
-                            - VehicleHalfWidthM
-                        : 5f;
-                    float m = allowed - Math.Abs(lats[i]);
+                    float leftAvail;
+                    float rightAvail;
+                    ReferenceRoadAt(reference, reference.StationS[Math.Min(i, reference.StationS.Count - 1)],
+                        out leftAvail, out rightAvail);
+                    float m = lats[i] >= 0f
+                        ? leftAvail - VehicleHalfWidthM - Math.Abs(lats[i])
+                        : rightAvail - VehicleHalfWidthM - Math.Abs(lats[i]);
                     if (m < roadMargin) roadMargin = m;
                 }
                 if (roadMargin == float.MaxValue) roadMargin = 0f;
 
-                // Progress dominates. Center is mildly preferred, but a clear
-                // side path that preserves several m/s easily wins.
-                float score = mean * 5.0f
-                    + min * 1.5f
-                    + RaceMath.Clamp(minClear, -2f, 6f) * 1.2f
-                    + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.7f
-                    - Math.Abs(targetLat) * 0.75f
-                    - maxKappa * 22f
+                // Racing objective: maximize ROUTE progress per predicted
+                // travel time, then break ties with clearance/margin/smoothness.
+                // This lets an apex/shortcut win because it gets farther along
+                // the route sooner, not because of a hard-coded "corner line".
+                var predictedArrival = BuildArrivalTimes(ss, desired);
+                float eta = predictedArrival.Count > 0 ? predictedArrival[predictedArrival.Count - 1] : 99f;
+                float referenceProgressRate = totalS / Math.Max(eta, 0.75f);
+                float score = referenceProgressRate * 5.5f
+                    + min * 1.15f
+                    + RaceMath.Clamp(minClear, -2f, 6f) * 1.25f
+                    + RaceMath.Clamp(roadMargin, -2f, 5f) * 0.75f
+                    - Math.Abs(shape.CharacteristicLat) * 0.55f
+                    - maxKappa * 20f
                     - firstTang * 0.08f;
 
                 // Small continuity preference around the current commitment.
                 if (Math.Abs(committedLat) > 0.35f)
-                    score -= Math.Abs(targetLat - committedLat) * 0.65f;
+                    score -= Math.Abs(shape.CharacteristicLat - committedLat) * 0.65f;
 
                 string limiting;
                 if (constrainHandle != -1 && desired[0] < roadDesired - 0.25f)
@@ -444,7 +589,7 @@ namespace StreetRacing
                 c.Path = path;
                 c.StationS = ss;
                 c.SpeedProfile = new List<float>(desired);
-                c.ArrivalT = BuildArrivalTimes(ss, desired);
+                c.ArrivalT = predictedArrival;
                 c.AimPoint = path[path.Count - 1];
                 c.MinMarginM = roadMargin;
                 c.MaxKappa = maxKappa;
@@ -473,6 +618,7 @@ namespace StreetRacing
         private static float[] BuildWorldActorEnvelope(
             IList<Vector3> path,
             IList<float> ss,
+            IList<float> provisionalSpeed,
             Perception perception,
             float egoSpeed,
             float cruise,
@@ -491,9 +637,15 @@ namespace StreetRacing
             minClearance = 999f;
             if (perception == null || perception.Actors.Count == 0) return allow;
 
+            var arrivalList = BuildArrivalTimes(ss, provisionalSpeed);
             var arrival = new float[n];
             for (int i = 0; i < n; i++)
-                arrival[i] = RaceMath.Clamp(ss[i] / Math.Max(egoSpeed, 6f), 0f, 5f);
+            {
+                float t = i < arrivalList.Count
+                    ? arrivalList[i]
+                    : ss[i] / Math.Max(egoSpeed, 6f);
+                arrival[i] = RaceMath.Clamp(t, 0f, 5f);
+            }
 
             float gapStop = (profile != null ? profile.SafetyMarginM : 3f) + Math.Max(0f, egoSpeed) * 0.25f;
             float earliestStopS = float.MaxValue;
@@ -603,6 +755,68 @@ namespace StreetRacing
             return r;
         }
 
+        private static float PiecewiseLateral(
+            float d0, float m0, float k1, float k2, float k3,
+            float s, float s1, float s2, float s3)
+        {
+            if (s <= 0f) return d0;
+            if (s <= s1)
+                return HermiteSegment(d0, m0, k1, 0f, s, 0f, s1);
+            if (s <= s2)
+                return HermiteSegment(k1, 0f, k2, 0f, s, s1, s2);
+            return HermiteSegment(k2, 0f, k3, 0f, Math.Min(s, s3), s2, s3);
+        }
+
+        private static float HermiteSegment(
+            float d0, float m0, float d1, float m1,
+            float s, float s0, float s1)
+        {
+            float S = Math.Max(0.5f, s1 - s0);
+            float t = RaceMath.Clamp((s - s0) / S, 0f, 1f);
+            float t2 = t * t;
+            float t3 = t2 * t;
+            float h00 = 2f * t3 - 3f * t2 + 1f;
+            float h10 = t3 - 2f * t2 + t;
+            float h01 = -2f * t3 + 3f * t2;
+            float h11 = t3 - t2;
+            return h00 * d0 + h10 * S * m0 + h01 * d1 + h11 * S * m1;
+        }
+
+        private static void ReferenceRoadAt(
+            DrivingReference.Result reference, float s, out float left, out float right)
+        {
+            left = 4f;
+            right = 4f;
+            try
+            {
+                if (reference.StationS.Count == 0) return;
+                if (s <= 0f)
+                {
+                    left = reference.LeftRoadM[0];
+                    right = reference.RightRoadM[0];
+                    return;
+                }
+                int last = reference.StationS.Count - 1;
+                if (s >= reference.StationS[last])
+                {
+                    left = reference.LeftRoadM[last];
+                    right = reference.RightRoadM[last];
+                    return;
+                }
+                for (int i = 0; i < last; i++)
+                {
+                    float a = reference.StationS[i];
+                    float b = reference.StationS[i + 1];
+                    if (s < a || s > b) continue;
+                    float t = b > a ? (s - a) / (b - a) : 0f;
+                    left = reference.LeftRoadM[i] + (reference.LeftRoadM[i + 1] - reference.LeftRoadM[i]) * t;
+                    right = reference.RightRoadM[i] + (reference.RightRoadM[i + 1] - reference.RightRoadM[i]) * t;
+                    return;
+                }
+            }
+            catch { }
+        }
+
         private static float HermiteLateral(float d0, float m0, float d1, float s, float S)
         {
             if (S <= 1f || s >= S) return d1;
@@ -677,15 +891,24 @@ namespace StreetRacing
                     var c = candidates[i];
                     if (!string.IsNullOrEmpty(c.RejectReason))
                     {
-                        parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:X({c.RejectReason})");
+                        parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:X({c.RejectReason})");
                         continue;
                     }
                     string lim = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
-                    parts.Add($"{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
+                    parts.Add($"{c.Shape}@{c.LateralM:+0.0;-0.0;0.0}:S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/{lim}/C{c.MinPredClearance:F1}");
                 }
                 return string.Join("|", parts);
             }
             catch { return "?"; }
+        }
+
+        private static int FindShapeIndex(IList<TrajectoryCandidate> candidates, string shape)
+        {
+            if (string.IsNullOrEmpty(shape)) return -1;
+            for (int i = 0; i < candidates.Count; i++)
+                if (string.Equals(candidates[i].Shape, shape, StringComparison.Ordinal))
+                    return i;
+            return -1;
         }
 
         private static int FindClosestIndex(IList<TrajectoryCandidate> candidates, float lat)
