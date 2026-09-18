@@ -46,6 +46,13 @@ Then in game press **Insert** to reload scripts (or restart the game).
 | RaceTimeoutMs / CooldownMs | 600000 / 8000 | give-up timer, rest between races |
 | CancelKey | G | cancel active race |
 
+## AI diagnostics (telemetry)
+
+Each race writes `scripts\StreetRacing_race_<id>.csv` (10 Hz samples: speeds, distances,
+off-road meters, lane alignment, traffic count, free road ahead) plus `_events.csv`
+(`OFFROAD_ENTER/EXIT`, `WRONGWAY_ENTER/EXIT`, `UNDERDRIVE`, `HARD_BRAKE`, `CRASH`).
+Disable with `TelemetryEnabled=0`. Send both files after test races to tune further.
+
 ## Tuning the AI (the fun part)
 
 Found by dumping `VehicleDrivingFlags` from SHVDN metadata + FiveM native docs:
