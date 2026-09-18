@@ -1389,7 +1389,7 @@ namespace StreetRacing.Race
                         + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
                         + $"constr={(c.ConstrainHandle != -1 ? (c.ConstrainKind ?? "Actor") + "#" + c.ConstrainHandle + "@" + c.ConstrainS.ToString("F0") : "none")};"
                         + $"minClear={c.MinPredClearance:F1};latTarget={c.LateralM:F1};score={c.Score:F1};"
-                        + $"local={localPlanner.LastDecision};s={route.AlongS:F0};{route.LocDetail}");
+                        + $"roadModel={lastRefDetail};local={localPlanner.LastDecision};s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }
