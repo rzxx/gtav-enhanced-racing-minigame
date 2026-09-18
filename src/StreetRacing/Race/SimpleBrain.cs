@@ -23,17 +23,19 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// Local Planner V1 is ENABLED after the initial join:
+    /// Local Planner V2 is ENABLED after the initial join:
     ///   several pose-continuous lateral candidates inside RoadCorridor,
     ///   world-space actor prediction per candidate, path+speed scoring, and
     ///   short commitment/hysteresis for PASS_LEFT / PASS_RIGHT / RETURN.
     ///
     /// Still disabled:
     ///   semantic lane graph / oncoming-lane classification / player tactics /
-    ///   Crashed state / ImpactClassifier-driven behavior /
-    ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
-    ///   StraightFallback. V1 may move laterally around traffic, but still
-    ///   treats the measured road corridor as one drivable surface.
+    ///   GTA DriveTo fallback / FallbackWalk / StraightFallback.
+    ///
+    /// RecoveryPrimitive is enabled only for structural loss or persistent
+    /// planner infeasibility without an active traffic constraint. It owns an
+    /// explicit Stop -> Reverse -> Forward -> Rejoin sequence; normal traffic
+    /// waiting never enters recovery.
     ///
     /// Speed separation (the recursive bug this fixes):
     ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
@@ -49,9 +51,8 @@ namespace StreetRacing.Race
     ///   The old KEEP_LINE rebuilt a Hermite through ego every 100 ms, which
     ///   zeroed the error by construction and hid drift. PoseConnector is used
     ///   ONLY for the initial JOIN when start pose is offset/misaligned; once
-    ///   aligned we latch to TRACK permanently. No rejoin, no recovery: if the
-    ///   follower stops, leaves the road, misaligns or crashes, the test must
-    ///   FAIL with logs, not hide behind reverse/rejoin.
+    ///   aligned we latch to normal planning. Structural loss is handled by an
+    ///   explicit recovery state rather than silently falling back to a rail.
     ///
     /// Steering sign (empirical, DirectDiag):
     ///   DirectDiag SteerLeft commands SteeringAngle = +12 deg and the NPC
@@ -79,7 +80,8 @@ namespace StreetRacing.Race
         // now constrains the SPEED profile of that exact path so the driver can
         // follow/stop for traffic instead of physically rear-ending it.
         private readonly Perception perception = new Perception();
-        private readonly LocalPlannerV1 localPlanner = new LocalPlannerV1();
+        private readonly LocalPlannerV2 localPlanner = new LocalPlannerV2();
+        private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
         private readonly DrivingReference drivingReference = new DrivingReference();
@@ -95,6 +97,8 @@ namespace StreetRacing.Race
         private bool lastLoggedLost;
         private int routeLostSinceMs = -1;
         private int referenceInvalidSinceMs = -1;
+        private int plannerInvalidSinceMs = -1;
+        private int recoveryEnteredMs = -1;
         private int stallSinceMs = -1;
         private int lastStallEventMs = -100000;
         private bool stallWasActive;
@@ -179,6 +183,7 @@ namespace StreetRacing.Race
             try { corridor.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localPlanner.Reset(); } catch { }
+            try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -223,6 +228,8 @@ namespace StreetRacing.Race
             lastLoggedLost = false;
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
+            plannerInvalidSinceMs = -1;
+            recoveryEnteredMs = -1;
             stallSinceMs = -1;
             lastStallEventMs = -100000;
             stallWasActive = false;
@@ -269,7 +276,7 @@ namespace StreetRacing.Race
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
                 telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -338,6 +345,7 @@ namespace StreetRacing.Race
             try { corridor.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localPlanner.Reset(); } catch { }
+            try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
 
@@ -383,6 +391,8 @@ namespace StreetRacing.Race
             lastLoggedLost = false;
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
+            plannerInvalidSinceMs = -1;
+            recoveryEnteredMs = -1;
             stallSinceMs = -1;
             lastStallEventMs = -100000;
             stallWasActive = false;
@@ -426,7 +436,7 @@ namespace StreetRacing.Race
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
                 telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;localPlanner=V1;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -600,7 +610,7 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            // Persistent world perception feeds Local Planner V1. Actor
+            // Persistent world perception feeds Local Planner V2. Actor
             // prediction is evaluated per candidate in world space.
             try
             {
@@ -817,7 +827,7 @@ namespace StreetRacing.Race
             lastRefRoadClamp = rr.RoadConstrainedPoints;
             lastRefDetail = rr.Detail;
 
-            LocalPlannerV1.Result lp = null;
+            LocalPlannerV2.Result lp = null;
             try
             {
                 lp = localPlanner.Plan(rr, corridor, route, perception, capability, profile,
