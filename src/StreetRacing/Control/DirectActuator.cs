@@ -338,7 +338,8 @@ namespace StreetRacing.Control
                 && egoSpeed > 5f
                 && Math.Abs(steerDeg) > 8f
                 && Math.Abs(yawRateDegS) > 8f
-                && steerDeg * yawRateDegS < 0f;
+                && steerDeg * yawRateDegS < 0f
+                && (Math.Abs(headErr) > 20f || Math.Abs(slipDeg) > 10f);
             bool unstable = !reversing && (
                 reverseMotion
                 || (egoSpeed > 7f && Math.Abs(slipDeg) > 22f)
