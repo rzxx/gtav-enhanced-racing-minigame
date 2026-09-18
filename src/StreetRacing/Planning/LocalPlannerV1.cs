@@ -106,7 +106,7 @@ namespace StreetRacing
                     profile, egoPos, egoHeading, egoSpeed, cruise, targetLat, candidateIndex++);
                 LastCandidates.Add(c);
                 if (Math.Abs(targetLat) < 0.25f && string.IsNullOrEmpty(c.RejectReason))
-                    roadDesiredCenter = c.RequiredDecel; // overloaded below: road desired telemetry
+                    roadDesiredCenter = c.RoadTargetSpeed;
             }
 
             // RequiredDecel is used only internally in V1 before selection to
@@ -220,7 +220,7 @@ namespace StreetRacing
                     chosen = LastCandidates[ci];
             }
 
-            float roadDesired = chosen.RequiredDecel; // internal carrier
+            float roadDesired = chosen.RoadTargetSpeed;
             chosen.RequiredDecel = Math.Max(0f, egoSpeed - chosen.TargetSpeed);
 
             result.Valid = true;
@@ -452,7 +452,8 @@ namespace StreetRacing
                 c.MinPredClearance = minClear;
                 c.MeanSpeed = mean;
                 c.MinSpeed = min;
-                c.RequiredDecel = roadDesired; // internal carrier; caller restores
+                c.RoadTargetSpeed = roadDesired;
+                c.RequiredDecel = Math.Max(0f, egoSpeed - desired[0]);
                 c.Score = score;
                 return c;
             }
