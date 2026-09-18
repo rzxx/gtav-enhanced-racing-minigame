@@ -241,7 +241,7 @@ namespace StreetRacing
                 var fOut = new OutputArgument();
                 var bOut = new OutputArgument();
                 var widthOut = new OutputArgument();
-                bool ok = Function.Call<bool>((Hash)0x132F52BBA570FE92,
+                bool ok = Function.Call<bool>((Hash)0x132F52BBA570FE92UL,
                     p.X, p.Y, p.Z,
                     2.0f, 1,
                     srcOut, dstOut, fOut, bOut, widthOut,
