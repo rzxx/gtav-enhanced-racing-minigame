@@ -69,7 +69,14 @@ namespace StreetRacing
         {
             if (e.KeyCode == cfg.CancelKey && state == RaceState.Racing)
             {
-                EndRace("Race cancelled.");
+                if (cfg.UseDiagDriver() || diagBrain.Running)
+                {
+                    EndDiag("Diagnostic cancelled.");
+                }
+                else
+                {
+                    EndRace("Race cancelled.");
+                }
             }
         }
 
@@ -94,6 +101,19 @@ namespace StreetRacing
 
         private void TickIdle()
         {
+            // DirectDiag isolation: its own minimal lifecycle with no route,
+            // no FinishPicker, no GPS, no planner, no recovery, no start
+            // validation. Never fall through to the normal arming pipeline
+            // below while diag is selected.
+            if (cfg.UseDiagDriver())
+            {
+                if (hasPending)
+                {
+                    CancelPending();
+                }
+                TickIdleDiag();
+                return;
+            }
             // --- Arming: waiting for the GPS route before releasing the rival.
             if (hasPending)
             {
@@ -270,8 +290,91 @@ namespace StreetRacing
             // route exists (or 1.5s timeout), so Build() starts on GPS.
         }
 
+        // DirectDiag minimal lifecycle: honk -> immediate start, no route.
+        // Deliberately bypasses FinishPicker, finish blip/checkpoint,
+        // hasPending, GPS wait, ValidateRouteForRival and rerolls.
+        private void TickIdleDiag()
+        {
+            bool down = false;
+            try
+            {
+                down = Game.IsControlPressed(GTA.Control.VehicleHorn);
+            }
+            catch
+            {
+            }
+            bool rising = down && !hornWasDown;
+            hornWasDown = down;
+            if (!rising || Game.GameTime - lastHonkAttempt < cfg.HonkDebounceMs)
+            {
+                return;
+            }
+            lastHonkAttempt = Game.GameTime;
+
+            if (!OpponentPicker.TryPick(cfg.MaxChallengeRange, out var vehicle, out var driver))
+            {
+                return; // silent: honking in empty traffic should do nothing
+            }
+
+            // Immediately assign the selected opponent and start the probe.
+            // No finish, no blip, no checkpoint, no pending arming.
+            oppVehicle = vehicle;
+            oppDriver = driver;
+            finish = Vector3.Zero;
+            activeStyle = cfg.ResolveDrivingStyle();
+            activeProfile = cfg.ResolveDriverProfile();
+            StartDiagNow();
+        }
+
+        private void StartDiagNow()
+        {
+            // Defensive: diag never owns a finish marker or GPS route, even
+            // for one frame. Clear any stale state from a previous mode.
+            try { finishBlip?.Delete(); } catch { }
+            try { finishCp?.Delete(); } catch { }
+            finishBlip = null;
+            finishCp = null;
+            finish = Vector3.Zero;
+            hasPending = false;
+            pendingOppVehicle = null;
+            pendingOppDriver = null;
+            pendingAttempts = 0;
+            raceStartTime = Game.GameTime;
+            lastHudTime = 0;
+            wasLeading = true;
+            try
+            {
+                telemetry?.Close();
+                telemetry = cfg.TelemetryEnabled ? new RaceTelemetry(raceStartTime, activeStyle, activeProfile.Name) : null;
+            }
+            catch
+            {
+                telemetry = null;
+            }
+            try
+            {
+                try { telemetry?.Event(0, "ARM", $"diag-direct;mode={cfg.DriverMode}"); } catch { }
+                diagBrain.Start(oppDriver, oppVehicle, telemetry, cfg.DiagCruise);
+            }
+            catch (Exception ex)
+            {
+                try { telemetry?.Event(0, "BRAIN_START_FAIL", ex.Message); } catch { }
+                EndDiag("Diagnostic failed to start.");
+                return;
+            }
+            state = RaceState.Racing;
+            Notification.PostTicker("Diagnostic started: throttle/coast/brake/steer probe.", false, false);
+        }
+
         private void StartRaceNow(string armReason)
         {
+            // Normal-race only. DirectDiag never reaches here: TickIdle
+            // routes diag honks straight to StartDiagNow with no pending,
+            // no blip and no GPS wait.
+            if (cfg.UseDiagDriver())
+            {
+                return;
+            }
             activeStyle = pendingStyle;
             // activeProfile already set from pending in the arming release;
             // keep fields consistent if StartRaceNow is called directly.
@@ -290,12 +393,7 @@ namespace StreetRacing
             try
             {
                 try { telemetry?.Event(0, "ARM", $"{armReason};mode={cfg.DriverMode}"); } catch { }
-                if (cfg.UseDiagDriver())
-                {
-                    // Phase-1 probe: no route/start gate, straight-road stages.
-                    diagBrain.Start(oppDriver, oppVehicle, telemetry, cfg.DiagCruise);
-                }
-                else if (cfg.UseSimpleDriver())
+                if (cfg.UseSimpleDriver())
                 {
                     simpleBrain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
                         activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
@@ -307,25 +405,23 @@ namespace StreetRacing
                         activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
                         cfg.UseDirectActuator(), cfg.DebugViz);
                 }
-                // Final start-line gate (Simple/Legacy only; Diag has no route):
-                // the temp-route check above used the arming-time pose; the
-                // rival may have crept. If the BUILT route is sideways from
-                // the actual start pose, do not race it — reject instead of
-                // recovering from a bad setup.
+                // Final start-line gate (normal races only): the temp-route
+                // check above used the arming-time pose; the rival may have
+                // crept. If the BUILT route is sideways from the actual start
+                // pose, do not race it — reject instead of recovering from a
+                // bad setup.
                 try
                 {
-                    if (!cfg.UseDiagDriver())
+                    string sr;
+                    bool ok = cfg.UseSimpleDriver()
+                        ? simpleBrain.IsStartPoseValid(out sr)
+                        : legacyBrain.IsStartPoseValid(out sr);
+                    if (!ok)
                     {
-                        string sr;
-                        bool ok = cfg.UseSimpleDriver()
-                            ? simpleBrain.IsStartPoseValid(out sr)
-                            : legacyBrain.IsStartPoseValid(out sr);
-                        if (!ok)
-                        {
-                            try { telemetry?.Event(0, "ARM_REJECT", $"built-route-invalid;{sr}"); } catch { }
-                            try { telemetry?.Close(); } catch { }
-                            telemetry = null;
-                            try { StopAllBrains(); } catch { }
+                        try { telemetry?.Event(0, "ARM_REJECT", $"built-route-invalid;{sr}"); } catch { }
+                        try { telemetry?.Close(); } catch { }
+                        telemetry = null;
+                        try { StopAllBrains(); } catch { }
                         try { finishBlip?.Delete(); } catch { }
                         try { finishCp?.Delete(); } catch { }
                         finishBlip = null;
@@ -334,7 +430,6 @@ namespace StreetRacing
                         state = RaceState.Cooldown;
                         Notification.PostTicker("No sane forward route for a race here. Try facing open road.", false, false);
                         return;
-                        }
                     }
                 }
                 catch { }
@@ -396,6 +491,14 @@ namespace StreetRacing
 
         private void TickRacing()
         {
+            // DirectDiag isolation: no finish-distance checks, no GPS/blip
+            // route reassertion, no route HUD, no finish dependency, no
+            // race-route validation while the probe is active.
+            if (cfg.UseDiagDriver() || diagBrain.Running)
+            {
+                TickDiagRacing();
+                return;
+            }
             var player = Game.Player.Character;
             if (player == null || !player.Exists() || player.IsDead)
             {
@@ -475,6 +578,107 @@ namespace StreetRacing
                 {
                 }
             }
+        }
+
+        // DirectDiag active tick: minimal lifecycle with no route state.
+        // No finish reference, no blip/GPS touch, no route HUD.
+        private void TickDiagRacing()
+        {
+            var player = Game.Player.Character;
+            if (player == null || !player.Exists() || player.IsDead)
+            {
+                EndDiag("Diagnostic over: you died.");
+                return;
+            }
+            if (!diagBrain.Valid())
+            {
+                EndDiag("Diagnostic over: rival out (wrecked / gone).");
+                return;
+            }
+            if (Game.GameTime - raceStartTime > cfg.RaceTimeoutMs)
+            {
+                EndDiag("Diagnostic timed out.");
+                return;
+            }
+
+            try
+            {
+                diagBrain.OnTick();
+            }
+            catch
+            {
+            }
+
+            // Explicit completion: the probe latches Finished after the Done
+            // stage holds; end automatically instead of idling as a dead race.
+            try
+            {
+                if (diagBrain.Finished)
+                {
+                    EndDiag("Diagnostic complete: throttle/coast/brake/steer done. See telemetry.");
+                    return;
+                }
+            }
+            catch { }
+
+            if (Game.GameTime - lastHudTime > 1000)
+            {
+                lastHudTime = Game.GameTime;
+                string msg;
+                try
+                {
+                    msg = $"~y~DIAG~s~ {diagBrain.TacticalName} tgt {diagBrain.TargetSpeed:F0} m/s act {diagBrain.ActualSpeed:F0} m/s";
+                }
+                catch
+                {
+                    msg = "~y~DIAG~s~ running";
+                }
+                try
+                {
+                    GTA.UI.Screen.ShowSubtitle(msg);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void EndDiag(string message)
+        {
+            try { telemetry?.Event(Game.GameTime - raceStartTime, "DIAG_END", message); } catch { }
+            try
+            {
+                StopAllBrains();
+            }
+            catch
+            {
+            }
+            // Defensive: diag never creates these, but clear stale markers
+            // if a previous normal race left any behind.
+            try
+            {
+                finishBlip?.Delete();
+                finishCp?.Delete();
+            }
+            catch
+            {
+            }
+            finishBlip = null;
+            finishCp = null;
+            finish = Vector3.Zero;
+            oppVehicle = null;
+            oppDriver = null;
+            try
+            {
+                telemetry?.Close();
+            }
+            catch
+            {
+            }
+            telemetry = null;
+            Notification.PostTicker(message, false, false);
+            cooldownUntil = Game.GameTime + cfg.CooldownMs;
+            state = RaceState.Cooldown;
         }
 
         private void EndRace(string message)

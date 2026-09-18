@@ -39,6 +39,10 @@ namespace StreetRacing.Race
         private int lastTeleMs;
 
         public bool Running { get; private set; }
+        // Explicit completion latch: set once the Done stage has held long
+        // enough to log the final result. The lifecycle polls this to end
+        // the diagnostic automatically instead of idling as a dead race.
+        public bool Finished { get; private set; }
         public string TacticalName => "DIAG_" + stage;
         public float TargetSpeed { get; private set; }
         public string SpeedLimit => "Diag:" + stage;
@@ -67,6 +71,7 @@ namespace StreetRacing.Race
             TargetSpeed = this.diagCruise;
             ActualSpeed = 0f;
             Running = true;
+            Finished = false;
             try
             {
                 try { driver.IsPersistent = true; } catch { }
@@ -165,6 +170,16 @@ namespace StreetRacing.Race
                 case Stage.Done:
                     TargetSpeed = 0f;
                     Apply(0f, 0f, 1f, 0f, false);
+                    // Explicit completion: hold the stopped state briefly so
+                    // the final telemetry lands, then latch Finished. Control
+                    // outputs above are unchanged; this only signals the
+                    // lifecycle to end the diagnostic automatically.
+                    if (heldS > 2f && !Finished)
+                    {
+                        Finished = true;
+                        try { telemetry?.Event(t, "DIAG_DONE", $"all-stages-complete;spd={egoSpeed:F1}"); } catch { }
+                        try { LogHw(t, "done"); } catch { }
+                    }
                     break;
             }
 
