@@ -215,7 +215,8 @@ namespace StreetRacing.Race
             {
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};gpsOnly=1;recovery=OFF;passing=OFF");
+                string headingChk = HeadingConventionCheck(vehicle);
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;passing=OFF");
                 telemetry?.Event(0, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
@@ -227,6 +228,8 @@ namespace StreetRacing.Race
                     telemetry?.Event(0, "POSE_CONNECTOR_FAIL", $"selftest={poseChk}");
                 if (steerChk != "OK")
                     telemetry?.Event(0, "STEER_SIGN_FAIL", $"selftest={steerChk}");
+                if (!headingChk.StartsWith("OK"))
+                    telemetry?.Event(0, "HEADING_CONVENTION_FAIL", headingChk);
             }
             catch { }
         }
@@ -342,9 +345,10 @@ namespace StreetRacing.Race
             {
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
+                string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};gpsOnly=1;recovery=OFF;passing=OFF;fromSnapshot=1");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=OFF;passing=OFF;fromSnapshot=1");
                 telemetry?.Event(tEv, "ACTUATOR", $"Direct;milestone GPS-centerline follower (route-anchored, persistent cmd speed);passing=OFF(override ini={enablePassing});gtaRejoin=OFF(override ini={useGtaRejoin});recovery=OFF");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
@@ -356,6 +360,8 @@ namespace StreetRacing.Race
                     telemetry?.Event(tEv, "POSE_CONNECTOR_FAIL", $"selftest={poseChk}");
                 if (steerChk != "OK")
                     telemetry?.Event(tEv, "STEER_SIGN_FAIL", $"selftest={steerChk}");
+                if (!headingChk.StartsWith("OK"))
+                    telemetry?.Event(tEv, "HEADING_CONVENTION_FAIL", headingChk);
             }
             catch { }
         }
@@ -631,7 +637,7 @@ namespace StreetRacing.Race
         }
 
         // --- JOIN: one-time pose-feasible merge, only until aligned.
-        // Uses PoseConnector (correct +tan sign) with ego snap at path[0].
+        // Uses PoseConnector (correct -tan sign for GTA headings) with ego snap at path[0].
         // Guarded by VerifyToward so a sign regression holds instead of
         // driving a path that leaves away from the nose.
         private ManeuverCommand BuildJoin(Vector3 egoPos, float egoSpeed, float dtPlan)
@@ -1016,6 +1022,23 @@ namespace StreetRacing.Race
             float m = float.MaxValue;
             foreach (var x in v) if (x < m) m = x;
             return m;
+        }
+
+        private static string HeadingConventionCheck(Vehicle v)
+        {
+            try
+            {
+                if (v == null || !v.Exists()) return "FAIL no-vehicle";
+                var nativeFwd = RaceMath.FlatNormalize(new Vector3(v.ForwardVector.X, v.ForwardVector.Y, 0f));
+                var fromHeading = RaceMath.VectorFromHeading(v.Heading);
+                float dot = RaceMath.FlatDot(nativeFwd, fromHeading);
+                float vecHeading = RaceMath.HeadingFromVector(nativeFwd);
+                float err = Math.Abs(RaceMath.HeadingDiffDeg(vecHeading, v.Heading));
+                if (dot < 0.98f || err > 5f)
+                    return $"FAIL dot={dot:F3};vehHead={v.Heading:F1};vecHead={vecHeading:F1};err={err:F1}";
+                return $"OK dot={dot:F3};err={err:F1}";
+            }
+            catch (Exception ex) { return "FAIL exc:" + ex.Message; }
         }
 
         private static float SafeHeading(Vehicle v)

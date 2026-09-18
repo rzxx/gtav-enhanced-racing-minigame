@@ -59,6 +59,7 @@ namespace StreetRacing
         private int armingBeginMs;
         private int armingSinceMs;
         private int armingLastSampleMs;
+        private int armingSampleNotBeforeMs;
         private int armingSampleAttempts;
         private int armingRerolls;
         private int armingLastReassertMs;
@@ -68,6 +69,11 @@ namespace StreetRacing
         // Timeout means "GPS still isn't available" (cancel), NEVER permission
         // to continue on FallbackWalk/StraightFallback.
         private const int SimpleSampleIntervalMs = 150;
+        // GTA rebuilds the active GPS route asynchronously after a new routed
+        // blip is created. Never sample on the next script tick: telemetry
+        // showed stale/mismatched routes being consumed ~55 ms after rerolls.
+        private const int SimpleInitialRouteSettleMs = 250;
+        private const int SimpleRerollRouteSettleMs = 350;
         private const int SimpleAcquireTimeoutMs = 8000;
         private const int LegacyAcquireTimeoutMs = 1500;
         private const int MaxArmingRerolls = 3;
@@ -199,13 +205,15 @@ namespace StreetRacing
             try { armingProfile = cfg.ResolveDriverProfile(); } catch { armingProfile = null; }
             armingBeginMs = now;
             armingSinceMs = now;
-            armingLastSampleMs = 0;
+            armingLastSampleMs = now;
+            armingSampleNotBeforeMs = now + SimpleInitialRouteSettleMs;
             armingSampleAttempts = 0;
             armingRerolls = 0;
             armingLastReassertMs = now;
             acceptedSnapshot = null;
 
             CreateFinishMarkers(armingFinish);
+            try { Notification.PostTicker("Challenge found. Calculating GPS route...", false, false); } catch { }
 
             // Lightweight arming telemetry immediately: startup failures must
             // be observable even when no race ever starts.
@@ -355,6 +363,8 @@ namespace StreetRacing
                 return;
             }
 
+            if (now < armingSampleNotBeforeMs)
+                return;
             if (now - armingLastSampleMs < SimpleSampleIntervalMs)
                 return;
             armingLastSampleMs = now;
@@ -485,12 +495,14 @@ namespace StreetRacing
                 {
                     armingFinish = spot2;
                     armingSinceMs = now;
-                    armingLastSampleMs = 0;
+                    armingLastSampleMs = now;
+                    armingSampleNotBeforeMs = now + SimpleRerollRouteSettleMs;
                     armingSampleAttempts = 0;
                     acceptedSnapshot = null;
                     armingLastReassertMs = now;
                     CreateFinishMarkers(armingFinish);
-                    try { telemetry?.Event(ElapsedArmingMs(), "ARM_REROLL_NEWFINISH", $"finish=({spot2.X:F0},{spot2.Y:F0});prevWhy={why}"); } catch { }
+                    try { Notification.PostTicker("Recalculating GPS route...", false, false); } catch { }
+                    try { telemetry?.Event(ElapsedArmingMs(), "ARM_REROLL_NEWFINISH", $"finish=({spot2.X:F0},{spot2.Y:F0});settleMs={SimpleRerollRouteSettleMs};prevWhy={why}"); } catch { }
                     return;
                 }
             }
@@ -512,6 +524,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             try { finishBlip?.Delete(); } catch { }
             try { finishCp?.Delete(); } catch { }
@@ -617,6 +630,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             try { telemetry?.Event(ElapsedArmingMs(), "RACE_START", $"src={snap.Source};pts={snap.Points.Count};len={snap.TotalLength:F0}"); } catch { }
             state = RaceState.Racing;
@@ -760,6 +774,7 @@ namespace StreetRacing
             armingOppDriver = null;
             acceptedSnapshot = null;
             armingSampleAttempts = 0;
+            armingSampleNotBeforeMs = 0;
             armingRerolls = 0;
             raceStartTime = Game.GameTime;
             lastHudTime = 0;

@@ -53,23 +53,27 @@ namespace StreetRacing
             return Math.Abs(SignedAngleDeg(a, b));
         }
 
-        /// GTA heading (deg, 0 = +Y/north, clockwise) from a flat direction vector.
+        /// GTA heading from a flat direction vector.
+        /// GTA/SHVDN convention: 0 = +Y/north, 90 = -X/west,
+        /// 180 = -Y/south, 270 = +X/east. Heading increases toward the left.
         public static float HeadingFromVector(Vector3 v)
         {
-            // GTA heading: 0 => (0,1), 90 => (1,0).
-            double rad = Math.Atan2(v.X, v.Y);
+            // Inverse of VectorFromHeading and equivalent to SHVDN Vector3.ToHeading().
+            double rad = Math.Atan2(-v.X, v.Y);
             double deg = rad * 180.0 / Math.PI;
-            if (deg < 0) deg += 360.0;
+            if (deg < 0.0) deg += 360.0;
+            if (deg >= 360.0) deg -= 360.0;
             return (float)deg;
         }
 
         public static Vector3 VectorFromHeading(float headingDeg)
         {
             double rad = headingDeg * Math.PI / 180.0;
-            return new Vector3((float)Math.Sin(rad), (float)Math.Cos(rad), 0f);
+            return new Vector3(-(float)Math.Sin(rad), (float)Math.Cos(rad), 0f);
         }
 
-        /// Smallest signed heading difference (target - current), -180..180.
+        /// Smallest signed GTA heading difference (target - current), -180..180.
+        /// Positive means target is to the left of current; negative means right.
         public static float HeadingDiffDeg(float target, float current)
         {
             float d = (target - current) % 360f;
