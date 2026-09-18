@@ -24,9 +24,9 @@ namespace StreetRacing.Race
     ///   -> Direct steering/throttle/brake.
     ///
     /// Local Planner V2 is ENABLED after the initial join:
-    ///   several pose-continuous lateral candidates inside RoadCorridor,
-    ///   world-space actor prediction per candidate, path+speed scoring, and
-    ///   short commitment/hysteresis for PASS_LEFT / PASS_RIGHT / RETURN.
+    ///   multi-stage trajectories in DrivingReference's own road envelope,
+    ///   world-space actor prediction per candidate, route-progress scoring,
+    ///   apex/pass-return shapes, and maneuver commitment/hysteresis.
     ///
     /// Still disabled:
     ///   semantic lane graph / oncoming-lane classification / player tactics /
