@@ -18,26 +18,26 @@ namespace StreetRacing.Race
     ///   -> persistent GPS centerline reference (route-anchored window, NOT
     ///      rebuilt through ego)
     ///   -> curvature-based desired road speed (cruise-capped, braking-feasible)
+    ///   -> path-specific actor prediction constrains speed for genuine conflicts
     ///   -> persistent acceleration-limited commanded speed
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
     /// Explicitly DISABLED by construction for this milestone:
-    ///   civilian traffic avoidance / passing (FOLLOW/PASS) /
+    ///   lateral traffic avoidance / passing (FOLLOW/PASS) /
     ///   player race tactics / candidate trajectory scoring / seven lateral
     ///   choices / Crashed state / ImpactClassifier-driven behavior /
     ///   RecoveryPrimitive / GTA DriveTo fallback / FallbackWalk /
-    ///   StraightFallback. Perception is OBSERVE-ONLY in this pass so traffic
-    ///   can be diagnosed without affecting planning.
+    ///   StraightFallback. Perception affects longitudinal speed only: the
+    ///   driver may follow/stop, but cannot change lanes to avoid or pass yet.
     ///
     /// Speed separation (the recursive bug this fixes):
     ///   desiredRoadSpeed = road allows (cruise + curvature + braking distance).
     ///   commandedSpeed  = persistent ramp toward desired (accel/decel limits).
     ///   actualSpeed     = vehicle.Speed (measured, NEVER feeds desired).
     ///   localTarget     = SpeedAtS(profile, sEgo) ~= commandedSpeed.
-    /// Telemetry exposes all four separately. SpeedLimit is "Curvature" only
-    /// when the ROAD caps speed; when the ramp lags behind desired it is
-    /// "AccelRamp", never mislabelled as curvature.
+    /// Telemetry exposes all four separately. SpeedLimit identifies
+    /// Traffic:<kind>#handle, Curvature, AccelRamp, or Cruise.
     ///
     /// Path separation (the ego-anchored bug this fixes):
     ///   TRACK path geometry is anchored to the ROUTE (PointAtS(AlongS + s)),
@@ -71,9 +71,9 @@ namespace StreetRacing.Race
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
-        // Observe-only in Simple for now: actors do NOT affect planning yet.
-        // We need to distinguish physical blockage from Rockstar/vehicle-state
-        // interference before enabling traffic behavior.
+        // Simple still has one geometric path (no passing yet), but perception
+        // now constrains the SPEED profile of that exact path so the driver can
+        // follow/stop for traffic instead of physically rear-ending it.
         private readonly Perception perception = new Perception();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
@@ -880,29 +880,65 @@ namespace StreetRacing.Race
                     Reverse = false,
                 };
             }
-            var vAllow = new float[n];
+            // First compute the road-only envelope. Keep this separate
+            // from actor constraints so desRoad_mps continues to mean exactly
+            // "what the road/curvature allows".
+            var kappas = new List<float>(n);
+            var roadAllow = new float[n];
             for (int i = 0; i < n; i++)
             {
                 float k = CurvatureOfPathAt(path, i);
+                kappas.Add(k);
                 float vc = k < 1e-5f ? cruise : (float)Math.Sqrt(aLat / k);
                 if (vc > cruise) vc = cruise;
                 if (top > 5f && vc > top) vc = top;
-                vAllow[i] = vc;
+                roadAllow[i] = vc;
             }
-            // Backwards braking pass: desired at ego already accounts for bends
-            // ahead, so the car brakes BEFORE the bend, not inside it.
+
+            var roadDes = new float[n];
+            roadDes[n - 1] = roadAllow[n - 1];
+            for (int i = n - 2; i >= 0; i--)
+            {
+                float ds = Math.Max(1f, ss[i + 1] - ss[i]);
+                float vr = (float)Math.Sqrt(roadDes[i + 1] * roadDes[i + 1] + 2f * aBrake * ds);
+                roadDes[i] = Math.Min(roadAllow[i], vr);
+            }
+            float roadDesired = RaceMath.Clamp(roadDes[0], 0f, cruise);
+            desiredRoadSpeed = roadDesired;
+
+            // Then constrain THIS executable path by predicted actors. We reuse
+            // the joint planner's swept-envelope logic but not its forward
+            // actual-speed limiter: Simple's persistent commandedSpeed remains
+            // the single acceleration authority (avoids the old actual+1 bug).
+            float[] jointAllow;
+            float[] plannerTarget;
+            float[] plannerArrival;
+            int constrainHandle;
+            string constrainKind;
+            float constrainS;
+            float minPredClearance;
+            SpeedPlanner.ProfileForPath(
+                path, ss, kappas, lats,
+                route.AlongS, perception, corridor,
+                egoSpeed, cruise, aLat, aBrake, top,
+                profile, cruise,
+                out jointAllow, out plannerTarget, out plannerArrival,
+                out constrainHandle, out constrainKind, out constrainS,
+                out minPredClearance);
+
+            // Re-run only the braking pass over the joint allow envelope.
+            // This preserves future-obstacle braking while keeping acceleration
+            // independent of measured actual speed.
             var vDes = new float[n];
-            vDes[n - 1] = vAllow[n - 1];
+            vDes[n - 1] = jointAllow[n - 1];
             for (int i = n - 2; i >= 0; i--)
             {
                 float ds = Math.Max(1f, ss[i + 1] - ss[i]);
                 float vr = (float)Math.Sqrt(vDes[i + 1] * vDes[i + 1] + 2f * aBrake * ds);
-                vDes[i] = Math.Min(vAllow[i], vr);
+                vDes[i] = Math.Min(jointAllow[i], vr);
             }
-            float desired = vDes[0];
-            if (desired < 0f) desired = 0f;
-            if (desired > cruise) desired = cruise;
-            desiredRoadSpeed = desired;
+            float desired = RaceMath.Clamp(vDes[0], 0f, cruise);
+            bool trafficLimited = constrainHandle != -1 && desired < roadDesired - 0.25f;
 
             // PERSISTENT commanded speed: ramp from PREVIOUS commanded toward
             // desired at physical limits. dtPlan is the real plan interval.
@@ -958,12 +994,15 @@ namespace StreetRacing.Race
             }
             catch { }
 
-            // SpeedLimit names the ROAD vs RAMP bottleneck honestly:
-            // Curvature only when the road itself caps; AccelRamp when the
-            // persistent command still lags behind a higher desired.
+            // Name the real limiting layer. Traffic wins over curvature when
+            // it is the reason the executable target is below the road target.
             string limit;
-            if (desired < cruise - 0.5f) limit = "Curvature";
-            else if (commandedSpeed < desired - 0.5f) limit = "AccelRamp";
+            if (trafficLimited)
+                limit = $"Traffic:{(string.IsNullOrEmpty(constrainKind) ? "Actor" : constrainKind)}#{constrainHandle}";
+            else if (roadDesired < cruise - 0.5f)
+                limit = "Curvature";
+            else if (commandedSpeed < desired - 0.5f)
+                limit = "AccelRamp";
             else limit = "Cruise";
 
             current = new TrajectoryCandidate
@@ -981,13 +1020,13 @@ namespace StreetRacing.Race
                 MaxKappa = maxKappa,
                 StationS = new List<float>(ss),
                 SpeedProfile = new List<float>(prof),
-                ArrivalT = new List<float>(ss.Count),
+                ArrivalT = plannerArrival != null ? new List<float>(plannerArrival) : new List<float>(ss.Count),
                 TargetSpeed = commandedSpeed,
                 SpeedLimiting = limit,
-                ConstrainHandle = -1,
-                ConstrainKind = "",
-                ConstrainS = -1f,
-                MinPredClearance = 999f,
+                ConstrainHandle = constrainHandle,
+                ConstrainKind = constrainKind ?? "",
+                ConstrainS = constrainS,
+                MinPredClearance = minPredClearance,
                 MeanSpeed = Mean(prof),
                 MinSpeed = Min(prof, cruise),
                 RequiredDecel = 0f,
@@ -1055,7 +1094,8 @@ namespace StreetRacing.Race
                         + $"headErr={route.HeadingErrorDeg:F0};firstTang={c.FirstTangentErrDeg:F1};"
                         + $"maxKappa={c.MaxKappa:F4};rawGpsK={lastRefRawKappa:F4};refK={lastRefKappa:F4};"
                         + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
-                        + $"s={route.AlongS:F0};{route.LocDetail}");
+                        + $"constr={(c.ConstrainHandle != -1 ? (c.ConstrainKind ?? "Actor") + "#" + c.ConstrainHandle + "@" + c.ConstrainS.ToString("F0") : "none")};"
+                        + $"minClear={c.MinPredClearance:F1};s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }
