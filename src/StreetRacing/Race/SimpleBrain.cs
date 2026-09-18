@@ -1065,6 +1065,13 @@ namespace StreetRacing.Race
                         lookPt = route.PointAtS(route.AlongS + ld);
                 }
                 catch { try { lookPt = hasCurrent ? current.AimPoint : egoPos; } catch { } }
+                int gear = 0;
+                int nextGear = 0;
+                float rpm = 0f;
+                try { gear = vehicle.CurrentGear; } catch { }
+                try { nextGear = vehicle.NextGear; } catch { }
+                try { rpm = vehicle.CurrentRPM; } catch { }
+
                 telemetry.Sample(t, style, joinState,
                     route.AlongS, route.Progress01, LookaheadM,
                     route.Lateral, corridor.HalfWidth, offCorr, route.HeadingErrorDeg, curv,
@@ -1099,7 +1106,8 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.ThrottlePowerActual01 : 0f,
                     pe.Valid ? pe.BrakeActual01 : 0f,
                     pe.Valid ? pe.SteerSaturationS : 0f,
-                    pe.Valid ? pe.StabilityMode : "");
+                    pe.Valid ? pe.StabilityMode : "",
+                    gear, nextGear, rpm);
             }
             catch { }
         }
