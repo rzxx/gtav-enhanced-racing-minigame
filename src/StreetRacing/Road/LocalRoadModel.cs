@@ -166,17 +166,27 @@ namespace StreetRacing
             if (node.Valid && edge.Valid)
             {
                 float axis = AxisHeadingError(node.Heading, edge.Heading);
-                confidence = axis < 18f ? 0.92f : 0.78f;
-                source = "Node+Edge";
+                float centers = RaceMath.FlatDistance(node.Center, edge.Center);
+                bool agree = axis < 22f && centers < 10f;
+                if (agree)
+                {
+                    confidence = RaceMath.Clamp(Math.Max(node.Confidence, edge.Confidence) + 0.12f, 0f, 0.96f);
+                    source = "Node+Edge";
+                }
+                else
+                {
+                    confidence = Math.Min(0.48f, Math.Max(node.Confidence, edge.Confidence));
+                    source = "NodeEdgeDisagree";
+                }
             }
             else if (node.Valid)
             {
-                confidence = 0.72f;
+                confidence = node.Confidence;
                 source = "Node";
             }
             else
             {
-                confidence = 0.58f;
+                confidence = edge.Confidence;
                 source = "Edge";
             }
 
@@ -219,12 +229,17 @@ namespace StreetRacing
                     float score = dist + z * 2.5f + axis * 0.18f;
                     if (score >= bestScore) continue;
                     bestScore = score;
+                    float quality = 0.90f
+                        - RaceMath.Clamp(dist / 26f, 0f, 1f) * 0.28f
+                        - RaceMath.Clamp(z / 7f, 0f, 1f) * 0.20f
+                        - RaceMath.Clamp(axis / 55f, 0f, 1f) * 0.22f;
                     best = new Obs
                     {
                         Valid = true,
                         Center = np,
                         Heading = AlignHeadingAxis(nh, refHeading),
                         Lanes = Math.Max(1, Math.Min(8, lanes)),
+                        Confidence = RaceMath.Clamp(quality, 0.30f, 0.88f),
                     };
                 }
                 catch { }
@@ -265,6 +280,12 @@ namespace StreetRacing
                 if (RaceMath.FlatDistance(p, center) > 22f) return new Obs();
                 if (Math.Abs(p.Z - center.Z) > 7f) return new Obs();
 
+                float dist = RaceMath.FlatDistance(p, center);
+                float z = Math.Abs(p.Z - center.Z);
+                float quality = 0.82f
+                    - RaceMath.Clamp(dist / 22f, 0f, 1f) * 0.24f
+                    - RaceMath.Clamp(z / 7f, 0f, 1f) * 0.18f
+                    - RaceMath.Clamp(axis / 55f, 0f, 1f) * 0.20f;
                 return new Obs
                 {
                     Valid = true,
@@ -274,6 +295,7 @@ namespace StreetRacing
                     ForwardLanes = f,
                     BackwardLanes = back,
                     MedianWidth = median,
+                    Confidence = RaceMath.Clamp(quality, 0.28f, 0.82f),
                 };
             }
             catch { return new Obs(); }
