@@ -184,6 +184,7 @@ namespace StreetRacing.Race
 
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
+            try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
@@ -350,6 +351,7 @@ namespace StreetRacing.Race
 
             try { route.Reset(); } catch { }
             try { corridor.Reset(); } catch { }
+            try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
