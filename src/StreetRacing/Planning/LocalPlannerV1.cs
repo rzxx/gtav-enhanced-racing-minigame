@@ -98,19 +98,14 @@ namespace StreetRacing
             usable = RaceMath.Clamp(usable, 0.75f, 6.0f);
 
             var targetLats = BuildTargets(usable);
-            float roadDesiredCenter = cruise;
             int candidateIndex = 0;
             foreach (float targetLat in targetLats)
             {
                 var c = BuildCandidate(reference, corridor, route, perception, capability,
                     profile, egoPos, egoHeading, egoSpeed, cruise, targetLat, candidateIndex++);
                 LastCandidates.Add(c);
-                if (Math.Abs(targetLat) < 0.25f && string.IsNullOrEmpty(c.RejectReason))
-                    roadDesiredCenter = c.RoadTargetSpeed;
             }
 
-            // RequiredDecel is used only internally in V1 before selection to
-            // carry roadDesired. Restore the selected candidate field later.
             int centerIndex = FindClosestIndex(LastCandidates, 0f);
             TrajectoryCandidate center = centerIndex >= 0 ? LastCandidates[centerIndex] : new TrajectoryCandidate();
 
@@ -147,6 +142,12 @@ namespace StreetRacing
                         && challenger.MinPredClearance > cc.MinPredClearance + 0.7f;
                     if (!committedUnsafe && !challengerDecisive)
                         bestIndex = committedIndex;
+                }
+                else if (centerIndex >= 0 && string.IsNullOrEmpty(center.RejectReason))
+                {
+                    // Road narrowed / committed corridor disappeared: unwind
+                    // through center instead of snapping across to the other side.
+                    bestIndex = centerIndex;
                 }
             }
 
@@ -505,6 +506,16 @@ namespace StreetRacing
                 {
                     if (!a.Valid) continue;
                     if (a.Dist > 130f) continue;
+
+                    // A car already beside us is not an immediate collision
+                    // merely because every candidate starts at egoPos. Ignore
+                    // the shared s~0 point when the actor is lateral, not ahead,
+                    // and not rapidly closing. Future stations still evaluate it.
+                    if (ss[i] < 3.0f
+                        && a.Longitudinal < 2.0f
+                        && Math.Abs(a.Lateral) > 1.35f
+                        && a.ClosingSpeed < 2.0f)
+                        continue;
 
                     Vector3 pred;
                     try { pred = perception.Predict(a, arrival[i]); }
