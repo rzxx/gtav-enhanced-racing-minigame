@@ -13,10 +13,17 @@ namespace StreetRacing.Control
     ///   - pure-pursuit steering to that point (cross-track + heading error);
     ///   - PI longitudinal tracking of the LOCAL planned speed.
     ///
-    /// GtaDriverActuator remains only as a baseline/diagnostic. Direct is the
-    /// default isolation test AND the intended actuator: if the AI stops, the
-    /// maneuver (path+speed) and these errors say why — there is no second
-    /// independent driving decision to blame.
+    /// COLLAPSED rules (Phases 1-3):
+    ///   - Reverse is EXPLICIT via ManeuverCommand.Reverse (recovery primitive
+    ///     only). Direct never infers reverse from heading error, even at
+    ///     >130 deg with zero speed: a zero-speed maneuver must HOLD.
+    ///   - Longitudinal uses BOTH Vehicle.Throttle and Vehicle.ThrottlePower.
+    ///     Legacy code set Throttle only; DriveV hardware diagnosis (DirectDiag)
+    ///     showed some cars need ThrottlePower to physically accelerate. Both
+    ///     are now commanded together and both are logged by the diag brain.
+    ///
+    /// GtaDriverActuator remains only as an emergency low-speed rejoin tool.
+    /// Direct is the default isolation test AND the intended actuator.
     internal sealed class DirectActuator : IVehicleActuator
     {
         private Ped driver;
@@ -125,7 +132,8 @@ namespace StreetRacing.Control
             {
                 if (vehicle != null && vehicle.Exists())
                 {
-                    vehicle.Throttle = 0f;
+                    try { vehicle.Throttle = 0f; } catch { }
+                    try { vehicle.ThrottlePower = 0f; } catch { }
                     try { vehicle.BrakePower = 0f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
                 }
@@ -146,6 +154,7 @@ namespace StreetRacing.Control
                 if (vehicle != null && vehicle.Exists())
                 {
                     try { vehicle.Throttle = 0f; } catch { }
+                    try { vehicle.ThrottlePower = 0f; } catch { }
                     try { vehicle.BrakePower = 1f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
                     vehicle.IsPersistent = false;
@@ -231,7 +240,12 @@ namespace StreetRacing.Control
             else if (egoSpeed > 15f) steerDeg = RaceMath.Clamp(steerDeg, -24f, 24f);
             else steerDeg = RaceMath.Clamp(steerDeg, -32f, 32f);
 
-            bool reversing = Math.Abs(headErr) > 130f && egoSpeed < 4f && distToLook > 4f;
+            // Explicit reverse ONLY: commanded by the recovery primitive via
+            // ManeuverCommand.Reverse. Never infer from heading error here —
+            // a maneuver that commanded zero speed must hold position, not
+            // back into traffic because the route is sideways.
+            bool reversing = false;
+            try { reversing = cmd.Reverse; } catch { reversing = false; }
             if (reversing) steerDeg = -steerDeg;
 
             try { vehicle.SteeringAngle = steerDeg; } catch { }
@@ -251,7 +265,9 @@ namespace StreetRacing.Control
             {
                 if (reversing)
                 {
-                    vehicle.Throttle = -0.6f;
+                    // Explicit recovery reverse: controlled, never inferred.
+                    try { vehicle.Throttle = -0.6f; } catch { }
+                    try { vehicle.ThrottlePower = -0.6f; } catch { }
                     try { vehicle.BrakePower = 0f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
                     thr = -0.6f;
@@ -260,13 +276,15 @@ namespace StreetRacing.Control
                 {
                     thr = RaceMath.Clamp(u, stalled ? 0.8f : 0f, 1f);
                     if (stalled && thr < 0.8f) thr = 0.8f;
-                    vehicle.Throttle = thr;
+                    try { vehicle.Throttle = thr; } catch { }
+                    try { vehicle.ThrottlePower = thr; } catch { }
                     try { vehicle.BrakePower = 0f; } catch { }
                     try { vehicle.IsHandbrakeForcedOn = false; } catch { }
                 }
                 else
                 {
-                    vehicle.Throttle = 0f;
+                    try { vehicle.Throttle = 0f; } catch { }
+                    try { vehicle.ThrottlePower = 0f; } catch { }
                     brk = RaceMath.Clamp(-u, 0.15f, 1f);
                     if (lookSpeed < 0.5f && egoSpeed > 1f) brk = 1f;
                     try { vehicle.BrakePower = brk; } catch { }

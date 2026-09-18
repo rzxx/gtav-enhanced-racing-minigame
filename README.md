@@ -3,13 +3,21 @@
 Drive up behind someone, honk, and race them to a random point on the map.
 No checkpoints, no lobbies — first to the yellow marker wins.
 
-## Status: v2 racing architecture
+## Status: COLLAPSED minimal driver (no racecraft until foundations pass)
+
+Complexity was retired before competence: the 7-candidate + tactics +
+Crashed stack oscillated laterally, braked for its own curvature, false-
+triggered IMPACT with zero damage, deadlocked recovery at 0 m/s, and
+inferred reverse inside the actuator. Do not re-add states, candidates, or
+guards until the dumb driver below passes controlled tests.
 
 - **Trigger:** honk at an NPC driver ahead of you / in your camera view (scores angle + aim + distance, so it picks who you meant)
 - **Finish:** random road point 1.2–2.8 km ahead (configurable), snapped to street, shown as yellow blip + GPS route + 3D cylinder
-- **Start:** instant rolling start, rival launches the moment you honk
-- **AI:** full pipeline `route -> corridor -> perception -> tactics -> trajectories -> speed -> actuator (stock DriveTo servo)`; see Architecture below
-- **HUD:** ticker messages + 1 Hz subtitle with both distances, who leads, tactical mode and target speed
+- **Start:** instant rolling start, rival launches the moment you honk (start-pose gate rejects sideways routes instead of recovering from bad setup)
+- **AI (default `DriverMode=Simple`):** `GPS route -> stable localization -> ONE pose-feasible center trajectory (PoseConnector +tan) -> curvature-capped fixed/moderate speed -> Direct`. No candidates, no opponent tactics, no overtaking, no collision avoidance, no `Crashed`, no dynamic recovery FSM, no civilian behavior (unless `EnablePassing=1` for the single-blocker test).
+- **Diag (`DriverMode=DirectDiag`):** Phase-1 hardware probe — no perception/route/planner. Straight-road `throttle(6s) -> coast(2s) -> brake -> steerL/R` with `Throttle+ThrottlePower/brake/gear/RPM/speed/accel` logging. Prove Direct moves a DriveV car before any AI work.
+- **Legacy (`DriverMode=Legacy`):** old full stack preserved for comparison only (7 candidates + tactics). Not the milestone path.
+- **HUD:** ticker messages + 1 Hz subtitle with both distances, who leads, intent/mode and target speed
 - **Cancel:** `G` key (configurable), plus auto-cancel on death/wreck/timeout
 
 ## Requirements
@@ -49,26 +57,36 @@ Then in game press **Insert** to reload scripts (or restart the game).
 | RefreshIntervalMs / StuckTimeoutMs | 2000 / 4000 | actuator refresh + stuck repath |
 | RaceTimeoutMs / CooldownMs | 600000 / 8000 | give-up timer, rest between races |
 | CancelKey | G | cancel active race |
-| DebugViz | 0 | 1 = in-game overlay: route/corridor/candidates/predictions/braking |
-| Actuator | Direct | Direct (intended: executes joint path/speed every tick) or GtaDriver (baseline/diagnostic only) |
+| DebugViz | 0 | 1 = in-game overlay: route/corridor/single-path/aim |
+| Actuator | Direct | Direct (executes maneuver every tick) or GtaDriver (emergency rejoin only) |
+| DriverMode | Simple | Simple (dumb follower, default) / DirectDiag (hardware probe) / Legacy (old stack, comparison only) |
+| SimpleCruise | 18 | Simple follower cruise cap m/s; effective = min(AiCruiseSpeed, SimpleCruise) |
+| EnablePassing | 0 | 1 = single-blocker FOLLOW/PASS test (Phase 5); 0 = pure route following |
+| UseGtaRejoin | 0 | 1 = emergency low-speed GTA DriveTo rejoin fallback; never normal driving |
+| DiagCruise | 18 | DirectDiag probe target speed m/s |
 
-## Architecture (v3 — joint maneuver)
+## Architecture (COLLAPSED — minimal competent driver)
 
 ```
-race route -> drivable corridor -> persistent perception -> tactics
-    -> JOINT maneuver (path + speed together) -> Direct -> DriveV
+Simple (default): GPS route -> stable localization -> ONE center path
+    (PoseConnector +tan) -> curvature-capped fixed speed -> Direct -> DriveV
+Diag:             fixed throttle/coast/brake/steer stages -> Direct -> DriveV
+Legacy:           old joint 7-candidate stack (DriverMode=Legacy only)
 ```
 
-- **Route (`Route/RaceRoute.cs`):** real connected GPS route first (`GET_GPS_BLIP_ROUTE_FOUND` / `GET_POS_ALONG_GPS_TYPE_ROUTE`, type 1 first, distance- then index-interpretation, densely sampled ~5 m so interpolation never cuts junctions into bad tangents), with connected street-walk fallback and straight last resort. `Source` (`GpsDist/GpsIdx/FallbackWalk/StraightFallback`) is logged; a `TryUpgradeToGps` pass adopts GPS within ~12 s if the blip route wasn't ready at Start (forward-compatible reproject only, dot > 0.5, else the upgrade is rejected). Localization is continuity-aware: predicted progress from motion, search around the expected station, score by distance + heading (dot > 0.5 required, dot <= 0 never healthy) + continuity; >12 m jumps while the car barely moves are rejected (`LocJump` + lost) instead of teleporting progress. Loss is tightened (`HeadingIncompatible` > 65 deg / 400 ms, `WrongDirection` > 70 deg, `WentBackwards` > 20 m, recovery re-acquire < 45 deg). `ValidateStart` gates the start line (close forward projection, <45 deg, continuous forward 30 m, no sharp branch) — bad destinations are rerolled/rejected, never raced. Recovery is a heading-compatible merge search (`TryGetRecoveryMerge`: <45 deg route, <65 deg bearing, reachable), not a blind 40 m point.
-- **Corridor (`Road/RoadCorridor.cs`):** FIXED `GET_ROAD_BOUNDARY_USING_HEADING` (one output, not two — probes left/right via ±90° with width/midpoint validation + on-road cross-check). Sampled profile along the horizon (slices every 10 m to lookahead+60 m, `HalfWidthAt/MinHalfWidthAhead/SliceAt`), not one `HalfWidth`. Sweep fallback, then conservative default.
-- **Perception (`Sense/Perception.cs`):** PERSISTENT tracking by handle with short expiry + coast/hysteresis (no clear/rebuild TTC-sorted top-24). Always retains route/path-relevant actors, the nearby safety bubble and the rival; stable relevance ordering (TTC is one signal, not the retention order). Route-frame actors (`RouteS/RouteLateral/SpeedAlong/ClosingAlong/RouteTtc`) + `OffRoadway` flag so sidewalk peds/props never constrain paths they cannot intersect. `TryGetLeadOnRoute` for Follow. Explicit `Reset()` per race (tracks/scan/retention cleared).
-- **Capability (`Planning/VehicleCapability.cs`):** spin/yaw rejection via slip + yaw gates; confidence 0..1 (rises stable, collapses on slide/spin); only stable physical samples adapt brake/lat/top. Impacts/teleports never train it. `Seed()` fully resets per race (incl. observed peaks).
-- **Maneuver (`Planning/TrajectoryPlanner.cs` + `SpeedPlanner.cs`):** JOINT 7-candidate plan, now POSE-aware. Every candidate is a cubic Hermite `d(0)=current lateral, d'(0)=-tan(headErr), d(S)=desired, d'(S)=0` on 5 m stations, so all paths begin FORWARD from the nose and spread laterally; a 90 deg merge yields large `maxKappa` + `pose-incompatible` instead of `maxKappa~0.01`. Per candidate: curvature speed profile → station arrival times → predict actors at those times → swept-envelope test along THAT path → constrain speed only for actors conflicting with THAT path → backwards braking pass (+ forward accel feasibility) → score the complete maneuver (safety/clearance, progress/mean-speed, smoothness/curvature+decel, tactical/inside intent, road margin, hysteresis). Winner is path+speed together. Hard invariant: `|headErr| > 50 deg` never yields a cruise maneuver — the brain crawls (`PoseHold` 0 m/s / `PoseMerge` 5 m/s) or holds via a pose-aware recovery connector (`RecoveryMerge` 8 m/s, `maxKappa > 0.25` rejected as U-turn). `Reset()` per race (`PlanId` restarts at 1).
-- **Tactics (`Tactics/RaceTactics.cs`):** same modes/gates, route-aware, skips `OffRoadway` sidewalk clutter in `SideClear/Blocked/Clearance`. Forces `Recovery` on `|headErr| > 60 deg`. Explicit `Reset()` per race (no more starting in `Crashed`).
-- **Actuator (`Control/`):** `IVehicleActuator` seam now passes the full maneuver (`SetManeuver`: sampled `Path` + `StationS` + `SpeedProfile`). `DirectActuator` = intended controller: local speed-dependent lookahead on the SELECTED path + pure-pursuit steering + PI on LOCAL planned speed, every script tick (~20 Hz) independently of the ~10 Hz plan cadence. `GtaDriverActuator` = baseline/diagnostic only (servo-tracks aim+speed, rate-limited re-issue). Both report extended `PathFollowingError` (cross-track/heading/local-speed + steer/throttle/brake) every tick. Controller state fully reset per race (new instance + zeroed integrators).
-- **Viz (`Debug/RaceDebugViz.cs`):** route/corridor/candidates/chosen/predictions/aim/braking markers (`DebugViz=1`), plus ego nose vector (white) vs route tangent (magenta) — on a straight start all gray/cyan candidate lines must leave the nose forward; sideways lines mean the race must not start.
-- **Skill (`Core/DriverProfile.cs`):** unchanged numbers (no tuning this pass).
-- **Impacts (`Sense/ImpactClassifier.cs`):** unchanged.
+- **Pose connector (`Core/PoseConnector.cs`, single source):** cubic Hermite `d(0)=current lateral, d'(0)=+tan(headErr), d(S)=0, d'(S)=0`. Sign proof in file: route-north/ego+10°-right gives `d' = -sin10/cos10 = tan(-10)`. Verified: ego 94°/route 124° reconstructs 94° (err 0); old `-tan` gave 154° (err +60°). `VerifyToward()` guards every Simple plan (first tangent must rotate toward the nose); `SelfTest()` returns `OK` and is logged at race start.
+- **Route (`Route/RaceRoute.cs`, preserved):** real connected GPS route first, fallback walk, straight last resort; continuity-aware localization (expected station, heading dot, 12 m jump guard); `ValidateStart` gates sideways starts; `TryGetRecoveryMerge` finds heading-compatible future merges. Unchanged geometry, new owner (SimpleBrain).
+- **Corridor (`Road/RoadCorridor.cs`, preserved):** sampled half-width profile for margin audit + pass-width check. No decisions in Simple mode beyond `MinHalfWidthAhead` for the gated pass test.
+- **Capability (`Planning/VehicleCapability.cs`, preserved):** handling-seeded + stable-sample adaptation. Impacts/teleports never train it.
+- **Simple follower (`Race/SimpleBrain.cs`, DEFAULT):** one center path per plan tick (no lateral alternatives, so no whole-road oscillation); curvature-only speed (`sqrt(aLat/k)` + braking/accel passes, no obstacle planner); stable `AlongS`; `INTENT` events (not `PLAN` flicker). Speed defaults to `min(AiCruiseSpeed, SimpleCruise)` ≈ 15–20 m/s.
+- **Intent (`Race/ManeuverIntent.cs`, Phase 4 foundation):** `KEEP_LINE / FOLLOW / PASS_LEFT / PASS_RIGHT / RECOVER` with 1.5 s dwell hysteresis. Trajectory is generated INSIDE the intent. Simple defaults to `KEEP_LINE`; `RECOVER` only via the primitive below; `FOLLOW/PASS` only when `EnablePassing=1`.
+- **Recovery (`Race/RecoveryPrimitive.cs`, Phase 3):** explicit `Stop -> Reverse (controlled 8 m, Reverse=true) -> Forward crawl -> Rejoin (heading-compatible connector)`. Entry needs corroboration (IsLost / headErr>50 / collision+decel / damage+decel / 4 s no-progress) — never decel alone. Never holds 0 indefinitely: no-merge crawls at ≤4 m/s so pose changes. `ManeuverCommand.Reverse` is the ONLY reverse authority. GTA `DriveTo` is emergency-rejoin only (`UseGtaRejoin=1`).
+- **Actuator (`Control/DirectActuator.cs`):** pure-pursuit + PI on the single path. Commands BOTH `Throttle` and `ThrottlePower` (DriveV hardware needs both on some cars). Reverse ONLY when `cmd.Reverse` is set. Legacy secret `headErr>130°` auto-reverse is deleted.
+- **Impacts (`Sense/ImpactClassifier.cs`, fixed):** decel alone (even <-12) is NEVER Impact — it is Braking. Impact needs `damage>=4` or `HasCollided` plus strong decel. False zero-damage IMPACTs no longer feed recovery.
+- **Tactics (`Tactics/RaceTactics.cs`, retired from default):** `Crashed` never assigned (kept in enum for compat). Legacy brain only.
+- **Legacy (`Race/RaceBrain.cs`, `Planning/TrajectoryPlanner.cs`, `Sense/Perception.cs`):** preserved for `DriverMode=Legacy` comparison. Pose sign fixed there too; legacy no-merge hold changed from 0 m/s deadlock to 3 m/s crawl.
+- **Viz (`Debug/RaceDebugViz.cs`, preserved):** draws the single Simple path (cyan) + route/corridor/nose-vs-tangent. On a straight start the single line must leave the nose forward.
+- **Skill (`Core/DriverProfile.cs`):** unchanged numbers (no tuning until foundations pass).
 
 ## AI diagnostics (telemetry)
 
@@ -77,9 +95,13 @@ Disable with `TelemetryEnabled=0`. Send both files after test races to tune furt
 
 Samples: legacy 42 cols unchanged, then `chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt` — chosen candidate + its speed profile summary, which actor constrained which station, predicted clearance, planner id, controller errors/outputs — then pose-foundation cols `egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m` (heading compatibility + continuity audit).
 
-Events: `START / ROUTE / START_POSE / LOC / ROUTE_AHEAD / RECOVERY_MERGE / ROUTE_INVALID / ROUTE_VALID / GPS_ROUTE / ACTUATOR / TACTIC / ROUTE_LOST / ROUTE_FOUND / IMPACT / TELEPORT / HARD_BRAKE / CTRL / PATH_ERR / PLAN` (`PLAN` now includes `egoHead/routeHead/headErr/firstTangErr/maxKappa/seg/s/expS/locDetail`; `START_POSE` + `LOC` carry the full pose-foundation snapshot; `RECOVERY_MERGE` names the selected merge station or why none exists).
+Events (Simple): `START / ROUTE (poseCheck=OK) / START_POSE / GPS_ROUTE / ACTUATOR / INTENT (intent/why/held + lat/v/lim + egoHead/routeHead/headErr/firstTang/maxKappa/s) / RECOVER_ENTER / RECOVER_EXIT / PASS_COMMIT (only if EnablePassing=1) / POSE_CONNECTOR_FAIL (must never fire) / IMPACT (corroborated only) / TELEPORT`. Legacy adds `PLAN / TACTIC / ROUTE_LOST / RECOVERY_MERGE`.
 
-Decisive test (straight road first, before any traffic/racecraft tuning): honk at a same-direction rival on a straight road with `DebugViz=1`. Expect: `START_POSE` shows `headErr` < ~15 deg; every gray/cyan candidate line leaves the nose FORWARD and spreads laterally; `firstTangErr` < ~10 deg, `maxKappa` < ~0.005, `v_tgt` near cruise, `prog_m` advances monotonically (~speed × t) over the first 3 s with no 18–30 m jumps (`locJump_m` ≈ motion per tick). If the debug lines go sideways or `headErr` ≈ 90 deg on sample 1, the start gate must reject the race (`ARM_REJECT`) — do not tune steering, profiles, TTC, overtaking or peds until this holds consistently.
+Decisive tests in order (do not tune profiles/heuristics until each passes):
+
+1. **Direct hardware (`DriverMode=DirectDiag`, straight road):** `DIAG_STAGE` Throttle→Coast→Brake→SteerL→SteerR→Done with `DIAG` rows showing `cmdThr=1/actThr/thrPow` rising together and `spd` climbing from 0 toward `DiagCruise` (15–20), then falling under brake, then lateral response to ±12° steer. If `thr=1/brk=0` yet `spd=0`, inspect `thrPow/gear/rpm/eng` columns — fix hardware layer first.
+2. **Dumb follower (`DriverMode=Simple`, `EnablePassing=0`, straight road, `DebugViz=1`):** `START_POSE headErr` < ~15°; the SINGLE cyan line leaves the nose forward; `INTENT` stays `KEEP_LINE`; `firstTangErr` < ~10°, `maxKappa` < ~0.005, `v_tgt` near `SimpleCruise`, `prog_m` advances monotonically (~speed × t) with `locJump_m` ≈ motion per tick. Lateral target must NOT jump across the road (single endLat=0 by construction).
+3. **City route:** 1–2 km ordinary route at ~15–20 m/s without leaving road, stopping for no reason, oscillating, or entering `RECOVER`. Only then enable `EnablePassing=1` for the one-stopped-civilian pass test, then rebuild racecraft.
 
 Retired: `offroad_m` (invalid street-node distance), 40 m frontal-only sensing, `dec`-only brake detection, alignment-only wrong-way detection, long-range `DriveTo(finish)`, global corridor-wide obstacle speed, creep heuristic, TTC-sorted top-24 perception rebuild.
 

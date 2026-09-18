@@ -12,10 +12,11 @@ namespace StreetRacing
     }
 
     /// Distinguishes real braking from crashes and position teleports.
-    /// The old detector flagged any `dec < -7` as HARD_BRAKE, so `dec < -20`
-    /// impact/teleport samples (physically impossible for tyres) polluted
-    /// braking analysis. Anything beyond plausible tyre decel is classified
-    /// as impact or teleport, never as braking.
+    /// Collapsed rule (Phase 3): deceleration ALONE never classifies a crash.
+    /// Almost all legacy IMPACT events had zero damage: hard braking /
+    /// physics spikes fed Crashed -> Recovery and poisoned normal driving.
+    /// Impact now requires corroborated evidence: actual collision flag or
+    /// damage drop, plus strong decel. Anything else is Braking/Normal.
     internal static class ImpactClassifier
     {
         /// Plausible DriveV limits (generous so modded cars don't false-trip).
@@ -35,14 +36,15 @@ namespace StreetRacing
             if (displacementM > Math.Max(30f, speed * dtS + 25f) && dtS < 0.5f)
                 return SampleKind.Teleport;
 
-            // Impact: impossible decel, or strong decel corroborated by damage
-            // / collision flags. Health is int-based; any multi-point drop in
-            // one 100 ms sample is a hit, not wear.
-            if (accel < -MaxPlausibleBrakeDecel)
-                return SampleKind.Impact;
+            // Impact: strong decel CORROBORATED by damage / collision flags.
+            // Decel alone (even < -12) is braking or a physics spike, never
+            // an impact: legacy traces showed almost all IMPACT events with
+            // zero damage, feeding false Crashed -> Recovery.
             if (healthDrop >= 4f && accel < -3f)
                 return SampleKind.Impact;
             if (hasCollided && accel < -8f)
+                return SampleKind.Impact;
+            if (accel < -MaxPlausibleBrakeDecel && (hasCollided || healthDrop >= 4f))
                 return SampleKind.Impact;
 
             if (accel < -HardBrakeThreshold)

@@ -16,6 +16,11 @@ namespace StreetRacing.Tactics
         Defend,
         CornerPrep,
         Recovery,
+        /// COLLAPSED (Phase 3): Crashed is retired as a normal tactical state.
+        /// It fed Recovery from decel-only false impacts and poisoned driving.
+        /// Kept in the enum for telemetry compat; never assigned in collapsed
+        /// logic. Recovery primitives (stop/reverse/rejoin) own stuck/crash
+        /// handling with corroborated evidence, not this FSM.
         Crashed,
     }
 
@@ -80,16 +85,14 @@ namespace StreetRacing.Tactics
             float rLat = RaceMath.FlatCross(egoFwd, toRival);
             bool alongside = Math.Abs(rLong) < 9f && Math.Abs(rLat) < 4f && rivalDist < 14f;
 
-            // Priority 0: crash / route loss / heading-incompatible route.
-            // A >~60 deg route tangent is not a racing state: it means wrong
-            // branch localization or a required special merge. Crawl via
-            // Recovery instead of commanding cruise into a sideways route.
-            if (justImpacted && egoSpeed < 5f)
-            {
-                want = TacticalMode.Crashed;
-                reason = "impact+slow";
-            }
-            else if (route.IsLost)
+            // Priority 0 (COLLAPSED Phase 3): Crashed is NOT a normal state.
+            // justImpacted (decel-only) never forces Crashed/Recovery: impact
+            // classification already requires corroboration, and a decel spike
+            // with zero damage must not interrupt driving. Route loss and
+            // heading-incompatible routes still gate to Recovery (explicit
+            // rejoin primitive in the Simple driver, not a tactical mode).
+            // justImpacted is therefore intentionally ignored here.
+            if (route.IsLost)
             {
                 want = TacticalMode.Recovery;
                 reason = "route:" + route.LossReason;
@@ -99,20 +102,11 @@ namespace StreetRacing.Tactics
                 want = TacticalMode.Recovery;
                 reason = $"heading-incompatible:{route.HeadingErrorDeg:F0}";
             }
-            else if (Mode == TacticalMode.Crashed && egoSpeed > 6f && nowMs - SinceMs > 1200)
-            {
-                want = TacticalMode.Recovery;
-                reason = "regained-motion";
-            }
-            else if (Mode == TacticalMode.Recovery && !route.IsLost)
+            else if (Mode == TacticalMode.Recovery && !route.IsLost
+                && (route == null || !route.Built || Math.Abs(route.HeadingErrorDeg) <= 60f))
             {
                 want = TacticalMode.Cruise;
                 reason = "route-reacquired";
-            }
-            else if (Mode == TacticalMode.Crashed && nowMs - SinceMs > 5000)
-            {
-                want = TacticalMode.Recovery;
-                reason = "crash-timeout";
             }
             else
             {

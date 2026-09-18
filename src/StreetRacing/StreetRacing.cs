@@ -17,7 +17,11 @@ namespace StreetRacing
     {
         private readonly StreetRacingConfig cfg;
         private RaceState state = RaceState.Idle;
-        private readonly RaceBrain brain = new RaceBrain();
+        // Collapsed brains: Simple (default dumb follower), Diag (Phase-1
+        // hardware probe), Legacy (old full stack, comparison only).
+        private readonly RaceBrain legacyBrain = new RaceBrain();
+        private readonly SimpleBrain simpleBrain = new SimpleBrain();
+        private readonly DirectDiagBrain diagBrain = new DirectDiagBrain();
 
         private Vehicle oppVehicle;
         private Ped oppDriver;
@@ -285,23 +289,43 @@ namespace StreetRacing
             }
             try
             {
-                try { telemetry?.Event(0, "ARM", $"{armReason}"); } catch { }
-                brain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
-                    activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
-                    cfg.UseDirectActuator(), cfg.DebugViz);
-                // Final start-line gate: the temp-route check above used the
-                // arming-time pose; the rival may have crept. If the BUILT
-                // route is sideways from the actual start pose, do not race
-                // it — reject instead of recovering from a bad setup.
+                try { telemetry?.Event(0, "ARM", $"{armReason};mode={cfg.DriverMode}"); } catch { }
+                if (cfg.UseDiagDriver())
+                {
+                    // Phase-1 probe: no route/start gate, straight-road stages.
+                    diagBrain.Start(oppDriver, oppVehicle, telemetry, cfg.DiagCruise);
+                }
+                else if (cfg.UseSimpleDriver())
+                {
+                    simpleBrain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
+                        activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
+                        cfg.DebugViz, cfg.SimpleCruise, cfg.EnablePassing, cfg.UseGtaRejoin);
+                }
+                else
+                {
+                    legacyBrain.Start(oppDriver, oppVehicle, finish, cfg.AiCruiseSpeed, activeStyle,
+                        activeProfile, telemetry, cfg.RefreshIntervalMs, cfg.StuckTimeoutMs,
+                        cfg.UseDirectActuator(), cfg.DebugViz);
+                }
+                // Final start-line gate (Simple/Legacy only; Diag has no route):
+                // the temp-route check above used the arming-time pose; the
+                // rival may have crept. If the BUILT route is sideways from
+                // the actual start pose, do not race it — reject instead of
+                // recovering from a bad setup.
                 try
                 {
-                    string sr;
-                    if (!brain.IsStartPoseValid(out sr))
+                    if (!cfg.UseDiagDriver())
                     {
-                        try { telemetry?.Event(0, "ARM_REJECT", $"built-route-invalid;{sr}"); } catch { }
-                        try { telemetry?.Close(); } catch { }
-                        telemetry = null;
-                        try { brain.Stop(); } catch { }
+                        string sr;
+                        bool ok = cfg.UseSimpleDriver()
+                            ? simpleBrain.IsStartPoseValid(out sr)
+                            : legacyBrain.IsStartPoseValid(out sr);
+                        if (!ok)
+                        {
+                            try { telemetry?.Event(0, "ARM_REJECT", $"built-route-invalid;{sr}"); } catch { }
+                            try { telemetry?.Close(); } catch { }
+                            telemetry = null;
+                            try { StopAllBrains(); } catch { }
                         try { finishBlip?.Delete(); } catch { }
                         try { finishCp?.Delete(); } catch { }
                         finishBlip = null;
@@ -310,6 +334,7 @@ namespace StreetRacing
                         state = RaceState.Cooldown;
                         Notification.PostTicker("No sane forward route for a race here. Try facing open road.", false, false);
                         return;
+                        }
                     }
                 }
                 catch { }
@@ -377,7 +402,7 @@ namespace StreetRacing
                 EndRace("You died. Race over.");
                 return;
             }
-            if (!brain.Valid())
+            if (!ActiveValid())
             {
                 EndRace("Rival is out (wrecked / gone). Race over.");
                 return;
@@ -390,7 +415,7 @@ namespace StreetRacing
 
             try
             {
-                brain.OnTick();
+                ActiveOnTick();
             }
             catch
             {
@@ -434,7 +459,7 @@ namespace StreetRacing
                 string msg;
                 try
                 {
-                    msg = $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  {lead} ~s~[{brain.TacticalName} {brain.TargetSpeed:F0} {brain.RouteSource} {brain.ActuatorName}]";
+                    msg = $"~y~RACE~s~  You: {(int)dYou}m  Rival: {(int)dOpp}m  {lead} ~s~[{ActiveTactical()} {ActiveTargetSpeed():F0} {ActiveRouteSource()} {ActiveActuator()}]";
                 }
                 catch
                 {
@@ -456,7 +481,7 @@ namespace StreetRacing
         {
             try
             {
-                brain.Stop();
+                StopAllBrains();
             }
             catch
             {
@@ -491,7 +516,7 @@ namespace StreetRacing
             pendingOppDriver = null;
             try
             {
-                brain.Stop();
+                StopAllBrains();
             }
             catch
             {
@@ -506,6 +531,76 @@ namespace StreetRacing
             {
             }
             telemetry = null;
+        }
+
+        // --- Collapsed brain dispatch (Simple default, Diag probe, Legacy).
+        private void StopAllBrains()
+        {
+            try { legacyBrain.Stop(); } catch { }
+            try { simpleBrain.Stop(); } catch { }
+            try { diagBrain.Stop(); } catch { }
+        }
+
+        private bool ActiveValid()
+        {
+            try
+            {
+                if (cfg.UseDiagDriver()) return diagBrain.Valid();
+                if (cfg.UseSimpleDriver()) return simpleBrain.Valid();
+                return legacyBrain.Valid();
+            }
+            catch { return false; }
+        }
+
+        private void ActiveOnTick()
+        {
+            if (cfg.UseDiagDriver()) diagBrain.OnTick();
+            else if (cfg.UseSimpleDriver()) simpleBrain.OnTick();
+            else legacyBrain.OnTick();
+        }
+
+        private string ActiveTactical()
+        {
+            try
+            {
+                if (cfg.UseDiagDriver()) return diagBrain.TacticalName;
+                if (cfg.UseSimpleDriver()) return simpleBrain.TacticalName;
+                return legacyBrain.TacticalName;
+            }
+            catch { return "?"; }
+        }
+
+        private float ActiveTargetSpeed()
+        {
+            try
+            {
+                if (cfg.UseDiagDriver()) return diagBrain.TargetSpeed;
+                if (cfg.UseSimpleDriver()) return simpleBrain.TargetSpeed;
+                return legacyBrain.TargetSpeed;
+            }
+            catch { return 0f; }
+        }
+
+        private string ActiveRouteSource()
+        {
+            try
+            {
+                if (cfg.UseDiagDriver()) return diagBrain.RouteSource;
+                if (cfg.UseSimpleDriver()) return simpleBrain.RouteSource;
+                return legacyBrain.RouteSource;
+            }
+            catch { return "?"; }
+        }
+
+        private string ActiveActuator()
+        {
+            try
+            {
+                if (cfg.UseDiagDriver()) return diagBrain.ActuatorName;
+                if (cfg.UseSimpleDriver()) return simpleBrain.ActuatorName;
+                return legacyBrain.ActuatorName;
+            }
+            catch { return "?"; }
         }
     }
 }

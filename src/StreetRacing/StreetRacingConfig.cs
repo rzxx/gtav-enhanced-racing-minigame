@@ -37,6 +37,29 @@ namespace StreetRacing
         // Default is Direct: the isolation test for planner deadlocks and the
         // intended controller going forward.
         public string ActuatorName = "Direct";
+        // Collapsed driver selection (Phases 1-5):
+        //   Simple     = ONE dumb center-path route follower (DEFAULT).
+        //                No candidates/tactics/traffic/Crashed. Proves the
+        //                1-2 km @15-20 m/s milestone before any racecraft.
+        //   DirectDiag = Phase-1 hardware probe (no perception/route/planner).
+        //                Straight-road throttle/coast/brake/steer validation.
+        //   Legacy     = old full stack (7 candidates + tactics + recovery).
+        //                Preserved for comparison only; not the milestone path.
+        public string DriverMode = "Simple";
+        // Simple follower cruise cap (m/s). Effective cruise is
+        // min(AiCruiseSpeed, SimpleCruise), clamped 5..25. 15-20 proving band.
+        public float SimpleCruise = 18f;
+        // Phase-5 single-blocker pass (one slower/stopped civilian ahead:
+        // FOLLOW if unsafe else committed PASS_LEFT/RIGHT, then KEEP_LINE).
+        // Default OFF for the milestone-1 dumb-driver test (pure route
+        // following). Player Attack/Defend/Commit/SideBySide stays retired
+        // until follow/control/recover/pass all pass.
+        public bool EnablePassing = false;
+        // Emergency low-speed GTA DriveTo rejoin ONLY (recovery primitive
+        // fallback). Never the normal driver. Default off.
+        public bool UseGtaRejoin = false;
+        // Diag probe target speed (m/s) for DirectDiag mode.
+        public float DiagCruise = 18f;
 
         public static StreetRacingConfig Load()
         {
@@ -64,6 +87,11 @@ namespace StreetRacing
                 c.GripFactor = (float)s.GetValue("Race", "GripFactor", (double)c.GripFactor);
                 c.DebugViz = s.GetValue("Race", "DebugViz", c.DebugViz);
                 c.ActuatorName = s.GetValue("Race", "Actuator", c.ActuatorName);
+                c.DriverMode = s.GetValue("Race", "DriverMode", c.DriverMode);
+                c.SimpleCruise = (float)s.GetValue("Race", "SimpleCruise", (double)c.SimpleCruise);
+                c.EnablePassing = s.GetValue("Race", "EnablePassing", c.EnablePassing);
+                c.UseGtaRejoin = s.GetValue("Race", "UseGtaRejoin", c.UseGtaRejoin);
+                c.DiagCruise = (float)s.GetValue("Race", "DiagCruise", (double)c.DiagCruise);
                 var keyName = s.GetValue("Race", "CancelKey", "G");
                 if (Enum.TryParse(keyName, true, out Keys k))
                 {
@@ -87,6 +115,26 @@ namespace StreetRacing
             {
                 string n = (ActuatorName ?? "").Trim().ToLowerInvariant();
                 return n == "direct" || n == "directactuator";
+            }
+            catch { return false; }
+        }
+
+        public bool UseSimpleDriver()
+        {
+            try
+            {
+                string n = (DriverMode ?? "").Trim().ToLowerInvariant();
+                return n == "simple" || n == "minimal" || n == "dumb" || n == "";
+            }
+            catch { return true; }
+        }
+
+        public bool UseDiagDriver()
+        {
+            try
+            {
+                string n = (DriverMode ?? "").Trim().ToLowerInvariant();
+                return n == "directdiag" || n == "diag" || n == "hardware" || n == "probe";
             }
             catch { return false; }
         }

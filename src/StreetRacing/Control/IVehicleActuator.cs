@@ -37,6 +37,10 @@ namespace StreetRacing.Control
         public int Style;
         public string Reason;
         public int PlanId;
+        // Explicit reverse command (recovery primitive ONLY). Direct must
+        // NEVER infer reverse from heading error: a maneuver that commanded
+        // zero speed must hold, not back up. Default false = forward only.
+        public bool Reverse;
     }
 
     /// Actuator abstraction: the joint planner outputs a full maneuver

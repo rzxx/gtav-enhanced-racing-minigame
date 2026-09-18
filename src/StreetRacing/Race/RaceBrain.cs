@@ -7,9 +7,12 @@ using StreetRacing.Tactics;
 
 namespace StreetRacing.Race
 {
-    /// Orchestrator for the street-racing AI:
-    ///   route -> corridor -> persistent perception/prediction -> tactics ->
-    ///   JOINT maneuver (path + speed together) -> actuator.
+    /// Orchestrator for the street-racing AI (LEGACY full stack).
+    /// Preserved for comparison via DriverMode=Legacy. The default collapsed
+    /// driver is SimpleBrain (one center path, no candidates/tactics).
+    /// Structural fixes (pose sign, corroborated impacts, explicit reverse)
+    /// are applied here too, but the 7-candidate + tactics complexity stays
+    /// retired from the milestone path — do not re-enable it by default.
     ///
     /// Architecture (this pass):
     ///   - Perception tracks entities persistently by handle (short
@@ -523,15 +526,17 @@ namespace StreetRacing.Race
                         else
                         {
                             // Infeasible merge (U-turn-like) or no merge:
-                            // hold position safely, never command cruise
-                            // into a sideways route.
-                            try { telemetry?.Event(t, "ROUTE_INVALID", $"hold;why={recWhy};headErr={route.HeadingErrorDeg:F0};seg={route.NearestIndex};s={route.AlongS:F0};dist={route.DistToRoute:F1};loss={route.LossReason};{route.LocDetail}"); } catch { }
+                            // CRAWL to change pose so a merge can appear.
+                            // Legacy deadlock was holdV=0 forever: pose never
+                            // changed so it never became mergeable. Collapsed
+                            // rule: never command a permanent zero here.
+                            try { telemetry?.Event(t, "ROUTE_INVALID", $"crawl;why={recWhy};headErr={route.HeadingErrorDeg:F0};seg={route.NearestIndex};s={route.AlongS:F0};dist={route.DistToRoute:F1};loss={route.LossReason};{route.LocDetail}"); } catch { }
                             var holdPath = new System.Collections.Generic.List<Vector3>
                             {
                                 egoPos,
                                 new Vector3(egoPos.X + egoFwd.X * 12f, egoPos.Y + egoFwd.Y * 12f, egoPos.Z)
                             };
-                            float holdV = 0f;
+                            float holdV = 3f;
                             chosen = new TrajectoryCandidate
                             {
                                 LateralM = 0f,
@@ -541,7 +546,7 @@ namespace StreetRacing.Race
                                 ClearanceM = 999f,
                                 CurveCost = 0f,
                                 TacticalBias = 0f,
-                                RejectReason = string.IsNullOrEmpty(recWhy) ? "recovery-hold" : recWhy,
+                                RejectReason = string.IsNullOrEmpty(recWhy) ? "recovery-crawl" : recWhy,
                                 Path = holdPath,
                                 StationS = new System.Collections.Generic.List<float> { 0f, 12f },
                                 SpeedProfile = new System.Collections.Generic.List<float> { holdV, holdV },
@@ -549,7 +554,7 @@ namespace StreetRacing.Race
                                 MinMarginM = 99f,
                                 MaxKappa = 0f,
                                 TargetSpeed = holdV,
-                                SpeedLimiting = headingInvalid ? "PoseHold" : "RecoveryHold",
+                                SpeedLimiting = headingInvalid ? "PoseCrawl" : "RecoveryCrawl",
                                 ConstrainHandle = -1,
                                 ConstrainKind = "",
                                 ConstrainS = -1f,

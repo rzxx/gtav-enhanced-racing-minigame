@@ -58,13 +58,17 @@ namespace StreetRacing
     /// Street-racing rules: the whole carriageway is drivable. Oncoming-lane
     /// use is allowed but penalised by risk unless tactics commits.
     ///
-    /// Pose continuity (this pass): every candidate begins from the actual
+    /// Pose continuity (collapsed): every candidate begins from the actual
     /// vehicle POSE (position + heading), not just position. Lateral profile
-    /// d(s) is a cubic Hermite with d(0)=current lateral, d'(0)=-tan(headErr)
+    /// d(s) is a cubic Hermite with d(0)=current lateral, d'(0)=+tan(headErr)
     /// (ego heading relative to route), d(S)=desired lateral, d'(S)=0
-    /// (merge parallel). The first meters therefore continue in the direction
-    /// the car already travels; a required ~90 deg merge produces huge
-    /// curvature/infeasibility instead of maxKappa~0.01.
+    /// (merge parallel). See Core/PoseConnector for the sign proof. The
+    /// first meters therefore continue in the direction the car already
+    /// travels; a required ~90 deg merge produces huge curvature instead
+    /// of maxKappa~0.01.
+    /// NOTE: the 7-candidate joint planner below is LEGACY (DriverMode=Legacy).
+    /// The default Simple driver (DriverMode=Simple) builds ONE center path
+    /// via PoseConnector and never scores lateral alternatives.
     internal sealed class TrajectoryPlanner
     {
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
@@ -139,8 +143,14 @@ namespace StreetRacing
             if (routeHeadErr < -180f) routeHeadErr = -180f;
 
             // Initial lateral slope from current heading relative to route:
-            // d'(0) = -tan(headErr). Positive headErr (route left of nose)
-            // means driving right of route => lateral decreasing => m0<0.
+            // d'(0) = +tan(headErr). headErr = routeHead - egoHead.
+            // Positive headErr (route left of nose) means the nose points
+            // right of the route, so to rejoin the nose must move left as s
+            // grows => lateral increasing => m0>0. Proof: route north,
+            // ego +10 deg right (headErr=-10): egoDir=(sin10,cos10),
+            // leftV=(-1,0), d' = dot(egoDir,leftV)/dot(egoDir,routeDir)
+            // = -sin10/cos10 = tan(headErr) < 0. So m0 = +tan(headErr).
+            // The old -tan bent the connector away from the nose.
             float m0;
             try
             {
@@ -151,7 +161,7 @@ namespace StreetRacing
                 // maneuver infeasible.
                 if (eRad > 1.1f) eRad = 1.1f;
                 if (eRad < -1.1f) eRad = -1.1f;
-                m0 = -(float)Math.Tan(eRad);
+                m0 = PoseConnector.LateralSlopeForHeadErrDeg(routeHeadErr);
                 if (m0 > 2f) m0 = 2f;
                 if (m0 < -2f) m0 = -2f;
             }
@@ -474,53 +484,16 @@ namespace StreetRacing
             return Chosen;
         }
 
-        /// Shared pose-aware connector: Hermite d(0)=d0, d'(0)=m0FromHeadErr,
-        /// d(S)=d1, d'(S)=0. Used by normal candidates and by recovery merges
-        /// so both share identical pose continuity (never an instantaneous
-        /// heading change at s=0).
+        /// Shared pose-aware connector: Hermite d(0)=d0, d'(0)=+tan(headErr),
+        /// d(S)=d1, d'(S)=0. Delegates slope to PoseConnector (single source).
+        /// Used by normal candidates and by recovery merges so both share
+        /// identical pose continuity (never an instantaneous heading change).
         public static List<Vector3> BuildPoseAwarePath(RaceRoute route, Vector3 egoPos,
             float startLat, float headErrDeg, float endLat, float lookaheadM,
             float stationDs, out List<float> pathLats, out List<float> pathS)
         {
-            pathLats = new List<float>();
-            pathS = new List<float>();
-            var path = new List<Vector3>();
-            try
-            {
-                float eRad = headErrDeg * (float)Math.PI / 180f;
-                if (eRad > 1.1f) eRad = 1.1f;
-                if (eRad < -1.1f) eRad = -1.1f;
-                float m0 = -(float)Math.Tan(eRad);
-                if (m0 > 2f) m0 = 2f;
-                if (m0 < -2f) m0 = -2f;
-                float S = Math.Max(lookaheadM, 10f);
-                int n = Math.Max(5, Math.Min(33, (int)Math.Ceiling(lookaheadM / stationDs) + 1));
-                for (int k = 0; k < n; k++)
-                {
-                    float s = k == n - 1 ? lookaheadM : k * stationDs;
-                    if (s > lookaheadM) s = lookaheadM;
-                    float t = S > 1f ? s / S : 1f;
-                    if (t < 0f) t = 0f;
-                    if (t > 1f) t = 1f;
-                    float t2 = t * t;
-                    float t3 = t2 * t;
-                    float h00 = 2f * t3 - 3f * t2 + 1f;
-                    float h10 = t3 - 2f * t2 + t;
-                    float h01 = -2f * t3 + 3f * t2;
-                    float lat = h00 * startLat + h10 * S * m0 + h01 * endLat;
-                    Vector3 rp = route.PointAtS(route.AlongS + s);
-                    float h = route.HeadingAtS(route.AlongS + s);
-                    var dir = RaceMath.VectorFromHeading(h);
-                    var leftV = new Vector3(-dir.Y, dir.X, 0f);
-                    path.Add(new Vector3(rp.X + leftV.X * lat, rp.Y + leftV.Y * lat, rp.Z));
-                    pathLats.Add(lat);
-                    pathS.Add(s);
-                    if (s >= lookaheadM - 0.01f) break;
-                }
-                if (path.Count > 0) path[0] = new Vector3(egoPos.X, egoPos.Y, path[0].Z);
-            }
-            catch { }
-            return path;
+            return PoseConnector.BuildPath(route, egoPos, startLat, headErrDeg,
+                endLat, lookaheadM, stationDs, out pathLats, out pathS);
         }
 
         public static float FirstTangentErrorDeg(IList<Vector3> path, Vector3 egoFwd)
