@@ -230,6 +230,7 @@ namespace StreetRacing
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
+                + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};flow={chosen.MeanFlowCost:F2};"
                 + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
@@ -392,6 +393,9 @@ namespace StreetRacing
             int blocker = -1;
             string blockerKind = "";
             float minClear = 999f;
+            int opposingSamples = 0;
+            int unknownSamples = 0;
+            float flowCostSum = 0f;
 
             for (int i = 0; i < n; i++)
             {
@@ -401,6 +405,9 @@ namespace StreetRacing
                     c.MinRoadConfidence = pc.RoadConfidence;
                 if (pc.ClearanceM < minClear)
                     minClear = pc.ClearanceM;
+                if (pc.OpposingSide) opposingSamples++;
+                if (!pc.OnRoad) unknownSamples++;
+                flowCostSum += pc.FlowCost;
 
                 // Every trajectory shares station zero. Proximity at the
                 // immutable current pose must NOT poison every alternative.
@@ -492,6 +499,9 @@ namespace StreetRacing
             c.ConstrainHandle = blocker;
             c.ConstrainKind = blockerKind;
             c.MinPredClearance = minClear;
+            c.OpposingFraction = n > 0 ? opposingSamples / (float)n : 0f;
+            c.UnknownFraction = n > 0 ? unknownSamples / (float)n : 0f;
+            c.MeanFlowCost = n > 0 ? flowCostSum / n : 0f;
             c.MeanSpeed = Mean(desired);
             c.MinSpeed = Min(desired, cruise);
             c.RequiredDecel = Math.Max(0f, egoSpeed - c.TargetSpeed);
@@ -615,7 +625,8 @@ namespace StreetRacing
                     var c = candidates[i];
                     string b = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
                     parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/"
-                        + $"L{c.LateralM:F1}/{b}@{c.ConstrainS:F0}/C{c.MinPredClearance:F1}");
+                        + $"L{c.LateralM:F1}/{b}@{c.ConstrainS:F0}/C{c.MinPredClearance:F1}/"
+                        + $"O{c.OpposingFraction * 100f:F0}/U{c.UnknownFraction * 100f:F0}");
                 }
                 return string.Join("|", parts);
             }
