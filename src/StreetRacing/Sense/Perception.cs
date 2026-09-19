@@ -419,8 +419,8 @@ namespace StreetRacing
                         Position = pp,
                         Velocity = new Vector3(),
                         HeadingDeg = SafeHeading(pr),
-                        HalfLengthM = 0.8f,
-                        HalfWidthM = 0.8f,
+                        HalfLengthM = EntityHalfLength(pr, 0.8f),
+                        HalfWidthM = EntityHalfWidth(pr, 0.8f),
                     };
                     added++;
                 }
@@ -745,30 +745,40 @@ namespace StreetRacing
 
         private static float VehicleHalfLength(Vehicle v)
         {
-            try
-            {
-                Vector3 min;
-                Vector3 max;
-                v.Model.GetDimensions(out min, out max);
-                float len = Math.Abs(max.Y - min.Y);
-                if (len > 1f && len < 20f) return len * 0.5f;
-            }
-            catch { }
-            return 2.3f;
+            return EntityHalfLength(v, 2.3f);
         }
 
         private static float VehicleHalfWidth(Vehicle v)
+        {
+            return EntityHalfWidth(v, 1.0f);
+        }
+
+        private static float EntityHalfLength(Entity e, float fallback)
         {
             try
             {
                 Vector3 min;
                 Vector3 max;
-                v.Model.GetDimensions(out min, out max);
-                float width = Math.Abs(max.X - min.X);
-                if (width > 0.8f && width < 8f) return width * 0.5f;
+                e.Model.GetDimensions(out min, out max);
+                float len = Math.Abs(max.Y - min.Y);
+                if (len > 0.2f && len < 30f) return len * 0.5f;
             }
             catch { }
-            return 1.0f;
+            return fallback;
+        }
+
+        private static float EntityHalfWidth(Entity e, float fallback)
+        {
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                e.Model.GetDimensions(out min, out max);
+                float width = Math.Abs(max.X - min.X);
+                if (width > 0.2f && width < 15f) return width * 0.5f;
+            }
+            catch { }
+            return fallback;
         }
 
         private static int SafeHandle(Entity e)
