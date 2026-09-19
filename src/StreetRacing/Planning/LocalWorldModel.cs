@@ -561,38 +561,45 @@ namespace StreetRacing
         private void BuildDebugGrid()
         {
             DebugCells.Clear();
-            // Coarse grid only; planning uses continuous evaluation.
-            for (float forward = 0f; forward <= 70f; forward += 5f)
+            float heading = RaceMath.HeadingFromVector(egoForward);
+
+            // March each lateral strip forward through the SAME connected
+            // 2.5D projection used by search, rather than freezing every debug
+            // sample at ego Z.
+            for (float lat = -18f; lat <= 18f; lat += 4f)
             {
-                for (float lat = -18f; lat <= 18f; lat += 4f)
+                float z = egoOrigin.Z;
+                for (float forward = 0f; forward <= 70f; forward += 5f)
                 {
-                    Vector3 p = new Vector3(
+                    Vector3 guess = new Vector3(
                         egoOrigin.X + egoForward.X * forward + egoLeft.X * lat,
                         egoOrigin.Y + egoForward.Y * forward + egoLeft.Y * lat,
-                        egoOrigin.Z);
-                    float outDist;
+                        z);
+
+                    Vector3 p;
                     float conf;
                     float dirCost;
-                    float surfaceZ;
-                    float surfaceHeading;
-                    bool road = SurfaceAt(p, RaceMath.HeadingFromVector(egoForward),
-                        out outDist, out conf, out dirCost, out surfaceZ, out surfaceHeading);
-                    if (road) p = new Vector3(p.X, p.Y, surfaceZ);
+                    bool road = TryProjectToSurface(guess, z, heading,
+                        out p, out conf, out dirCost);
+                    if (road) z = p.Z;
+                    else p = guess;
+
                     bool occupied = false;
                     for (int i = 0; i < actors.Count; i++)
                     {
-                        if (ActorClearance(actors[i], p, RaceMath.HeadingFromVector(egoForward), 0f) <= 0.2f)
+                        if (ActorClearance(actors[i], p, heading, 0f) <= 0.2f)
                         {
                             occupied = true;
                             break;
                         }
                     }
+
                     DebugCells.Add(new DebugCell
                     {
                         Position = p,
                         OnRoad = road,
                         Occupied = occupied,
-                        SurfaceCost = road ? (1f - conf) * 2f + dirCost : 14f + Math.Max(0f, outDist),
+                        SurfaceCost = road ? (1f - conf) * 2f + dirCost : 14f,
                         DirectionCost = dirCost,
                     });
                 }
