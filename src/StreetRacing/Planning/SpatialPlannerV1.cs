@@ -30,7 +30,7 @@ namespace StreetRacing
             public float HeadingDeg;
             public float TimeS;
             public float Cost;
-            public float RouteS;
+            public float GoalDist;
             public float FirstCurvature;
             public float LastCurvature;
             public readonly List<Vector3> Path = new List<Vector3>();
@@ -90,14 +90,15 @@ namespace StreetRacing
             aBrake = RaceMath.Clamp(aBrake, 3.5f, 11.5f);
 
             float searchSpeed = RaceMath.Clamp(Math.Max(egoSpeed, 8f), 8f, Math.Min(cruise, 20f));
-            var startPr = route.ProjectOntoRoute(egoPos);
+            float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
+            Vector3 spatialGoal = route.PointAtS(goalS);
             var root = new Node
             {
                 Pos = egoPos,
                 HeadingDeg = egoHeading,
                 TimeS = 0f,
                 Cost = 0f,
-                RouteS = startPr.S,
+                GoalDist = RaceMath.FlatDistance(egoPos, spatialGoal),
                 FirstCurvature = 0f,
                 LastCurvature = 0f,
             };
@@ -114,7 +115,7 @@ namespace StreetRacing
                     var curvatures = CurvatureChoices(parent.LastCurvature, layer);
                     for (int k = 0; k < curvatures.Count; k++)
                     {
-                        var child = Expand(parent, curvatures[k], searchSpeed, world, route, aLat, layer);
+                        var child = Expand(parent, curvatures[k], searchSpeed, world, spatialGoal, aLat, layer);
                         if (child != null) expanded.Add(child);
                     }
                 }
@@ -200,7 +201,7 @@ namespace StreetRacing
             float curvature,
             float searchSpeed,
             LocalWorldModel world,
-            RaceRoute route,
+            Vector3 spatialGoal,
             float aLat,
             int layer)
         {
@@ -210,7 +211,7 @@ namespace StreetRacing
                 HeadingDeg = parent.HeadingDeg,
                 TimeS = parent.TimeS,
                 Cost = parent.Cost,
-                RouteS = parent.RouteS,
+                GoalDist = parent.GoalDist,
                 FirstCurvature = layer == 0 ? curvature : parent.FirstCurvature,
                 LastCurvature = curvature,
             };
@@ -253,22 +254,24 @@ namespace StreetRacing
                 n.Heading.Add(n.HeadingDeg);
             }
 
-            var pr = route.ProjectOntoRoute(n.Pos);
-            float progress = pr.S - parent.RouteS;
-            n.RouteS = pr.S;
+            float newGoalDist = RaceMath.FlatDistance(n.Pos, spatialGoal);
+            float goalProgress = parent.GoalDist - newGoalDist;
+            n.GoalDist = newGoalDist;
 
-            // GPS/route is a global objective only. Large progress is good;
-            // lateral distance to it is merely a weak regularizer.
-            n.Cost -= progress * 3.2f;
-            if (progress < -1f) n.Cost += Math.Abs(progress) * 12f;
-            n.Cost += Math.Min(pr.Dist, 30f) * 0.18f;
+            // Route is now only a global branch/goal cue. The search is free
+            // to approach that goal through any low-cost local world space.
+            n.Cost -= goalProgress * 3.4f;
+            if (goalProgress < -1f) n.Cost += Math.Abs(goalProgress) * 9f;
 
-            float routeHeading = RaceMath.HeadingFromVector(pr.Dir);
-            float headErr = Math.Abs(RaceMath.HeadingDiffDeg(routeHeading, n.HeadingDeg));
-            n.Cost += Math.Min(headErr, 90f) * 0.035f;
-
-            // Never let beam search run away from the local problem entirely.
-            if (pr.Dist > 32f) n.Cost += (pr.Dist - 32f) * 8f;
+            Vector3 toGoal = new Vector3(
+                spatialGoal.X - n.Pos.X,
+                spatialGoal.Y - n.Pos.Y, 0f);
+            if (RaceMath.FlatLength(toGoal) > 2f)
+            {
+                float goalHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(toGoal));
+                float headErr = Math.Abs(RaceMath.HeadingDiffDeg(goalHeading, n.HeadingDeg));
+                n.Cost += Math.Min(headErr, 100f) * 0.025f;
+            }
             return n;
         }
 
