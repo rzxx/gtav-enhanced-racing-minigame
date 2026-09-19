@@ -161,6 +161,20 @@ namespace StreetRacing
             return result;
         }
 
+        public bool TryGetActor(int handle, out TrackedActor actor)
+        {
+            for (int i = 0; i < actors.Count; i++)
+            {
+                if (actors[i].Handle == handle)
+                {
+                    actor = actors[i];
+                    return true;
+                }
+            }
+            actor = new TrackedActor();
+            return false;
+        }
+
         public float ActorClearance(TrackedActor a, Vector3 egoPos, float egoHeadingDeg, float timeS)
         {
             Vector3 ap;
