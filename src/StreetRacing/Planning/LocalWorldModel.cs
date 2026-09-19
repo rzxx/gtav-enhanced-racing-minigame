@@ -190,6 +190,9 @@ namespace StreetRacing
             if (RaceMath.FlatLength(a.Velocity) > 1.2f)
                 actorHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(a.Velocity));
 
+            if (Math.Abs(ap.Z - egoPos.Z) > 4.5f)
+                return 999f; // stacked road / bridge traffic
+
             Vector3 af = RaceMath.VectorFromHeading(actorHeading);
             af = RaceMath.FlatNormalize(af);
             Vector3 al = new Vector3(-af.Y, af.X, 0f);
@@ -330,6 +333,7 @@ namespace StreetRacing
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
+                if (Math.Abs(p.Z - s.Center.Z) > 7.5f) continue;
                 Vector3 f = RaceMath.VectorFromHeading(s.HeadingDeg);
                 f = RaceMath.FlatNormalize(f);
                 Vector3 l = new Vector3(-f.Y, f.X, 0f);
