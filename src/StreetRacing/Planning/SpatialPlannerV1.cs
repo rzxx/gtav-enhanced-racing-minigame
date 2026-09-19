@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using GTA.Math;
 
 namespace StreetRacing
@@ -42,6 +43,8 @@ namespace StreetRacing
         public TrajectoryCandidate LastChosen;
         public bool HasChosen;
         public string LastDecision { get; private set; } = "";
+        public float LastPlanMs { get; private set; }
+        public int LastPoolCount { get; private set; }
 
         private readonly List<SearchNode> pool = new List<SearchNode>(1600);
         private readonly List<int> beam = new List<int>(32);
@@ -65,6 +68,8 @@ namespace StreetRacing
             LastChosen = new TrajectoryCandidate();
             HasChosen = false;
             LastDecision = "";
+            LastPlanMs = 0f;
+            LastPoolCount = 0;
             lastFirstCurvature = 0f;
             hasLastCurvature = false;
             planId = 0;
@@ -87,6 +92,7 @@ namespace StreetRacing
             float cruise,
             int nowMs)
         {
+            long perfStart = Stopwatch.GetTimestamp();
             var result = new Result();
             LastCandidates.Clear();
             HasChosen = false;
@@ -219,10 +225,12 @@ namespace StreetRacing
             result.Intent = intent;
             result.RoadDesired = chosen.RoadTargetSpeed;
             result.Desired = chosen.TargetSpeed;
+            LastPoolCount = pool.Count;
+            LastPlanMs = (float)((Stopwatch.GetTimestamp() - perfStart) * 1000.0 / Stopwatch.Frequency);
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"{world.Detail};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
+                + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
             LastChosen = chosen;
