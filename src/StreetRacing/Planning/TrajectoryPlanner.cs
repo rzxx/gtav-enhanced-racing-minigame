@@ -21,6 +21,7 @@ namespace StreetRacing
         public float OpposingFraction;   // fraction of sampled path on opposing side
         public float UnknownFraction;    // fraction outside supported road surface
         public float MeanFlowCost;       // mean soft directional-road cost
+        public float ElevationDeltaM;    // path end Z - start Z
         public float MaxKappa;      // max path curvature rad/m
 
         // --- Joint maneuver fields: this candidate WITH its executable speed.
