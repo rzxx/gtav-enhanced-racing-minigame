@@ -495,7 +495,7 @@ namespace StreetRacing
                         t.Position = new Vector3(
                             t.Position.X + t.Velocity.X * dtScanS,
                             t.Position.Y + t.Velocity.Y * dtScanS,
-                            t.Position.Z);
+                            t.Position.Z + t.Velocity.Z * dtScanS);
                     }
                     catch { }
                     t.Stale = true;
@@ -657,7 +657,7 @@ namespace StreetRacing
             return new Vector3(
                 a.Position.X + a.Velocity.X * dt,
                 a.Position.Y + a.Velocity.Y * dt,
-                a.Position.Z);
+                a.Position.Z + a.Velocity.Z * dt);
         }
 
         private TrackedActor BuildActor(PersistedTrack t,
@@ -689,7 +689,7 @@ namespace StreetRacing
                 Stale = t.Stale,
                 OffRoadway = false,
                 Position = pos,
-                Velocity = new Vector3(vel.X, vel.Y, 0f),
+                Velocity = vel,
                 HeadingDeg = t.HeadingDeg,
                 HalfLengthM = t.HalfLengthM > 0.1f ? t.HalfLengthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 2.3f : 0.5f),
                 HalfWidthM = t.HalfWidthM > 0.1f ? t.HalfWidthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 1.0f : 0.5f),
