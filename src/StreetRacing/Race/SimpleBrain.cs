@@ -23,11 +23,11 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// SpatialPlannerV1 is ENABLED after the initial join:
-    ///   a local 2D world model fuses road supports + moving actor footprints;
-    ///   beam search expands short curvature primitives directly in world XY;
-    ///   GPS is only the global route-progress objective, not the trajectory
-    ///   coordinate system.
+    /// SpatialPlannerV2 is ENABLED after the initial join:
+    ///   a local 2.5D world model fuses graded road supports + oriented actors;
+    ///   beam search expands short curvature primitives through connected road
+    ///   surfaces, with soft same-direction/opposing-road semantics;
+    ///   GPS is only the global route-progress objective.
     ///
     /// Still disabled:
     ///   semantic lane graph / oncoming-lane classification / player tactics /
@@ -81,7 +81,7 @@ namespace StreetRacing.Race
         // geometry itself is searched in world XY rather than route offsets.
         private readonly Perception perception = new Perception();
         private readonly LocalWorldModel localWorld = new LocalWorldModel();
-        private readonly SpatialPlannerV1 spatialPlanner = new SpatialPlannerV1();
+        private readonly SpatialPlannerV2 spatialPlanner = new SpatialPlannerV2();
         private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
@@ -304,8 +304,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V2");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -484,8 +484,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V2;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -1011,7 +1011,7 @@ namespace StreetRacing.Race
             }
             catch { }
 
-            SpatialPlannerV1.Result sp = null;
+            SpatialPlannerV2.Result sp = null;
             try
             {
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
