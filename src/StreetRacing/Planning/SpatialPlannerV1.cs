@@ -237,11 +237,19 @@ namespace StreetRacing
                 float midHeading = WrapHeading(n.HeadingDeg + dHead * 0.5f);
                 Vector3 fwd = RaceMath.VectorFromHeading(midHeading);
                 fwd = RaceMath.FlatNormalize(fwd);
-                n.Pos = new Vector3(
+                Vector3 guess = new Vector3(
                     n.Pos.X + fwd.X * ds,
                     n.Pos.Y + fwd.Y * ds,
                     n.Pos.Z);
                 n.HeadingDeg = WrapHeading(n.HeadingDeg + dHead);
+                Vector3 projected;
+                float surfaceConfidence;
+                float surfaceDirectionCost;
+                if (world.TryProjectToSurface(guess, n.Pos.Z, n.HeadingDeg,
+                    out projected, out surfaceConfidence, out surfaceDirectionCost))
+                    n.Pos = projected;
+                else
+                    n.Pos = guess;
                 n.TimeS += ds / Math.Max(primitiveSpeed, 1f);
 
                 var pc = world.EvaluatePose(n.Pos, n.HeadingDeg, n.TimeS);
@@ -380,23 +388,48 @@ namespace StreetRacing
                     TrackedActor a;
                     float actorV = 0f;
                     string kind = "Actor";
-                    if (world.TryGetActor(pc.BlockingHandle, out a))
+                    bool haveActor = world.TryGetActor(pc.BlockingHandle, out a);
+                    if (haveActor)
                     {
                         actorV = a.Speed;
                         kind = a.Kind.ToString();
                     }
 
+                    float relAlong;
+                    float relLat;
+                    TrackedActor relActor;
+                    bool haveRel = world.TryGetActorRelative(
+                        pc.BlockingHandle, c.Path[i], h, arrival[i],
+                        out relAlong, out relLat, out relActor);
+
+                    bool nearSharedOrigin = c.StationS[i] < 3.0f;
+                    bool actuallyAheadAtOrigin = haveRel
+                        && relAlong > 0.75f
+                        && Math.Abs(relLat) < (relActor.HalfWidthM > 0.2f ? relActor.HalfWidthM + 1.35f : 2.35f);
+
+                    // Every candidate shares the exact ego pose at s=0. A car,
+                    // ped or prop beside/rearward of us must not poison every
+                    // candidate before they have had a chance to diverge.
+                    if (nearSharedOrigin && !actuallyAheadAtOrigin)
+                        continue;
+
                     if (pc.ClearanceM <= 0.35f)
                     {
-                        float stopS = Math.Max(0f, c.StationS[i] - 3.0f);
-                        if (stopS < earliestStopS)
+                        // Immediate stop only for a genuine forward overlap.
+                        // Otherwise the first future swept conflict determines
+                        // the braking station.
+                        if (!nearSharedOrigin || actuallyAheadAtOrigin)
                         {
-                            earliestStopS = stopS;
-                            blocker = pc.BlockingHandle;
-                            blockerKind = kind;
+                            float stopS = Math.Max(0f, c.StationS[i] - 3.0f);
+                            if (stopS < earliestStopS)
+                            {
+                                earliestStopS = stopS;
+                                blocker = pc.BlockingHandle;
+                                blockerKind = kind;
+                            }
                         }
                     }
-                    else
+                    else if (!nearSharedOrigin)
                     {
                         allow[i] = Math.Min(allow[i], Math.Max(0f, actorV));
                         if (blocker == -1)
