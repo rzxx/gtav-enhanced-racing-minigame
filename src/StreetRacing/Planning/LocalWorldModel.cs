@@ -30,6 +30,7 @@ namespace StreetRacing
         {
             public Vector3 Position;
             public float SurfaceCost;
+            public float DirectionCost;
             public bool OnRoad;
             public bool Occupied;
         }
@@ -581,7 +582,8 @@ namespace StreetRacing
                         Position = p,
                         OnRoad = road,
                         Occupied = occupied,
-                        SurfaceCost = road ? (1f - conf) * 2f : 14f + Math.Max(0f, outDist),
+                        SurfaceCost = road ? (1f - conf) * 2f + dirCost : 14f + Math.Max(0f, outDist),
+                        DirectionCost = dirCost,
                     });
                 }
             }
