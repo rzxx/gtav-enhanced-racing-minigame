@@ -24,7 +24,7 @@ namespace StreetRacing
             public float Desired;
         }
 
-        private sealed class Node
+        private struct SearchNode
         {
             public Vector3 Pos;
             public float HeadingDeg;
@@ -33,8 +33,8 @@ namespace StreetRacing
             public float GoalDist;
             public float FirstCurvature;
             public float LastCurvature;
-            public readonly List<Vector3> Path = new List<Vector3>();
-            public readonly List<float> Heading = new List<float>();
+            public int ParentIndex;
+            public int Depth;
         }
 
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
@@ -92,7 +92,8 @@ namespace StreetRacing
             float searchSpeed = RaceMath.Clamp(Math.Max(egoSpeed, 8f), 8f, Math.Min(cruise, 20f));
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
             Vector3 spatialGoal = route.PointAtS(goalS);
-            var root = new Node
+            var arena = new List<SearchNode>(2048);
+            arena.Add(new SearchNode
             {
                 Pos = egoPos,
                 HeadingDeg = egoHeading,
@@ -101,28 +102,30 @@ namespace StreetRacing
                 GoalDist = RaceMath.FlatDistance(egoPos, spatialGoal),
                 FirstCurvature = 0f,
                 LastCurvature = 0f,
-            };
-            root.Path.Add(egoPos);
-            root.Heading.Add(egoHeading);
+                ParentIndex = -1,
+                Depth = 0,
+            });
 
-            var beam = new List<Node> { root };
+            var beam = new List<int>(BeamWidth) { 0 };
             for (int layer = 0; layer < Layers; layer++)
             {
-                var expanded = new List<Node>(BeamWidth * 7);
+                var expanded = new List<int>(BeamWidth * 7);
                 for (int i = 0; i < beam.Count; i++)
                 {
-                    var parent = beam[i];
+                    int parentIndex = beam[i];
+                    var parent = arena[parentIndex];
                     var curvatures = CurvatureChoices(parent.LastCurvature, layer);
                     for (int k = 0; k < curvatures.Count; k++)
                     {
-                        var child = Expand(parent, curvatures[k], searchSpeed, world, spatialGoal, aLat, layer);
-                        if (child != null) expanded.Add(child);
+                        int childIndex = Expand(arena, parentIndex, curvatures[k],
+                            searchSpeed, world, spatialGoal, aLat, layer);
+                        if (childIndex >= 0) expanded.Add(childIndex);
                     }
                 }
 
                 if (expanded.Count == 0) break;
-                expanded.Sort((a, b) => a.Cost.CompareTo(b.Cost));
-                beam = DiverseBeam(expanded, BeamWidth);
+                expanded.Sort((a, b) => arena[a].Cost.CompareTo(arena[b].Cost));
+                beam = DiverseBeam(arena, expanded, BeamWidth);
             }
 
             if (beam.Count == 0)
@@ -131,11 +134,12 @@ namespace StreetRacing
                 return result;
             }
 
-            beam.Sort((a, b) => a.Cost.CompareTo(b.Cost));
+            beam.Sort((a, b) => arena[a].Cost.CompareTo(arena[b].Cost));
             int emit = Math.Min(10, beam.Count);
             for (int i = 0; i < emit; i++)
             {
-                var c = FinalizeCandidate(beam[i], world, route, aLat, aBrake, cruise, egoSpeed, i);
+                var c = FinalizeCandidate(arena, beam[i], world, route,
+                    aLat, aBrake, cruise, egoSpeed, i);
                 LastCandidates.Add(c);
             }
 
@@ -196,8 +200,9 @@ namespace StreetRacing
             return result;
         }
 
-        private Node Expand(
-            Node parent,
+        private int Expand(
+            List<SearchNode> arena,
+            int parentIndex,
             float curvature,
             float searchSpeed,
             LocalWorldModel world,
@@ -205,7 +210,8 @@ namespace StreetRacing
             float aLat,
             int layer)
         {
-            var n = new Node
+            var parent = arena[parentIndex];
+            var n = new SearchNode
             {
                 Pos = parent.Pos,
                 HeadingDeg = parent.HeadingDeg,
@@ -214,9 +220,9 @@ namespace StreetRacing
                 GoalDist = parent.GoalDist,
                 FirstCurvature = layer == 0 ? curvature : parent.FirstCurvature,
                 LastCurvature = curvature,
+                ParentIndex = parentIndex,
+                Depth = parent.Depth + 1,
             };
-            n.Path.AddRange(parent.Path);
-            n.Heading.AddRange(parent.Heading);
 
             if (layer == 0 && hasLastCurvature)
                 n.Cost += Math.Abs(curvature - lastFirstCurvature) * 55f;
@@ -227,8 +233,7 @@ namespace StreetRacing
                 ? searchSpeed
                 : (float)Math.Sqrt(aLat / Math.Abs(curvature));
             float primitiveSpeed = RaceMath.Clamp(Math.Min(searchSpeed, feasibleV), 4f, searchSpeed);
-            float steps = PrimitiveM / SampleM;
-            int count = Math.Max(1, (int)Math.Round(steps));
+            int count = Math.Max(1, (int)Math.Round(PrimitiveM / SampleM));
 
             for (int s = 0; s < count; s++)
             {
@@ -242,6 +247,7 @@ namespace StreetRacing
                     n.Pos.Y + fwd.Y * ds,
                     n.Pos.Z);
                 n.HeadingDeg = WrapHeading(n.HeadingDeg + dHead);
+
                 Vector3 projected;
                 float surfaceConfidence;
                 float surfaceDirectionCost;
@@ -250,24 +256,18 @@ namespace StreetRacing
                     n.Pos = projected;
                 else
                     n.Pos = guess;
-                n.TimeS += ds / Math.Max(primitiveSpeed, 1f);
 
+                n.TimeS += ds / Math.Max(primitiveSpeed, 1f);
                 var pc = world.EvaluatePose(n.Pos, n.HeadingDeg, n.TimeS);
                 n.Cost += pc.SurfaceCost * ds * 0.42f;
                 n.Cost += pc.ActorCost * 0.12f;
                 if (pc.HardCollision)
-                    n.Cost += 90f; // expensive, but following must remain representable
-
-                n.Path.Add(n.Pos);
-                n.Heading.Add(n.HeadingDeg);
+                    n.Cost += 90f;
             }
 
             float newGoalDist = RaceMath.FlatDistance(n.Pos, spatialGoal);
             float goalProgress = parent.GoalDist - newGoalDist;
             n.GoalDist = newGoalDist;
-
-            // Route is now only a global branch/goal cue. The search is free
-            // to approach that goal through any low-cost local world space.
             n.Cost -= goalProgress * 3.4f;
             if (goalProgress < -1f) n.Cost += Math.Abs(goalProgress) * 9f;
 
@@ -280,7 +280,9 @@ namespace StreetRacing
                 float headErr = Math.Abs(RaceMath.HeadingDiffDeg(goalHeading, n.HeadingDeg));
                 n.Cost += Math.Min(headErr, 100f) * 0.025f;
             }
-            return n;
+
+            arena.Add(n);
+            return arena.Count - 1;
         }
 
         private static List<float> CurvatureChoices(float previous, int layer)
@@ -299,28 +301,37 @@ namespace StreetRacing
             return r;
         }
 
-        private static List<Node> DiverseBeam(List<Node> sorted, int max)
+        private static List<int> DiverseBeam(
+            List<SearchNode> arena, List<int> sorted, int max)
         {
-            var r = new List<Node>();
-            var used = new HashSet<string>();
+            var r = new List<int>(max);
+            var used = new HashSet<long>();
             for (int i = 0; i < sorted.Count && r.Count < max; i++)
             {
-                var n = sorted[i];
+                int idx = sorted[i];
+                var n = arena[idx];
                 int qx = (int)Math.Round(n.Pos.X / 3.5f);
                 int qy = (int)Math.Round(n.Pos.Y / 3.5f);
                 int qh = (int)Math.Round(WrapHeading(n.HeadingDeg) / 12f);
-                string key = qx + ":" + qy + ":" + qh;
+                long key = ((long)(qx & 0x1FFFFF) << 42)
+                    ^ ((long)(qy & 0x1FFFFF) << 21)
+                    ^ (uint)(qh & 0x1FFFFF);
                 if (!used.Add(key)) continue;
-                r.Add(n);
+                r.Add(idx);
             }
-            // If clustering was too aggressive, fill with best leftovers.
-            for (int i = 0; i < sorted.Count && r.Count < max; i++)
-                if (!r.Contains(sorted[i])) r.Add(sorted[i]);
+
+            if (r.Count < max)
+            {
+                var already = new HashSet<int>(r);
+                for (int i = 0; i < sorted.Count && r.Count < max; i++)
+                    if (already.Add(sorted[i])) r.Add(sorted[i]);
+            }
             return r;
         }
 
         private TrajectoryCandidate FinalizeCandidate(
-            Node node,
+            List<SearchNode> arena,
+            int nodeIndex,
             LocalWorldModel world,
             RaceRoute route,
             float aLat,
@@ -329,13 +340,17 @@ namespace StreetRacing
             float egoSpeed,
             int index)
         {
+            List<Vector3> path;
+            List<float> headings;
+            ReconstructPath(arena, nodeIndex, world, out path, out headings);
+            var node = arena[nodeIndex];
             var c = new TrajectoryCandidate
             {
                 CandidateIndex = index,
                 Shape = $"Spatial:{node.FirstCurvature:+0.000;-0.000;0.000}",
-                Path = new List<Vector3>(node.Path),
-                StationS = BuildStationS(node.Path),
-                AimPoint = node.Path[node.Path.Count - 1],
+                Path = path,
+                StationS = BuildStationS(path),
+                AimPoint = path[path.Count - 1],
                 RejectReason = "",
                 ConstrainHandle = -1,
                 ConstrainKind = "",
@@ -348,7 +363,6 @@ namespace StreetRacing
             };
 
             int n = c.Path.Count;
-            var headings = node.Heading;
             var kappa = new float[n];
             var roadAllow = new float[n];
             float maxK = 0f;
@@ -473,6 +487,59 @@ namespace StreetRacing
             c.Score += c.MeanSpeed * 3.2f + c.MinSpeed * 0.8f
                 + RaceMath.Clamp(minClear, -2f, 6f) * 1.2f;
             return c;
+        }
+
+        private static void ReconstructPath(
+            List<SearchNode> arena, int nodeIndex, LocalWorldModel world,
+            out List<Vector3> path, out List<float> headings)
+        {
+            var chain = new List<int>(Layers + 1);
+            int cur = nodeIndex;
+            while (cur >= 0)
+            {
+                chain.Add(cur);
+                cur = arena[cur].ParentIndex;
+            }
+            chain.Reverse();
+
+            path = new List<Vector3>(Layers * 5 + 1);
+            headings = new List<float>(Layers * 5 + 1);
+            var root = arena[chain[0]];
+            Vector3 pos = root.Pos;
+            float heading = root.HeadingDeg;
+            path.Add(pos);
+            headings.Add(heading);
+
+            for (int ci = 1; ci < chain.Count; ci++)
+            {
+                var node = arena[chain[ci]];
+                float curvature = node.LastCurvature;
+                int count = Math.Max(1, (int)Math.Round(PrimitiveM / SampleM));
+                for (int s = 0; s < count; s++)
+                {
+                    float ds = PrimitiveM / count;
+                    float dHead = curvature * ds * 180f / (float)Math.PI;
+                    float midHeading = WrapHeading(heading + dHead * 0.5f);
+                    Vector3 fwd = RaceMath.VectorFromHeading(midHeading);
+                    fwd = RaceMath.FlatNormalize(fwd);
+                    Vector3 guess = new Vector3(
+                        pos.X + fwd.X * ds,
+                        pos.Y + fwd.Y * ds,
+                        pos.Z);
+                    heading = WrapHeading(heading + dHead);
+
+                    Vector3 projected;
+                    float conf;
+                    float dirCost;
+                    if (world.TryProjectToSurface(guess, pos.Z, heading,
+                        out projected, out conf, out dirCost))
+                        pos = projected;
+                    else
+                        pos = guess;
+                    path.Add(pos);
+                    headings.Add(heading);
+                }
+            }
         }
 
         private static string Summarize(IList<TrajectoryCandidate> candidates)
