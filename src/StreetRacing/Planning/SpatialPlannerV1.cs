@@ -416,6 +416,15 @@ namespace StreetRacing
                 if (!world.TryGetActor(pc.BlockingHandle, out a))
                     continue;
 
+                // An actor already beside the ego is not a lead
+                // blocker merely because the first 2 m sample still overlaps
+                // the inflated footprint. Let spatial search create separation.
+                bool initiallyLateral = a.Longitudinal < 2.5f
+                    && Math.Abs(a.Lateral) > 1.35f
+                    && a.ClosingSpeed < 3.0f;
+                if (initiallyLateral && c.StationS[i] < 6.0f)
+                    continue;
+
                 string kind = a.Kind.ToString();
                 float actorHeading = a.HeadingDeg;
                 if (RaceMath.FlatLength(a.Velocity) > 1.2f)
