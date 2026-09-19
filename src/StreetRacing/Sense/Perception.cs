@@ -18,11 +18,10 @@ namespace StreetRacing
     /// a parked car 40 m ahead at 40 m/s (TTC ~1 s) outranks a car 20 m
     /// behind moving away.
     ///
-    /// Route-frame fields (RouteS / RouteLateral / SpeedAlong) express the
-    /// same actor in candidate-path coordinates. All planning decisions
-    /// (trajectory scoring, speed limits, tactics) must use the route frame;
-    /// ego-heading Longitudinal/Lateral/IsAhead are kept for telemetry and
-    /// as a fallback when the route is lost.
+    /// Route-frame fields remain useful for topology/telemetry, but the Simple
+    /// spatial planner reasons about actor footprints directly in world space.
+    /// Ego-heading Longitudinal/Lateral remain useful for immediate relative
+    /// geometry such as distinguishing a side-by-side actor from a lead car.
     internal struct TrackedActor
     {
         public bool Valid;
