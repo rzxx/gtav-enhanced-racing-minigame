@@ -70,7 +70,8 @@ namespace StreetRacing
             Vector3 egoPos,
             float egoHeading,
             float egoHalfLength,
-            float egoHalfWidth)
+            float egoHalfWidth,
+            bool buildDebugGrid = false)
         {
             Reset();
             this.perception = perception;
@@ -96,7 +97,7 @@ namespace StreetRacing
                 }
             }
 
-            BuildDebugGrid();
+            if (buildDebugGrid) BuildDebugGrid();
             Detail = $"roadSupports={Road.Count};actors={actors.Count};debugCells={DebugCells.Count}";
         }
 
