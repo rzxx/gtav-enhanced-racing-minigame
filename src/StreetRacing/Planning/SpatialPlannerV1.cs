@@ -230,7 +230,8 @@ namespace StreetRacing
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};flow={chosen.MeanFlowCost:F2};"
+                + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};"
+                + $"flow={chosen.MeanFlowCost:F2};dz={chosen.ElevationDeltaM:F1};"
                 + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
@@ -502,6 +503,7 @@ namespace StreetRacing
             c.OpposingFraction = n > 0 ? opposingSamples / (float)n : 0f;
             c.UnknownFraction = n > 0 ? unknownSamples / (float)n : 0f;
             c.MeanFlowCost = n > 0 ? flowCostSum / n : 0f;
+            c.ElevationDeltaM = c.Path.Count > 1 ? c.Path[c.Path.Count - 1].Z - c.Path[0].Z : 0f;
             c.MeanSpeed = Mean(desired);
             c.MinSpeed = Min(desired, cruise);
             c.RequiredDecel = Math.Max(0f, egoSpeed - c.TargetSpeed);
@@ -626,7 +628,8 @@ namespace StreetRacing
                     string b = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
                     parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/"
                         + $"L{c.LateralM:F1}/{b}@{c.ConstrainS:F0}/C{c.MinPredClearance:F1}/"
-                        + $"O{c.OpposingFraction * 100f:F0}/U{c.UnknownFraction * 100f:F0}");
+                        + $"O{c.OpposingFraction * 100f:F0}/U{c.UnknownFraction * 100f:F0}/"
+                        + $"Z{c.ElevationDeltaM:F1}");
                 }
                 return string.Join("|", parts);
             }
