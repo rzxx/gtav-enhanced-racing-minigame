@@ -119,7 +119,16 @@ namespace StreetRacing
             }
 
             if (buildDebugGrid) BuildDebugGrid();
-            Detail = $"roadSupports={Road.Count};actors={actors.Count};debugCells={DebugCells.Count}";
+            float maxAbsGrade = 0f;
+            int alignedSupports = 0;
+            for (int i = 0; i < Road.Count; i++)
+            {
+                float g = Math.Abs(Road[i].Grade);
+                if (g > maxAbsGrade) maxAbsGrade = g;
+                if (Road[i].FlowConfidence > 0.25f) alignedSupports++;
+            }
+            Detail = $"roadSupports={Road.Count};flowSupports={alignedSupports};actors={actors.Count};"
+                + $"maxGrade={maxAbsGrade:F2};debugCells={DebugCells.Count}";
         }
 
         public bool TryProjectToSurface(
@@ -242,6 +251,18 @@ namespace StreetRacing
             if (Math.Abs(ap.Z - egoPos.Z) > 4.5f)
                 return 999f;
 
+            float actorHL = a.HalfLengthM > 0.2f ? a.HalfLengthM : 2.3f;
+            float actorHW = a.HalfWidthM > 0.2f ? a.HalfWidthM : 1.0f;
+            float dx = egoPos.X - ap.X;
+            float dy = egoPos.Y - ap.Y;
+            float centerDistSq = dx * dx + dy * dy;
+            float broadRadius = actorHL + actorHW + egoHalfLength + egoHalfWidth + 5f;
+            if (centerDistSq > broadRadius * broadRadius)
+            {
+                float centerDist = (float)Math.Sqrt(centerDistSq);
+                return Math.Max(0f, centerDist - (actorHL + egoHalfLength));
+            }
+
             float actorHeading = a.HeadingDeg;
             if (RaceMath.FlatLength(a.Velocity) > 1.2f)
                 actorHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(a.Velocity));
@@ -251,8 +272,6 @@ namespace StreetRacing
             Vector3 ef = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(egoHeadingDeg));
             Vector3 el = new Vector3(-ef.Y, ef.X, 0f);
 
-            float actorHL = a.HalfLengthM > 0.2f ? a.HalfLengthM : 2.3f;
-            float actorHW = a.HalfWidthM > 0.2f ? a.HalfWidthM : 1.0f;
             float egoOnAF = egoHalfLength * Math.Abs(RaceMath.FlatDot(ef, af))
                 + egoHalfWidth * Math.Abs(RaceMath.FlatDot(el, af));
             float egoOnAL = egoHalfLength * Math.Abs(RaceMath.FlatDot(ef, al))
@@ -417,6 +436,11 @@ namespace StreetRacing
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
+                float broadReach = s.HalfLengthM + Math.Max(s.LeftM, s.RightM) + 3f;
+                float dx = p.X - s.Center.X;
+                float dy = p.Y - s.Center.Y;
+                if (dx * dx + dy * dy > broadReach * broadReach) continue;
+
                 Vector3 f = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(s.HeadingDeg));
                 Vector3 l = new Vector3(-f.Y, f.X, 0f);
                 Vector3 rel = new Vector3(p.X - s.Center.X, p.Y - s.Center.Y, 0f);
@@ -514,23 +538,28 @@ namespace StreetRacing
             DebugCells.Clear();
             float egoHeading = RaceMath.HeadingFromVector(egoForward);
 
-            for (float forward = 0f; forward <= 70f; forward += 5f)
+            // March each lateral strip forward on the connected surface.
+            // Sampling every cell from ego Z makes uphill/downhill road appear
+            // unknown once elevation changes beyond the surface-layer gate.
+            for (float lat = -18f; lat <= 18f; lat += 4f)
             {
-                for (float lat = -18f; lat <= 18f; lat += 4f)
+                float zHint = egoOrigin.Z;
+                for (float forward = 0f; forward <= 70f; forward += 5f)
                 {
-                    Vector3 p = new Vector3(
+                    Vector3 candidate = new Vector3(
                         egoOrigin.X + egoForward.X * forward + egoLeft.X * lat,
                         egoOrigin.Y + egoForward.Y * forward + egoLeft.Y * lat,
-                        egoOrigin.Z);
+                        zHint);
 
-                    Vector3 projected;
+                    Vector3 p;
                     float flow;
                     float conf;
                     bool opposing;
                     bool road = TryProjectToSurface(
-                        p, egoHeading, egoOrigin.Z,
-                        out projected, out flow, out conf, out opposing);
-                    if (road) p = projected;
+                        candidate, egoHeading, zHint,
+                        out p, out flow, out conf, out opposing);
+                    if (road) zHint = p.Z;
+                    else p = candidate;
 
                     bool occupied = false;
                     for (int i = 0; i < actors.Count; i++)
