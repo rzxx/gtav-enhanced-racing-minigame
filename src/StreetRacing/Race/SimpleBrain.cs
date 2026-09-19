@@ -122,6 +122,8 @@ namespace StreetRacing.Race
         private int lastIntentLogMs = -100000;
         private string lastStabilityMode = "";
         private int lastStabilityEventMs = -100000;
+        private string lastVizError = "";
+        private int lastVizErrorMs = -100000;
         private int lastRoadModelEventMs = -100000;
         private bool roadModelWasLow;
         private float lastRefRawKappa;
@@ -227,6 +229,7 @@ namespace StreetRacing.Race
             }
             catch { }
             viz.Enabled = debugViz;
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -273,6 +276,8 @@ namespace StreetRacing.Race
             lastIntentLogMs = -100000;
             lastStabilityMode = "";
             lastStabilityEventMs = -100000;
+            lastVizError = "";
+            lastVizErrorMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -407,6 +412,7 @@ namespace StreetRacing.Race
             }
             catch { }
             viz.Enabled = debugViz;
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -453,6 +459,8 @@ namespace StreetRacing.Race
             lastIntentLogMs = -100000;
             lastStabilityMode = "";
             lastStabilityEventMs = -100000;
+            lastVizError = "";
+            lastVizErrorMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -857,10 +865,26 @@ namespace StreetRacing.Race
             try
             {
                 if (viz.Enabled)
+                {
                     viz.Draw(route, corridor, trajViz, perception, speedViz, lastRoadReference, localWorld,
                         egoPos, lastEgoFwd, egoSpeed, LookaheadM, TargetSpeed);
+                    if (!string.IsNullOrEmpty(viz.LastError)
+                        && (viz.LastError != lastVizError || now - lastVizErrorMs > 3000))
+                    {
+                        lastVizError = viz.LastError;
+                        lastVizErrorMs = now;
+                        telemetry?.Event(t, "DEBUG_VIZ_ERROR", viz.LastError);
+                    }
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (now - lastVizErrorMs > 3000)
+                {
+                    lastVizErrorMs = now;
+                    telemetry?.Event(t, "DEBUG_VIZ_ERROR", "outer:" + ex.Message);
+                }
+            }
 
             if (now - lastTeleMs >= 100)
             {
