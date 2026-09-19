@@ -33,6 +33,9 @@ namespace StreetRacing
         public bool OffRoadway;   // true when provably off the drivable surface
         public Vector3 Position;
         public Vector3 Velocity;
+        public float HeadingDeg;    // world heading, GTA convention
+        public float HalfLengthM;   // oriented footprint half-length
+        public float HalfWidthM;    // oriented footprint half-width
         public float Dist;          // flat distance from ego
         public float Longitudinal;  // + ahead along ego forward
         public float Lateral;       // + left
@@ -105,6 +108,9 @@ namespace StreetRacing
             public ActorKind Kind;
             public Vector3 Position;
             public Vector3 Velocity;
+            public float HeadingDeg;
+            public float HalfLengthM;
+            public float HalfWidthM;
             public int LastSeenMs;
             public int FirstSeenMs;
             public int SeenCount;
@@ -117,6 +123,9 @@ namespace StreetRacing
             public ActorKind Kind;
             public Vector3 Position;
             public Vector3 Velocity;
+            public float HeadingDeg;
+            public float HalfLengthM;
+            public float HalfWidthM;
         }
 
         public void Update(Vehicle ego, Vehicle rivalVehicle, Ped rivalPed, float egoSpeed,
@@ -264,6 +273,9 @@ namespace StreetRacing
                         Kind = ActorKind.TrafficVehicle,
                         Position = v.Position,
                         Velocity = SafeVelocity(v),
+                        HeadingDeg = SafeHeading(v),
+                        HalfLengthM = VehicleHalfLength(v),
+                        HalfWidthM = VehicleHalfWidth(v),
                     };
                 }
             }
@@ -292,6 +304,9 @@ namespace StreetRacing
                                 Kind = ActorKind.Rival,
                                 Position = rvp,
                                 Velocity = SafeVelocity(rv),
+                        HeadingDeg = SafeHeading(rv),
+                        HalfLengthM = VehicleHalfLength(rv),
+                        HalfWidthM = VehicleHalfWidth(rv),
                             };
                         }
                     }
@@ -318,6 +333,9 @@ namespace StreetRacing
                                 Kind = ActorKind.Rival,
                                 Position = rp,
                                 Velocity = rvv,
+                                HeadingDeg = SafeHeading(rivalPed),
+                                HalfLengthM = 0.45f,
+                                HalfWidthM = 0.35f,
                             };
                         }
                     }
@@ -371,6 +389,9 @@ namespace StreetRacing
                         Kind = ActorKind.Ped,
                         Position = p.Position,
                         Velocity = pv,
+                        HeadingDeg = SafeHeading(p),
+                        HalfLengthM = 0.45f,
+                        HalfWidthM = 0.35f,
                     };
                 }
             }
@@ -397,6 +418,9 @@ namespace StreetRacing
                         Kind = ActorKind.Obstacle,
                         Position = pp,
                         Velocity = new Vector3(),
+                        HeadingDeg = SafeHeading(pr),
+                        HalfLengthM = EntityHalfLength(pr, 0.8f),
+                        HalfWidthM = EntityHalfWidth(pr, 0.8f),
                     };
                     added++;
                 }
@@ -425,6 +449,9 @@ namespace StreetRacing
                     catch { }
                     t.Position = o.Position;
                     t.Velocity = o.Velocity;
+                    t.HeadingDeg = o.HeadingDeg;
+                    t.HalfLengthM = o.HalfLengthM;
+                    t.HalfWidthM = o.HalfWidthM;
                     t.Kind = o.Kind; // rival marking wins
                     t.LastSeenMs = nowMs;
                     t.SeenCount++;
@@ -438,6 +465,9 @@ namespace StreetRacing
                         Kind = o.Kind,
                         Position = o.Position,
                         Velocity = o.Velocity,
+                        HeadingDeg = o.HeadingDeg,
+                        HalfLengthM = o.HalfLengthM,
+                        HalfWidthM = o.HalfWidthM,
                         LastSeenMs = nowMs,
                         FirstSeenMs = nowMs,
                         SeenCount = 1,
@@ -660,6 +690,9 @@ namespace StreetRacing
                 OffRoadway = false,
                 Position = pos,
                 Velocity = new Vector3(vel.X, vel.Y, 0f),
+                HeadingDeg = t.HeadingDeg,
+                HalfLengthM = t.HalfLengthM > 0.1f ? t.HalfLengthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 2.3f : 0.5f),
+                HalfWidthM = t.HalfWidthM > 0.1f ? t.HalfWidthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 1.0f : 0.5f),
                 Dist = dist,
                 Longitudinal = lon,
                 Lateral = lat,
@@ -702,6 +735,50 @@ namespace StreetRacing
             }
             catch { a.RouteValid = false; }
             return a;
+        }
+
+        private static float SafeHeading(Entity e)
+        {
+            try { return e.Heading; }
+            catch { return 0f; }
+        }
+
+        private static float VehicleHalfLength(Vehicle v)
+        {
+            return EntityHalfLength(v, 2.3f);
+        }
+
+        private static float VehicleHalfWidth(Vehicle v)
+        {
+            return EntityHalfWidth(v, 1.0f);
+        }
+
+        private static float EntityHalfLength(Entity e, float fallback)
+        {
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                e.Model.GetDimensions(out min, out max);
+                float len = Math.Abs(max.Y - min.Y);
+                if (len > 0.2f && len < 30f) return len * 0.5f;
+            }
+            catch { }
+            return fallback;
+        }
+
+        private static float EntityHalfWidth(Entity e, float fallback)
+        {
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                e.Model.GetDimensions(out min, out max);
+                float width = Math.Abs(max.X - min.X);
+                if (width > 0.2f && width < 15f) return width * 0.5f;
+            }
+            catch { }
+            return fallback;
         }
 
         private static int SafeHandle(Entity e)

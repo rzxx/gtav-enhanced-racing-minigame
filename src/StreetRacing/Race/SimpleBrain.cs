@@ -23,10 +23,11 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// Local Planner V2 is ENABLED after the initial join:
-    ///   multi-stage trajectories in DrivingReference's own road envelope,
-    ///   world-space actor prediction per candidate, route-progress scoring,
-    ///   apex/pass-return shapes, and maneuver commitment/hysteresis.
+    /// SpatialPlannerV1 is ENABLED after the initial join:
+    ///   a local 2D world model fuses road supports + moving actor footprints;
+    ///   beam search expands short curvature primitives directly in world XY;
+    ///   GPS is only the global route-progress objective, not the trajectory
+    ///   coordinate system.
     ///
     /// Still disabled:
     ///   semantic lane graph / oncoming-lane classification / player tactics /
@@ -76,10 +77,11 @@ namespace StreetRacing.Race
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
-        // Planner V2 evaluates several staged road trajectories against the
-        // persistent world model; path and speed are chosen together.
+        // Spatial planning uses a persistent perception world, but trajectory
+        // geometry itself is searched in world XY rather than route offsets.
         private readonly Perception perception = new Perception();
-        private readonly LocalPlannerV2 localPlanner = new LocalPlannerV2();
+        private readonly LocalWorldModel localWorld = new LocalWorldModel();
+        private readonly SpatialPlannerV1 spatialPlanner = new SpatialPlannerV1();
         private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
         private readonly SpeedPlanner speedViz = new SpeedPlanner();
@@ -121,6 +123,8 @@ namespace StreetRacing.Race
         private int lastIntentLogMs = -100000;
         private string lastStabilityMode = "";
         private int lastStabilityEventMs = -100000;
+        private string lastVizError = "";
+        private int lastVizErrorMs = -100000;
         private int lastRoadModelEventMs = -100000;
         private bool roadModelWasLow;
         private float lastRefRawKappa;
@@ -129,6 +133,8 @@ namespace StreetRacing.Race
         private int lastRefRoadClamp;
         private string lastRefDetail = "";
         private DrivingReference.Result lastRoadReference;
+        private float egoHalfLength = 2.3f;
+        private float egoHalfWidth = 1.0f;
         private Vector3 lastEgoFwd = new Vector3(0f, 1f, 0f);
         private float lastEgoHeading;
 
@@ -186,7 +192,8 @@ namespace StreetRacing.Race
             try { corridor.Reset(); } catch { }
             try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
-            try { localPlanner.Reset(); } catch { }
+            try { localWorld.Reset(); } catch { }
+            try { spatialPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
@@ -198,6 +205,17 @@ namespace StreetRacing.Race
             try { originSpeed = vehicle.Speed; } catch { }
             route.Build(origin, finish);
             capability.Seed(vehicle);
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                vehicle.Model.GetDimensions(out min, out max);
+                float len = Math.Abs(max.Y - min.Y);
+                float wid = Math.Abs(max.X - min.X);
+                if (len > 1f && len < 20f) egoHalfLength = len * 0.5f;
+                if (wid > 0.8f && wid < 8f) egoHalfWidth = wid * 0.5f;
+            }
+            catch { egoHalfLength = 2.3f; egoHalfWidth = 1.0f; }
             LookaheadM = this.profile.LookaheadForSpeed(0f);
             try { corridor.Update(route, origin, LookaheadM, t0); } catch { }
             try { route.Update(origin, originHeading, 0f, t0, corridor.HalfWidth); } catch { }
@@ -212,6 +230,7 @@ namespace StreetRacing.Race
             }
             catch { }
             viz.Enabled = debugViz;
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -258,6 +277,8 @@ namespace StreetRacing.Race
             lastIntentLogMs = -100000;
             lastStabilityMode = "";
             lastStabilityEventMs = -100000;
+            lastVizError = "";
+            lastVizErrorMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -283,8 +304,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;localPlanner=V2");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -353,7 +374,8 @@ namespace StreetRacing.Race
             try { corridor.Reset(); } catch { }
             try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
-            try { localPlanner.Reset(); } catch { }
+            try { localWorld.Reset(); } catch { }
+            try { spatialPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
             try { speedViz.Reset(); } catch { }
@@ -366,6 +388,17 @@ namespace StreetRacing.Race
             // SINGLE authoritative geometry: copy accepted snapshot, no GPS natives.
             route.ImportSnapshot(snapshot);
             capability.Seed(vehicle);
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                vehicle.Model.GetDimensions(out min, out max);
+                float len = Math.Abs(max.Y - min.Y);
+                float wid = Math.Abs(max.X - min.X);
+                if (len > 1f && len < 20f) egoHalfLength = len * 0.5f;
+                if (wid > 0.8f && wid < 8f) egoHalfWidth = wid * 0.5f;
+            }
+            catch { egoHalfLength = 2.3f; egoHalfWidth = 1.0f; }
             LookaheadM = this.profile.LookaheadForSpeed(0f);
             try { corridor.Update(route, origin, LookaheadM, nowGame); } catch { }
             try { route.Update(origin, originHeading, 0f, nowGame, corridor.HalfWidth); } catch { }
@@ -380,6 +413,7 @@ namespace StreetRacing.Race
             }
             catch { }
             viz.Enabled = debugViz;
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -426,6 +460,8 @@ namespace StreetRacing.Race
             lastIntentLogMs = -100000;
             lastStabilityMode = "";
             lastStabilityEventMs = -100000;
+            lastVizError = "";
+            lastVizErrorMs = -100000;
             lastEgoFwd = RaceMath.VectorFromHeading(originHeading);
             lastEgoHeading = originHeading;
 
@@ -448,8 +484,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;localPlanner=V2;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -608,7 +644,7 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            // Persistent world perception feeds Local Planner V2. Actor
+            // Persistent perception feeds the local 2D world model. Actor
             // prediction is evaluated per candidate in world space.
             try
             {
@@ -685,7 +721,8 @@ namespace StreetRacing.Race
                     {
                         try { telemetry?.Event(t, "RECOVERY_EXIT", $"stage={recovery.Current};s={route.AlongS:F0};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}"); } catch { }
                         try { recovery.Exit(now); } catch { }
-                        try { localPlanner.Reset(); } catch { }
+                        try { spatialPlanner.Reset(); } catch { }
+                        try { localWorld.Reset(); } catch { }
                         lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
                         recoveryEnteredMs = -1;
                         plannerInvalidSinceMs = -1;
@@ -829,10 +866,26 @@ namespace StreetRacing.Race
             try
             {
                 if (viz.Enabled)
-                    viz.Draw(route, corridor, trajViz, perception, speedViz, lastRoadReference,
+                {
+                    viz.Draw(route, corridor, trajViz, perception, speedViz, lastRoadReference, localWorld,
                         egoPos, lastEgoFwd, egoSpeed, LookaheadM, TargetSpeed);
+                    if (!string.IsNullOrEmpty(viz.LastError)
+                        && (viz.LastError != lastVizError || now - lastVizErrorMs > 3000))
+                    {
+                        lastVizError = viz.LastError;
+                        lastVizErrorMs = now;
+                        telemetry?.Event(t, "DEBUG_VIZ_ERROR", viz.LastError);
+                    }
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (now - lastVizErrorMs > 3000)
+                {
+                    lastVizErrorMs = now;
+                    telemetry?.Event(t, "DEBUG_VIZ_ERROR", "outer:" + ex.Message);
+                }
+            }
 
             if (now - lastTeleMs >= 100)
             {
@@ -857,7 +910,8 @@ namespace StreetRacing.Race
                 plannerInvalidSinceMs = -1;
                 joined = true;
                 joinState = "Recovery:" + recovery.Current;
-                localPlanner.Reset();
+                spatialPlanner.Reset();
+                localWorld.Reset();
                 telemetry?.Event(now - t0, "RECOVERY_ENTER",
                     $"reason={reason};s={route.AlongS:F0};lat={route.Lateral:F1};headErr={route.HeadingErrorDeg:F0}");
             }
@@ -957,37 +1011,38 @@ namespace StreetRacing.Race
             }
             catch { }
 
-            LocalPlannerV2.Result lp = null;
+            SpatialPlannerV1.Result sp = null;
             try
             {
-                lp = localPlanner.Plan(rr, corridor, route, perception, capability, profile,
+                localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
+                sp = spatialPlanner.Plan(localWorld, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime);
             }
-            catch { lp = null; }
+            catch { sp = null; }
 
-            if (lp == null || !lp.Valid || lp.Chosen.Path == null || lp.Chosen.Path.Count < 3)
+            if (sp == null || !sp.Valid || sp.Chosen.Path == null || sp.Chosen.Path.Count < 3)
             {
                 int now = Game.GameTime;
-                string why = lp != null ? lp.Detail : "null";
+                string why = sp != null ? sp.Detail : "null";
                 if (plannerInvalidSinceMs < 0)
                 {
                     plannerInvalidSinceMs = now;
-                    try { telemetry?.Event(now - t0, "LOCAL_PLAN_UNCERTAIN", why); } catch { }
+                    try { telemetry?.Event(now - t0, "SPATIAL_PLAN_UNCERTAIN", why); } catch { }
                 }
-                // No candidate is an epistemic failure, not proof of a wall.
-                // Follow the known-good reference conservatively and keep
-                // replanning. Physical recovery has separate entry criteria.
-                joinState = "PlanUncertain";
+                // Spatial search uncertainty is not proof of blockage. Keep
+                // moving on the known smooth reference while the world model
+                // rebuilds; never resurrect LocalPlannerV2 rails here.
+                joinState = "SpatialUncertain";
                 var latsFallback = new List<float>(rr.Path.Count);
                 for (int i = 0; i < rr.Path.Count; i++) latsFallback.Add(0f);
                 return BuildCommandFromPath(rr.Path, rr.StationS, latsFallback,
-                    egoSpeed, dtPlan, Math.Min(cruise, 7f), "PlanUncertain", egoPos);
+                    egoSpeed, dtPlan, Math.Min(cruise, 7f), "SpatialUncertain", egoPos);
             }
 
             plannerInvalidSinceMs = -1;
             referenceInvalidSinceMs = -1;
-            joinState = lp.Intent;
-            return BuildCommandFromCandidate(lp.Chosen, egoSpeed, dtPlan, cruise, lp.RoadDesired);
+            joinState = sp.Intent;
+            return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
         }
 
         private ManeuverCommand BuildFailSoftFromCurrent(Vector3 egoPos, float cap, string why)
@@ -1373,10 +1428,10 @@ namespace StreetRacing.Race
             try
             {
                 trajViz.LastCandidates.Clear();
-                if (joined && localPlanner.LastCandidates.Count > 0)
+                if (joined && spatialPlanner.LastCandidates.Count > 0)
                 {
-                    for (int i = 0; i < localPlanner.LastCandidates.Count; i++)
-                        trajViz.LastCandidates.Add(localPlanner.LastCandidates[i]);
+                    for (int i = 0; i < spatialPlanner.LastCandidates.Count; i++)
+                        trajViz.LastCandidates.Add(spatialPlanner.LastCandidates[i]);
                 }
                 else if (hasCurrent)
                 {
@@ -1424,7 +1479,7 @@ namespace StreetRacing.Race
                         + $"refHeadStep={lastRefHeadStep:F0};roadClamp={lastRefRoadClamp};"
                         + $"constr={(c.ConstrainHandle != -1 ? (c.ConstrainKind ?? "Actor") + "#" + c.ConstrainHandle + "@" + c.ConstrainS.ToString("F0") : "none")};"
                         + $"minClear={c.MinPredClearance:F1};latTarget={c.LateralM:F1};score={c.Score:F1};"
-                        + $"roadModel={lastRefDetail};local={localPlanner.LastDecision};s={route.AlongS:F0};{route.LocDetail}");
+                        + $"roadModel={lastRefDetail};world={localWorld.Detail};spatial={spatialPlanner.LastDecision};s={route.AlongS:F0};{route.LocDetail}");
                 }
             }
             catch { }
