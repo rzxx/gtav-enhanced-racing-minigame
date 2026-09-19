@@ -175,9 +175,10 @@ namespace StreetRacing
             }
             else
             {
-                // Unknown/non-road remains searchable, but expensive. This is
-                // future sidewalk/grass space, not permission to cut buildings.
-                result.SurfaceCost = 14.0f;
+                // Unknown/non-road remains searchable, but expensive. Distance
+                // from the nearest structural support increases that cost.
+                result.SurfaceCost = 14.0f
+                    + Math.Min(24f, Math.Max(0f, q.SignedOutside) * 2.2f);
             }
 
             for (int i = 0; i < actors.Count; i++)
@@ -440,6 +441,13 @@ namespace StreetRacing
                     + Math.Max(0f, outside) * 3.0f
                     + (1f - s.Confidence) * 2.0f;
                 if (!inside) score += 4f;
+
+                // Once an actual containing surface exists, an outside-nearby
+                // support can never displace it just because its center/Z is a
+                // little closer.
+                if (best.Found && !inside) continue;
+                if (!best.Found && inside)
+                    score -= 100f;
                 if (score >= bestScore) continue;
 
                 float flowCost;
