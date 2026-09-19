@@ -23,10 +23,11 @@ namespace StreetRacing.Race
     ///      (MoveTowards(prevCommanded, desired, limit*dt), NEVER actual+1)
     ///   -> Direct steering/throttle/brake.
     ///
-    /// Local Planner V2 is ENABLED after the initial join:
-    ///   multi-stage trajectories in DrivingReference's own road envelope,
-    ///   world-space actor prediction per candidate, route-progress scoring,
-    ///   apex/pass-return shapes, and maneuver commitment/hysteresis.
+    /// SpatialPlannerV1 is ENABLED after the initial join:
+    ///   a local 2D world model fuses road supports + moving actor footprints;
+    ///   beam search expands short curvature primitives directly in world XY;
+    ///   GPS is only the global route-progress objective, not the trajectory
+    ///   coordinate system.
     ///
     /// Still disabled:
     ///   semantic lane graph / oncoming-lane classification / player tactics /
@@ -76,8 +77,8 @@ namespace StreetRacing.Race
         private readonly RaceRoute route = new RaceRoute();
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
-        // Planner V2 evaluates several staged road trajectories against the
-        // persistent world model; path and speed are chosen together.
+        // Spatial planning uses a persistent perception world, but trajectory
+        // geometry itself is searched in world XY rather than route offsets.
         private readonly Perception perception = new Perception();
         private readonly LocalWorldModel localWorld = new LocalWorldModel();
         private readonly SpatialPlannerV1 spatialPlanner = new SpatialPlannerV1();
@@ -304,7 +305,7 @@ namespace StreetRacing.Race
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
                 telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -484,7 +485,7 @@ namespace StreetRacing.Race
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
                 telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;DrivingReference + LocalPlannerV2 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -643,7 +644,7 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            // Persistent world perception feeds Local Planner V2. Actor
+            // Persistent perception feeds the local 2D world model. Actor
             // prediction is evaluated per candidate in world space.
             try
             {
