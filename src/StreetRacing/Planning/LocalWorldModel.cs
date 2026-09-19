@@ -244,6 +244,8 @@ namespace StreetRacing
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
+                float reach = s.HalfLengthM + Math.Max(s.LeftM, s.RightM) + 2f;
+                if (RaceMath.FlatDistance(pos, s.Center) > reach) continue;
                 Vector3 f = RaceMath.VectorFromHeading(s.HeadingDeg);
                 f = RaceMath.FlatNormalize(f);
                 Vector3 l = new Vector3(-f.Y, f.X, 0f);
@@ -296,15 +298,21 @@ namespace StreetRacing
             if (Math.Abs(ap.Z - egoPos.Z) > 4.5f)
                 return 999f; // stacked road / bridge traffic
 
+            float actorHL = a.HalfLengthM > 0.2f ? a.HalfLengthM : 2.3f;
+            float actorHW = a.HalfWidthM > 0.2f ? a.HalfWidthM : 1.0f;
+            float centerDx = egoPos.X - ap.X;
+            float centerDy = egoPos.Y - ap.Y;
+            float centerDist = (float)Math.Sqrt(centerDx * centerDx + centerDy * centerDy);
+            float broadRadius = actorHL + actorHW + egoHalfLength + egoHalfWidth + 5f;
+            if (centerDist > broadRadius)
+                return centerDist - (actorHL + egoHalfLength);
+
             Vector3 af = RaceMath.VectorFromHeading(actorHeading);
             af = RaceMath.FlatNormalize(af);
             Vector3 al = new Vector3(-af.Y, af.X, 0f);
             Vector3 ef = RaceMath.VectorFromHeading(egoHeadingDeg);
             ef = RaceMath.FlatNormalize(ef);
             Vector3 el = new Vector3(-ef.Y, ef.X, 0f);
-
-            float actorHL = a.HalfLengthM > 0.2f ? a.HalfLengthM : 2.3f;
-            float actorHW = a.HalfWidthM > 0.2f ? a.HalfWidthM : 1.0f;
 
             // Minkowski inflation of the actor box by the ego box projected
             // onto actor axes. The ego center then becomes a point-vs-OBB test.
@@ -509,6 +517,8 @@ namespace StreetRacing
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
+                float reach = s.HalfLengthM + Math.Max(s.LeftM, s.RightM) + 2f;
+                if (RaceMath.FlatDistance(p, s.Center) > reach) continue;
                 Vector3 f = RaceMath.VectorFromHeading(s.HeadingDeg);
                 f = RaceMath.FlatNormalize(f);
                 Vector3 l = new Vector3(-f.Y, f.X, 0f);
