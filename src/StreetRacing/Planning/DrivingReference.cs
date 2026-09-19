@@ -32,6 +32,9 @@ namespace StreetRacing
             public readonly List<float> RoadConfidence = new List<float>();
             public readonly List<string> RoadSource = new List<string>();
             public readonly List<int> RoadLaneCount = new List<int>();
+            public readonly List<int> RoadForwardLanes = new List<int>();
+            public readonly List<int> RoadBackwardLanes = new List<int>();
+            public readonly List<float> RoadMedianWidth = new List<float>();
             public readonly List<Vector3> RoadCenter = new List<Vector3>();
             public readonly List<float> RoadHeadingDeg = new List<float>();
             public bool Valid;

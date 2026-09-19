@@ -46,6 +46,9 @@ namespace StreetRacing
             r.RoadConfidence.Clear();
             r.RoadSource.Clear();
             r.RoadLaneCount.Clear();
+            r.RoadForwardLanes.Clear();
+            r.RoadBackwardLanes.Clear();
+            r.RoadMedianWidth.Clear();
             r.RoadCenter.Clear();
             r.RoadHeadingDeg.Clear();
 
@@ -115,6 +118,9 @@ namespace StreetRacing
                 r.RoadConfidence.Add(obs[i].Confidence);
                 r.RoadSource.Add(obs[i].Source ?? "?");
                 r.RoadLaneCount.Add(obs[i].Lanes);
+                r.RoadForwardLanes.Add(obs[i].ForwardLanes);
+                r.RoadBackwardLanes.Add(obs[i].BackwardLanes);
+                r.RoadMedianWidth.Add(obs[i].MedianWidth);
                 r.RoadCenter.Add(obs[i].Center);
                 r.RoadHeadingDeg.Add(obs[i].Heading);
             }
@@ -286,14 +292,15 @@ namespace StreetRacing
                     - RaceMath.Clamp(dist / 22f, 0f, 1f) * 0.24f
                     - RaceMath.Clamp(z / 7f, 0f, 1f) * 0.18f
                     - RaceMath.Clamp(axis / 55f, 0f, 1f) * 0.20f;
+                bool flipped = Math.Abs(RaceMath.HeadingDiffDeg(h, refHeading)) > 90f;
                 return new Obs
                 {
                     Valid = true,
                     Center = center,
                     Heading = AlignHeadingAxis(h, refHeading),
                     Lanes = Math.Max(1, Math.Min(8, f + back)),
-                    ForwardLanes = f,
-                    BackwardLanes = back,
+                    ForwardLanes = flipped ? back : f,
+                    BackwardLanes = flipped ? f : back,
                     MedianWidth = median,
                     Confidence = RaceMath.Clamp(quality, 0.28f, 0.82f),
                 };
@@ -309,6 +316,9 @@ namespace StreetRacing
                 Center = p,
                 Heading = RaceMath.HeadingFromVector(dir),
                 Lanes = 2,
+                ForwardLanes = 1,
+                BackwardLanes = 1,
+                MedianWidth = 0f,
                 LeftM = 3.6f,
                 RightM = 3.6f,
                 Confidence = 0.18f,
@@ -339,6 +349,9 @@ namespace StreetRacing
                     a.Center.Z + (b.Center.Z - a.Center.Z) * t),
                 Heading = a.Heading,
                 Lanes = t < 0.5f ? a.Lanes : b.Lanes,
+                ForwardLanes = t < 0.5f ? a.ForwardLanes : b.ForwardLanes,
+                BackwardLanes = t < 0.5f ? a.BackwardLanes : b.BackwardLanes,
+                MedianWidth = a.MedianWidth + (b.MedianWidth - a.MedianWidth) * t,
                 LeftM = a.LeftM + (b.LeftM - a.LeftM) * t,
                 RightM = a.RightM + (b.RightM - a.RightM) * t,
                 Confidence = Math.Min(a.Confidence, b.Confidence),

@@ -31,6 +31,8 @@ namespace StreetRacing
         public float GripFactor = 0f;
         // Spatial debug overlay (route / corridor / candidates / predictions).
         public bool DebugViz = false;
+        public string DebugVizRaw = "";
+        public string ConfigLoadError = "";
         // Actuator: Direct (intended: executes the joint path/speed maneuver
         // itself every tick) or GtaDriver (baseline/diagnostic only: hands
         // point/speed to GTA pathfinding, does not guarantee the maneuver).
@@ -76,7 +78,7 @@ namespace StreetRacing
                 c.StuckTimeoutMs = s.GetValue("Race", "StuckTimeoutMs", c.StuckTimeoutMs);
                 c.DrivingStyleName = s.GetValue("Race", "DrivingStyle", c.DrivingStyleName);
                 c.DrivingStyleRaw = s.GetValue("Race", "DrivingStyleRaw", c.DrivingStyleRaw);
-                c.TelemetryEnabled = s.GetValue("Race", "TelemetryEnabled", c.TelemetryEnabled);
+                c.TelemetryEnabled = ReadBool(s, "Race", "TelemetryEnabled", c.TelemetryEnabled, null);
                 c.RaceTimeoutMs = s.GetValue("Race", "RaceTimeoutMs", c.RaceTimeoutMs);
                 c.CooldownMs = s.GetValue("Race", "CooldownMs", c.CooldownMs);
                 c.HonkDebounceMs = s.GetValue("Race", "HonkDebounceMs", c.HonkDebounceMs);
@@ -85,12 +87,12 @@ namespace StreetRacing
                 c.LookaheadTimeS = (float)s.GetValue("Race", "LookaheadTimeS", (double)c.LookaheadTimeS);
                 c.SafetyMarginM = (float)s.GetValue("Race", "SafetyMarginM", (double)c.SafetyMarginM);
                 c.GripFactor = (float)s.GetValue("Race", "GripFactor", (double)c.GripFactor);
-                c.DebugViz = s.GetValue("Race", "DebugViz", c.DebugViz);
+                c.DebugViz = ReadBool(s, "Race", "DebugViz", c.DebugViz, raw => c.DebugVizRaw = raw);
                 c.ActuatorName = s.GetValue("Race", "Actuator", c.ActuatorName);
                 c.DriverMode = s.GetValue("Race", "DriverMode", c.DriverMode);
                 c.SimpleCruise = (float)s.GetValue("Race", "SimpleCruise", (double)c.SimpleCruise);
-                c.EnablePassing = s.GetValue("Race", "EnablePassing", c.EnablePassing);
-                c.UseGtaRejoin = s.GetValue("Race", "UseGtaRejoin", c.UseGtaRejoin);
+                c.EnablePassing = ReadBool(s, "Race", "EnablePassing", c.EnablePassing, null);
+                c.UseGtaRejoin = ReadBool(s, "Race", "UseGtaRejoin", c.UseGtaRejoin, null);
                 c.DiagCruise = (float)s.GetValue("Race", "DiagCruise", (double)c.DiagCruise);
                 var keyName = s.GetValue("Race", "CancelKey", "G");
                 if (Enum.TryParse(keyName, true, out Keys k))
@@ -102,11 +104,34 @@ namespace StreetRacing
                     c.MaxDistance = c.MinDistance;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Missing/corrupt ini -> run on defaults.
+                // Missing/corrupt ini -> run on defaults, but expose why.
+                c.ConfigLoadError = ex.GetType().Name + ":" + ex.Message;
             }
             return c;
+        }
+
+        private static bool ReadBool(
+            ScriptSettings settings,
+            string section,
+            string key,
+            bool fallback,
+            Action<string> rawSink)
+        {
+            try
+            {
+                string raw = settings.GetValue(section, key, fallback ? "true" : "false");
+                rawSink?.Invoke(raw ?? "");
+                string n = (raw ?? "").Trim().ToLowerInvariant();
+                if (n == "1" || n == "true" || n == "yes" || n == "on") return true;
+                if (n == "0" || n == "false" || n == "no" || n == "off") return false;
+
+                bool parsed;
+                if (bool.TryParse(n, out parsed)) return parsed;
+            }
+            catch { }
+            return fallback;
         }
 
         public bool UseDirectActuator()

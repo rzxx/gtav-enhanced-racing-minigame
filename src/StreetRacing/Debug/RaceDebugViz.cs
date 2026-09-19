@@ -231,6 +231,8 @@ namespace StreetRacing.Debug
                     System.Drawing.Color col;
                     if (cell.Occupied)
                         col = System.Drawing.Color.FromArgb(210, 255, 20, 20);
+                    else if (cell.OnRoad && cell.FlowCost > 0.75f)
+                        col = System.Drawing.Color.FromArgb(150, 255, 120, 20);
                     else if (cell.OnRoad)
                         col = System.Drawing.Color.FromArgb(115, 40, 220, 100);
                     else

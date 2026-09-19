@@ -252,7 +252,7 @@ namespace StreetRacing
                     }
                 }
                 catch { }
-                telemetry?.Event(0, "ARM_BEGIN", $"mode={cfg.DriverMode};oppVeh={oppHandle};oppDrv={drvHandle};oppPos=({oppPos.X:F0},{oppPos.Y:F0});oppHead={oppHead:F0};plPos=({plPos.X:F0},{plPos.Y:F0});plHead={plHead:F0};plOppDist={plOppDist:F0};plOppHeadDiff={plOppHeadDiff:F0};finish=({spot.X:F0},{spot.Y:F0});style={armingStyle};profile={(armingProfile != null ? armingProfile.Name : "?")}");
+                telemetry?.Event(0, "ARM_BEGIN", $"mode={cfg.DriverMode};oppVeh={oppHandle};oppDrv={drvHandle};oppPos=({oppPos.X:F0},{oppPos.Y:F0});oppHead={oppHead:F0};plPos=({plPos.X:F0},{plPos.Y:F0});plHead={plHead:F0};plOppDist={plOppDist:F0};plOppHeadDiff={plOppHeadDiff:F0};finish=({spot.X:F0},{spot.Y:F0});style={armingStyle};profile={(armingProfile != null ? armingProfile.Name : "?")};debugVizRaw={cfg.DebugVizRaw};debugViz={(cfg.DebugViz ? 1 : 0)};cfgErr={cfg.ConfigLoadError}");
             }
             catch (Exception ex)
             {
