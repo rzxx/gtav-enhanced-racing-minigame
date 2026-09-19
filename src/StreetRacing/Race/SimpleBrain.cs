@@ -24,8 +24,8 @@ namespace StreetRacing.Race
     ///   -> Direct steering/throttle/brake.
     ///
     /// SpatialPlannerV1 is ENABLED after the initial join:
-    ///   a local 2D world model fuses road supports + moving actor footprints;
-    ///   beam search expands short curvature primitives directly in world XY;
+    ///   a local 2.5D road-surface world model fuses road supports + moving actor footprints;
+    ///   beam search expands short curvature primitives directly in world XY on connected road surfaces;
     ///   GPS is only the global route-progress objective, not the trajectory
     ///   coordinate system.
     ///
@@ -78,7 +78,7 @@ namespace StreetRacing.Race
         private readonly RoadCorridor corridor = new RoadCorridor();
         private readonly VehicleCapability capability = new VehicleCapability();
         // Spatial planning uses a persistent perception world, but trajectory
-        // geometry itself is searched in world XY rather than route offsets.
+        // geometry itself is searched in world XY on connected road surfaces rather than route offsets.
         private readonly Perception perception = new Perception();
         private readonly LocalWorldModel localWorld = new LocalWorldModel();
         private readonly SpatialPlannerV1 spatialPlanner = new SpatialPlannerV1();
@@ -644,7 +644,7 @@ namespace StreetRacing.Race
                 try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
             }
 
-            // Persistent perception feeds the local 2D world model. Actor
+            // Persistent perception feeds the local 2.5D road-surface world model. Actor
             // prediction is evaluated per candidate in world space.
             try
             {
