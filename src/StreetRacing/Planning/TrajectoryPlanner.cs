@@ -18,6 +18,9 @@ namespace StreetRacing
         public List<Vector3> Path;
         public float MinMarginM;    // min estimated road-edge margin along path
         public float MinRoadConfidence; // 0 unknown .. 1 structural agreement
+        public float OpposingFraction;   // fraction of sampled path on opposing side
+        public float UnknownFraction;    // fraction outside supported road surface
+        public float MeanFlowCost;       // mean soft directional-road cost
         public float MaxKappa;      // max path curvature rad/m
 
         // --- Joint maneuver fields: this candidate WITH its executable speed.
