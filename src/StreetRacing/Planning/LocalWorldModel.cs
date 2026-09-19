@@ -206,7 +206,8 @@ namespace StreetRacing
                 ap = perception != null
                     ? perception.Predict(actor, RaceMath.Clamp(timeS, 0f, 5f))
                     : new Vector3(actor.Position.X + actor.Velocity.X * timeS,
-                        actor.Position.Y + actor.Velocity.Y * timeS, actor.Position.Z);
+                        actor.Position.Y + actor.Velocity.Y * timeS,
+                        actor.Position.Z + actor.Velocity.Z * timeS);
             }
             catch { ap = actor.Position; }
 
@@ -272,7 +273,9 @@ namespace StreetRacing
             {
                 ap = perception != null
                     ? perception.Predict(a, RaceMath.Clamp(timeS, 0f, 5f))
-                    : new Vector3(a.Position.X + a.Velocity.X * timeS, a.Position.Y + a.Velocity.Y * timeS, a.Position.Z);
+                    : new Vector3(a.Position.X + a.Velocity.X * timeS,
+                        a.Position.Y + a.Velocity.Y * timeS,
+                        a.Position.Z + a.Velocity.Z * timeS);
             }
             catch { ap = a.Position; }
 
