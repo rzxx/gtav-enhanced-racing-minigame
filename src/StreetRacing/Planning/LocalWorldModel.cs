@@ -5,7 +5,7 @@ using GTA.Math;
 
 namespace StreetRacing
 {
-    /// Local 2D world representation used by SpatialPlannerV1.
+    /// Local 2.5D world representation used by SpatialPlannerV2.
     ///
     /// Unlike LocalPlannerV2, this model does not ask "how far left/right from
     /// the GPS rail may I go?". It represents a union of local road supports
@@ -104,7 +104,16 @@ namespace StreetRacing
             }
 
             if (buildDebugGrid) BuildDebugGrid();
-            Detail = $"roadSupports={Road.Count};actors={actors.Count};debugCells={DebugCells.Count}";
+            float maxAbsGrade = 0f;
+            int aligned = 0;
+            for (int i = 0; i < Road.Count; i++)
+            {
+                float g = Math.Abs(Road[i].Grade);
+                if (g > maxAbsGrade) maxAbsGrade = g;
+                if (Road[i].RouteAligned) aligned++;
+            }
+            Detail = $"roadSupports={Road.Count};aligned={aligned};actors={actors.Count};"
+                + $"maxGrade={maxAbsGrade:F2};debugCells={DebugCells.Count}";
         }
 
         public PoseCost EvaluatePose(Vector3 pos, float headingDeg, float timeS)
