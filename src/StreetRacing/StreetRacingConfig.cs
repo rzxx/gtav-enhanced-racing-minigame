@@ -76,7 +76,7 @@ namespace StreetRacing
                 c.StuckTimeoutMs = s.GetValue("Race", "StuckTimeoutMs", c.StuckTimeoutMs);
                 c.DrivingStyleName = s.GetValue("Race", "DrivingStyle", c.DrivingStyleName);
                 c.DrivingStyleRaw = s.GetValue("Race", "DrivingStyleRaw", c.DrivingStyleRaw);
-                c.TelemetryEnabled = s.GetValue("Race", "TelemetryEnabled", c.TelemetryEnabled);
+                c.TelemetryEnabled = ReadBool(s, "Race", "TelemetryEnabled", c.TelemetryEnabled);
                 c.RaceTimeoutMs = s.GetValue("Race", "RaceTimeoutMs", c.RaceTimeoutMs);
                 c.CooldownMs = s.GetValue("Race", "CooldownMs", c.CooldownMs);
                 c.HonkDebounceMs = s.GetValue("Race", "HonkDebounceMs", c.HonkDebounceMs);
@@ -85,12 +85,12 @@ namespace StreetRacing
                 c.LookaheadTimeS = (float)s.GetValue("Race", "LookaheadTimeS", (double)c.LookaheadTimeS);
                 c.SafetyMarginM = (float)s.GetValue("Race", "SafetyMarginM", (double)c.SafetyMarginM);
                 c.GripFactor = (float)s.GetValue("Race", "GripFactor", (double)c.GripFactor);
-                c.DebugViz = s.GetValue("Race", "DebugViz", c.DebugViz);
+                c.DebugViz = ReadBool(s, "Race", "DebugViz", c.DebugViz);
                 c.ActuatorName = s.GetValue("Race", "Actuator", c.ActuatorName);
                 c.DriverMode = s.GetValue("Race", "DriverMode", c.DriverMode);
                 c.SimpleCruise = (float)s.GetValue("Race", "SimpleCruise", (double)c.SimpleCruise);
-                c.EnablePassing = s.GetValue("Race", "EnablePassing", c.EnablePassing);
-                c.UseGtaRejoin = s.GetValue("Race", "UseGtaRejoin", c.UseGtaRejoin);
+                c.EnablePassing = ReadBool(s, "Race", "EnablePassing", c.EnablePassing);
+                c.UseGtaRejoin = ReadBool(s, "Race", "UseGtaRejoin", c.UseGtaRejoin);
                 c.DiagCruise = (float)s.GetValue("Race", "DiagCruise", (double)c.DiagCruise);
                 var keyName = s.GetValue("Race", "CancelKey", "G");
                 if (Enum.TryParse(keyName, true, out Keys k))
@@ -107,6 +107,20 @@ namespace StreetRacing
                 // Missing/corrupt ini -> run on defaults.
             }
             return c;
+        }
+
+        private static bool ReadBool(ScriptSettings s, string section, string key, bool fallback)
+        {
+            try
+            {
+                string raw = s.GetValue(section, key, fallback ? "true" : "false");
+                if (raw == null) return fallback;
+                raw = raw.Trim().ToLowerInvariant();
+                if (raw == "1" || raw == "true" || raw == "yes" || raw == "on") return true;
+                if (raw == "0" || raw == "false" || raw == "no" || raw == "off") return false;
+            }
+            catch { }
+            return fallback;
         }
 
         public bool UseDirectActuator()
