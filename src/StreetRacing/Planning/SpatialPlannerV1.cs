@@ -188,7 +188,7 @@ namespace StreetRacing
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
-                + $"{world.Detail};beam={beam.Count};cand={LastCandidates.Count}";
+                + $"{world.Detail};beam={beam.Count};cand={LastCandidates.Count};top={Summarize(LastCandidates)}";
 
             LastChosen = chosen;
             HasChosen = true;
@@ -440,6 +440,23 @@ namespace StreetRacing
             c.Score += c.MeanSpeed * 3.2f + c.MinSpeed * 0.8f
                 + RaceMath.Clamp(minClear, -2f, 6f) * 1.2f;
             return c;
+        }
+
+        private static string Summarize(IList<TrajectoryCandidate> candidates)
+        {
+            try
+            {
+                var parts = new List<string>();
+                int n = Math.Min(5, candidates.Count);
+                for (int i = 0; i < n; i++)
+                {
+                    var c = candidates[i];
+                    string b = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
+                    parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/L{c.LateralM:F1}/{b}/C{c.MinPredClearance:F1}");
+                }
+                return string.Join("|", parts);
+            }
+            catch { return "?"; }
         }
 
         private static List<float> BuildStationS(IList<Vector3> path)
