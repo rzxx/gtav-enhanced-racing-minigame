@@ -1014,7 +1014,7 @@ namespace StreetRacing.Race
             SpatialPlannerV1.Result sp = null;
             try
             {
-                localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth);
+                localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
                 sp = spatialPlanner.Plan(localWorld, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime);
             }
