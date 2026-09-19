@@ -377,6 +377,8 @@ namespace StreetRacing
             int blocker = -1;
             string blockerKind = "";
             float minClear = 999f;
+            float directionCostSum = 0f;
+            int directionSamples = 0;
 
             for (int i = 0; i < n; i++)
             {
@@ -384,6 +386,11 @@ namespace StreetRacing
                 var pc = world.EvaluatePose(c.Path[i], h, arrival[i]);
                 if (pc.RoadConfidence < c.MinRoadConfidence) c.MinRoadConfidence = pc.RoadConfidence;
                 if (pc.ClearanceM < minClear) minClear = pc.ClearanceM;
+                if (pc.OnRoad)
+                {
+                    directionCostSum += pc.DirectionCost;
+                    directionSamples++;
+                }
 
                 if (pc.BlockingHandle != -1 && pc.ClearanceM < 2.8f)
                 {
@@ -463,6 +470,8 @@ namespace StreetRacing
             c.MeanSpeed = Mean(desired);
             c.MinSpeed = Min(desired, cruise);
             c.RequiredDecel = Math.Max(0f, egoSpeed - c.TargetSpeed);
+            c.SpatialDirectionCost = directionSamples > 0 ? directionCostSum / directionSamples : 0f;
+            c.ElevationDeltaM = c.AimPoint.Z - c.Path[0].Z;
             c.LookaheadM = c.StationS[c.StationS.Count - 1];
             c.LateralM = route.ProjectOntoRoute(c.AimPoint).Lateral;
             c.SpeedLimiting = blocker != -1 && c.TargetSpeed < c.RoadTargetSpeed - 0.25f
@@ -540,7 +549,7 @@ namespace StreetRacing
                 {
                     var c = candidates[i];
                     string b = c.ConstrainHandle != -1 ? "T" + c.ConstrainHandle : "-";
-                    parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/L{c.LateralM:F1}/{b}/C{c.MinPredClearance:F1}");
+                    parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/L{c.LateralM:F1}/D{c.SpatialDirectionCost:F1}/Z{c.ElevationDeltaM:F1}/{b}/C{c.MinPredClearance:F1}");
                 }
                 return string.Join("|", parts);
             }
