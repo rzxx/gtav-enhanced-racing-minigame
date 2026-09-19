@@ -18,6 +18,8 @@ namespace StreetRacing.Debug
     internal sealed class RaceDebugViz
     {
         public bool Enabled;
+        public string LastError { get; private set; } = "";
+        public int FramesDrawn { get; private set; }
 
         public void Draw(
             RaceRoute route,
@@ -63,19 +65,44 @@ namespace StreetRacing.Debug
             float lookaheadM,
             float targetSpeed)
         {
+            Draw(route, corridor, traj, perception, speedPlan, roadReference, null,
+                egoPos, egoFwd, egoSpeed, lookaheadM, targetSpeed);
+        }
+
+        public void Draw(
+            RaceRoute route,
+            RoadCorridor corridor,
+            TrajectoryPlanner traj,
+            Perception perception,
+            SpeedPlanner speedPlan,
+            DrivingReference.Result roadReference,
+            LocalWorldModel localWorld,
+            Vector3 egoPos,
+            Vector3 egoFwd,
+            float egoSpeed,
+            float lookaheadM,
+            float targetSpeed)
+        {
             if (!Enabled) return;
             try
             {
                 DrawRoute(route);
-                if (roadReference == null)
+                if (localWorld != null)
+                    DrawLocalWorld(localWorld);
+                else if (roadReference == null)
                     DrawCorridor(corridor);
                 DrawRoadReference(roadReference);
                 DrawCandidates(traj);
                 DrawActors(perception, egoSpeed);
                 DrawAimAndBraking(route, traj, speedPlan);
                 DrawEgoPose(egoPos, egoFwd, route, traj);
+                FramesDrawn++;
+                LastError = "";
             }
-            catch { }
+            catch (Exception ex)
+            {
+                LastError = ex.GetType().Name + ":" + ex.Message;
+            }
         }
 
         private static void DrawEgoPose(Vector3 egoPos, Vector3 egoFwd, RaceRoute route, TrajectoryPlanner traj)
@@ -157,6 +184,61 @@ namespace StreetRacing.Debug
                     World.DrawLine(
                         new Vector3(a.RightEdge.X, a.RightEdge.Y, a.RightEdge.Z + 0.6f),
                         new Vector3(b.RightEdge.X, b.RightEdge.Y, b.RightEdge.Z + 0.6f), rightCol);
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawLocalWorld(LocalWorldModel world)
+        {
+            try
+            {
+                if (world == null) return;
+
+                for (int i = 0; i < world.Road.Count; i++)
+                {
+                    var s = world.Road[i];
+                    Vector3 f = RaceMath.VectorFromHeading(s.HeadingDeg);
+                    f = RaceMath.FlatNormalize(f);
+                    Vector3 l = new Vector3(-f.Y, f.X, 0f);
+                    Vector3 a = new Vector3(
+                        s.Center.X - f.X * s.HalfLengthM,
+                        s.Center.Y - f.Y * s.HalfLengthM,
+                        s.Center.Z + 0.45f);
+                    Vector3 b = new Vector3(
+                        s.Center.X + f.X * s.HalfLengthM,
+                        s.Center.Y + f.Y * s.HalfLengthM,
+                        s.Center.Z + 0.45f);
+                    var col = s.Source == "Reference"
+                        ? System.Drawing.Color.FromArgb(125, 0, 210, 255)
+                        : System.Drawing.Color.FromArgb(80, 80, 160, 255);
+                    World.DrawLine(a, b, col);
+
+                    Vector3 lp = new Vector3(
+                        s.Center.X + l.X * s.LeftM,
+                        s.Center.Y + l.Y * s.LeftM,
+                        s.Center.Z + 0.45f);
+                    Vector3 rp = new Vector3(
+                        s.Center.X - l.X * s.RightM,
+                        s.Center.Y - l.Y * s.RightM,
+                        s.Center.Z + 0.45f);
+                    World.DrawLine(lp, rp, col);
+                }
+
+                for (int i = 0; i < world.DebugCells.Count; i++)
+                {
+                    var cell = world.DebugCells[i];
+                    System.Drawing.Color col;
+                    if (cell.Occupied)
+                        col = System.Drawing.Color.FromArgb(210, 255, 20, 20);
+                    else if (cell.OnRoad)
+                        col = System.Drawing.Color.FromArgb(115, 40, 220, 100);
+                    else
+                        col = System.Drawing.Color.FromArgb(80, 150, 150, 150);
+
+                    Vector3 a = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.2f);
+                    Vector3 b = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.7f);
+                    World.DrawLine(a, b, col);
                 }
             }
             catch { }
