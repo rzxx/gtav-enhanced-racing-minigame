@@ -5,22 +5,28 @@ using GTA.Math;
 
 namespace StreetRacing
 {
-    /// Local 2D world representation used by SpatialPlannerV1.
+    /// Local 2.5D world representation used by SpatialPlannerV1.
     ///
-    /// Unlike LocalPlannerV2, this model does not ask "how far left/right from
-    /// the GPS rail may I go?". It represents a union of local road supports
-    /// in world XY, plus time-dependent oriented actor occupancy.
+    /// XY is searched freely; Z is derived from a connected local road surface.
+    /// Road supports also carry a soft traffic-flow preference. Opposing lanes
+    /// stay usable for racing/overtakes, but are no longer free real estate.
     internal sealed class LocalWorldModel
     {
         internal struct RoadSupport
         {
             public Vector3 Center;
-            public float HeadingDeg;
+            public float HeadingDeg;          // structural road axis
+            public float PreferredHeadingDeg; // route-progress direction
+            public float Grade;               // dz / horizontal meter
             public float HalfLengthM;
             public float LeftM;
             public float RightM;
             public float Confidence;
             public int Lanes;
+            public int ForwardLanes;
+            public int BackwardLanes;
+            public float MedianWidth;
+            public float FlowConfidence;
             public string Source;
         }
 
@@ -28,6 +34,7 @@ namespace StreetRacing
         {
             public Vector3 Position;
             public float SurfaceCost;
+            public float FlowCost;
             public bool OnRoad;
             public bool Occupied;
         }
@@ -36,11 +43,27 @@ namespace StreetRacing
         {
             public bool HardCollision;
             public float SurfaceCost;
+            public float FlowCost;
             public float ActorCost;
             public float ClearanceM;
             public int BlockingHandle;
             public bool OnRoad;
             public float RoadConfidence;
+            public float SurfaceZ;
+            public float Grade;
+            public bool OpposingSide;
+        }
+
+        private struct SurfaceQuery
+        {
+            public bool Found;
+            public int Index;
+            public float SignedOutside;
+            public float Confidence;
+            public float SurfaceZ;
+            public float Grade;
+            public float FlowCost;
+            public bool OpposingSide;
         }
 
         public readonly List<RoadSupport> Road = new List<RoadSupport>();
@@ -75,10 +98,9 @@ namespace StreetRacing
         {
             Reset();
             this.perception = perception;
-            this.egoOrigin = egoPos;
-            this.egoForward = RaceMath.VectorFromHeading(egoHeading);
-            this.egoForward = RaceMath.FlatNormalize(this.egoForward);
-            this.egoLeft = new Vector3(-this.egoForward.Y, this.egoForward.X, 0f);
+            egoOrigin = egoPos;
+            egoForward = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(egoHeading));
+            egoLeft = new Vector3(-egoForward.Y, egoForward.X, 0f);
             this.egoHalfLength = RaceMath.Clamp(egoHalfLength, 1.5f, 4.5f);
             this.egoHalfWidth = RaceMath.Clamp(egoHalfWidth, 0.75f, 1.8f);
 
@@ -91,8 +113,7 @@ namespace StreetRacing
                 for (int i = 0; i < perception.Actors.Count; i++)
                 {
                     var a = perception.Actors[i];
-                    if (!a.Valid) continue;
-                    if (a.Dist > 110f) continue;
+                    if (!a.Valid || a.Dist > 110f) continue;
                     actors.Add(a);
                 }
             }
@@ -101,35 +122,62 @@ namespace StreetRacing
             Detail = $"roadSupports={Road.Count};actors={actors.Count};debugCells={DebugCells.Count}";
         }
 
+        public bool TryProjectToSurface(
+            Vector3 candidate,
+            float headingDeg,
+            float previousZ,
+            out Vector3 projected,
+            out float flowCost,
+            out float confidence,
+            out bool opposingSide)
+        {
+            var q = QuerySurface(candidate, headingDeg, previousZ, true);
+            if (!q.Found)
+            {
+                projected = candidate;
+                flowCost = 0f;
+                confidence = 0f;
+                opposingSide = false;
+                return false;
+            }
+
+            projected = new Vector3(candidate.X, candidate.Y, q.SurfaceZ);
+            flowCost = q.FlowCost;
+            confidence = q.Confidence;
+            opposingSide = q.OpposingSide;
+            return true;
+        }
+
         public PoseCost EvaluatePose(Vector3 pos, float headingDeg, float timeS)
         {
+            var q = QuerySurface(pos, headingDeg, pos.Z, false);
             var result = new PoseCost
             {
                 HardCollision = false,
                 SurfaceCost = 0f,
+                FlowCost = 0f,
                 ActorCost = 0f,
                 ClearanceM = 999f,
                 BlockingHandle = -1,
-                OnRoad = false,
-                RoadConfidence = 0f,
+                OnRoad = q.Found,
+                RoadConfidence = q.Confidence,
+                SurfaceZ = q.Found ? q.SurfaceZ : pos.Z,
+                Grade = q.Grade,
+                OpposingSide = q.OpposingSide,
             };
 
-            float signedOutside;
-            float roadConf;
-            result.OnRoad = SurfaceAt(pos, out signedOutside, out roadConf);
-            result.RoadConfidence = roadConf;
-            if (result.OnRoad)
+            if (q.Found)
             {
-                result.SurfaceCost = (1f - roadConf) * 2.0f;
-                // Small preference for not grazing inferred road edges.
-                if (signedOutside > -0.7f)
-                    result.SurfaceCost += (signedOutside + 0.7f) * 0.9f;
+                result.SurfaceCost = (1f - q.Confidence) * 2.0f;
+                if (q.SignedOutside > -0.7f)
+                    result.SurfaceCost += (q.SignedOutside + 0.7f) * 0.9f;
+                result.FlowCost = q.FlowCost;
             }
             else
             {
-                // Unknown/non-road is expensive but not a wall. This is the
-                // hook for future sidewalk/grass classification.
-                result.SurfaceCost = 14.0f + Math.Min(24f, Math.Max(0f, signedOutside) * 2.2f);
+                // Unknown/non-road remains searchable, but expensive. This is
+                // future sidewalk/grass space, not permission to cut buildings.
+                result.SurfaceCost = 14.0f;
             }
 
             for (int i = 0; i < actors.Count; i++)
@@ -183,29 +231,27 @@ namespace StreetRacing
             {
                 ap = perception != null
                     ? perception.Predict(a, RaceMath.Clamp(timeS, 0f, 5f))
-                    : new Vector3(a.Position.X + a.Velocity.X * timeS, a.Position.Y + a.Velocity.Y * timeS, a.Position.Z);
+                    : new Vector3(
+                        a.Position.X + a.Velocity.X * timeS,
+                        a.Position.Y + a.Velocity.Y * timeS,
+                        a.Position.Z + a.Velocity.Z * timeS);
             }
             catch { ap = a.Position; }
+
+            if (Math.Abs(ap.Z - egoPos.Z) > 4.5f)
+                return 999f;
 
             float actorHeading = a.HeadingDeg;
             if (RaceMath.FlatLength(a.Velocity) > 1.2f)
                 actorHeading = RaceMath.HeadingFromVector(RaceMath.FlatNormalize(a.Velocity));
 
-            if (Math.Abs(ap.Z - egoPos.Z) > 4.5f)
-                return 999f; // stacked road / bridge traffic
-
-            Vector3 af = RaceMath.VectorFromHeading(actorHeading);
-            af = RaceMath.FlatNormalize(af);
+            Vector3 af = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(actorHeading));
             Vector3 al = new Vector3(-af.Y, af.X, 0f);
-            Vector3 ef = RaceMath.VectorFromHeading(egoHeadingDeg);
-            ef = RaceMath.FlatNormalize(ef);
+            Vector3 ef = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(egoHeadingDeg));
             Vector3 el = new Vector3(-ef.Y, ef.X, 0f);
 
             float actorHL = a.HalfLengthM > 0.2f ? a.HalfLengthM : 2.3f;
             float actorHW = a.HalfWidthM > 0.2f ? a.HalfWidthM : 1.0f;
-
-            // Minkowski inflation of the actor box by the ego box projected
-            // onto actor axes. The ego center then becomes a point-vs-OBB test.
             float egoOnAF = egoHalfLength * Math.Abs(RaceMath.FlatDot(ef, af))
                 + egoHalfWidth * Math.Abs(RaceMath.FlatDot(el, af));
             float egoOnAL = egoHalfLength * Math.Abs(RaceMath.FlatDot(ef, al))
@@ -220,7 +266,7 @@ namespace StreetRacing
             float y = Math.Abs(RaceMath.FlatDot(rel, al)) - hw;
 
             if (x <= 0f && y <= 0f)
-                return Math.Max(x, y); // negative = overlap depth-ish
+                return Math.Max(x, y);
 
             float ox = Math.Max(0f, x);
             float oy = Math.Max(0f, y);
@@ -230,32 +276,51 @@ namespace StreetRacing
         private void AddReferenceSupports(DrivingReference.Result reference)
         {
             if (reference == null || reference.Path == null || reference.Path.Count < 2) return;
+
             for (int i = 0; i < reference.Path.Count; i++)
             {
+                Vector3 refDir = DirectionAt(reference.Path, i);
+                float preferredHeading = RaceMath.HeadingFromVector(refDir);
                 Vector3 center = i < reference.RoadCenter.Count
                     ? reference.RoadCenter[i]
                     : reference.Path[i];
                 float heading = i < reference.RoadHeadingDeg.Count
                     ? reference.RoadHeadingDeg[i]
-                    : RaceMath.HeadingFromVector(DirectionAt(reference.Path, i));
+                    : preferredHeading;
                 float left = i < reference.LeftRoadM.Count ? reference.LeftRoadM[i] : 3.5f;
                 float right = i < reference.RightRoadM.Count ? reference.RightRoadM[i] : 3.5f;
                 float conf = i < reference.RoadConfidence.Count ? reference.RoadConfidence[i] : 0.35f;
                 int lanes = i < reference.RoadLaneCount.Count ? reference.RoadLaneCount[i] : 2;
+                int forward = i < reference.RoadForwardLanes.Count ? reference.RoadForwardLanes[i] : 0;
+                int backward = i < reference.RoadBackwardLanes.Count ? reference.RoadBackwardLanes[i] : 0;
+                float median = i < reference.RoadMedianWidth.Count ? reference.RoadMedianWidth[i] : 0f;
 
                 float halfLen = 8f;
                 if (i + 1 < reference.Path.Count)
-                    halfLen = Math.Max(halfLen, RaceMath.FlatDistance(reference.Path[i], reference.Path[i + 1]) * 0.8f + 5f);
+                    halfLen = Math.Max(
+                        halfLen,
+                        RaceMath.FlatDistance(reference.Path[i], reference.Path[i + 1]) * 0.8f + 5f);
+
+                float grade = GradeAt(reference.Path, i);
+                float flowConfidence = forward > 0 && backward > 0
+                    ? Math.Min(conf, 0.92f)
+                    : (lanes >= 3 ? Math.Min(conf, 0.35f) : 0.15f);
 
                 Road.Add(new RoadSupport
                 {
                     Center = center,
                     HeadingDeg = heading,
+                    PreferredHeadingDeg = preferredHeading,
+                    Grade = grade,
                     HalfLengthM = halfLen,
                     LeftM = RaceMath.Clamp(left, 1.7f, 16f),
                     RightM = RaceMath.Clamp(right, 1.7f, 16f),
                     Confidence = RaceMath.Clamp(conf, 0f, 1f),
                     Lanes = Math.Max(1, lanes),
+                    ForwardLanes = Math.Max(0, forward),
+                    BackwardLanes = Math.Max(0, backward),
+                    MedianWidth = RaceMath.Clamp(median, 0f, 8f),
+                    FlowConfidence = flowConfidence,
                     Source = "Reference",
                 });
             }
@@ -273,9 +338,9 @@ namespace StreetRacing
                     bool ok = PathFind.GetNthClosestVehicleNodePositionWithHeading(
                         egoPos, nth, out p, out h, out lanes);
                     if (!ok) continue;
+
                     float d = RaceMath.FlatDistance(egoPos, p);
-                    if (d > 95f) continue;
-                    if (Math.Abs(p.Z - egoPos.Z) > 9f) continue;
+                    if (d > 95f || Math.Abs(p.Z - egoPos.Z) > 12f) continue;
 
                     lanes = Math.Max(1, Math.Min(8, lanes));
                     float half = RaceMath.Clamp(lanes * 3.25f * 0.5f + 0.55f, 2.0f, 14f);
@@ -287,11 +352,17 @@ namespace StreetRacing
                     {
                         Center = p,
                         HeadingDeg = h,
+                        PreferredHeadingDeg = AlignHeadingAxis(h, egoHeading),
+                        Grade = 0f,
                         HalfLengthM = 13f,
                         LeftM = half,
                         RightM = half,
                         Confidence = RaceMath.Clamp(conf, 0.25f, 0.62f),
                         Lanes = lanes,
+                        ForwardLanes = 0,
+                        BackwardLanes = 0,
+                        MedianWidth = 0f,
+                        FlowConfidence = 0.08f,
                         Source = "NearbyNode",
                     });
                 }
@@ -301,8 +372,6 @@ namespace StreetRacing
 
         private void MergeRedundantSupports()
         {
-            // Keep reference supports, but avoid dozens of nearly-identical node
-            // rectangles on the same piece of road.
             var merged = new List<RoadSupport>();
             for (int i = 0; i < Road.Count; i++)
             {
@@ -325,50 +394,118 @@ namespace StreetRacing
             Road.AddRange(merged);
         }
 
-        private bool SurfaceAt(Vector3 p, out float signedOutside, out float confidence)
+        private SurfaceQuery QuerySurface(
+            Vector3 p,
+            float headingDeg,
+            float zHint,
+            bool projectionMode)
         {
-            signedOutside = 999f;
-            confidence = 0f;
-            bool insideAny = false;
+            var best = new SurfaceQuery
+            {
+                Found = false,
+                Index = -1,
+                SignedOutside = 999f,
+                Confidence = 0f,
+                SurfaceZ = p.Z,
+                Grade = 0f,
+                FlowCost = 0f,
+                OpposingSide = false,
+            };
+            float bestScore = float.MaxValue;
 
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
-                if (Math.Abs(p.Z - s.Center.Z) > 7.5f) continue;
-                Vector3 f = RaceMath.VectorFromHeading(s.HeadingDeg);
-                f = RaceMath.FlatNormalize(f);
+                Vector3 f = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(s.HeadingDeg));
                 Vector3 l = new Vector3(-f.Y, f.X, 0f);
                 Vector3 rel = new Vector3(p.X - s.Center.X, p.Y - s.Center.Y, 0f);
-                float along = Math.Abs(RaceMath.FlatDot(rel, f));
+                float alongSigned = RaceMath.FlatDot(rel, f);
+                float along = Math.Abs(alongSigned);
                 float lat = RaceMath.FlatDot(rel, l);
 
                 float outsideAlong = along - s.HalfLengthM;
                 float outsideLat = lat >= 0f ? lat - s.LeftM : -lat - s.RightM;
                 float outside = Math.Max(outsideAlong, outsideLat);
+                bool inside = outside <= 0f;
 
-                if (outside <= 0f)
+                float surfaceZ = s.Center.Z + alongSigned * s.Grade;
+                float dz = Math.Abs(zHint - surfaceZ);
+                float maxDz = projectionMode ? 5.5f : 6.5f;
+                if (dz > maxDz) continue;
+
+                // Prefer the connected vertical layer first, then high-confidence
+                // structural support. This prevents XY crossings from snapping
+                // between an overpass and the road below.
+                float score = dz * 2.6f
+                    + Math.Max(0f, outside) * 3.0f
+                    + (1f - s.Confidence) * 2.0f;
+                if (!inside) score += 4f;
+                if (score >= bestScore) continue;
+
+                float flowCost;
+                bool opposing;
+                EvaluateFlow(s, lat, headingDeg, out flowCost, out opposing);
+
+                bestScore = score;
+                best = new SurfaceQuery
                 {
-                    insideAny = true;
-                    // signedOutside near zero means near an estimated boundary;
-                    // more negative means safely inside.
-                    if (outside < signedOutside) signedOutside = outside;
-                    if (s.Confidence > confidence) confidence = s.Confidence;
-                }
-                else if (!insideAny && outside < signedOutside)
-                {
-                    signedOutside = outside;
-                    confidence = Math.Max(confidence, s.Confidence * 0.5f);
-                }
+                    Found = inside,
+                    Index = i,
+                    SignedOutside = outside,
+                    Confidence = s.Confidence,
+                    SurfaceZ = surfaceZ,
+                    Grade = s.Grade,
+                    FlowCost = flowCost,
+                    OpposingSide = opposing,
+                };
+            }
+            return best;
+        }
+
+        private static void EvaluateFlow(
+            RoadSupport s,
+            float lateral,
+            float headingDeg,
+            out float cost,
+            out bool opposing)
+        {
+            cost = 0f;
+            opposing = false;
+            if (s.FlowConfidence <= 0.05f) return;
+
+            float headErr = Math.Abs(RaceMath.HeadingDiffDeg(s.PreferredHeadingDeg, headingDeg));
+            if (headErr > 100f)
+            {
+                // Driving against route progress should be costly regardless
+                // of which half of the road we occupy.
+                cost += 3.0f * s.FlowConfidence;
             }
 
-            if (signedOutside == 999f) signedOutside = 20f;
-            return insideAny;
+            if (s.ForwardLanes > 0 && s.BackwardLanes > 0)
+            {
+                // GTA traffic is right-hand. With PreferredHeading aligned to
+                // route progress, positive LEFT lateral is the opposing side.
+                float medianHalf = s.MedianWidth * 0.5f;
+                float intoOpposing = lateral - medianHalf;
+                if (intoOpposing > 0f)
+                {
+                    opposing = true;
+                    cost += s.FlowConfidence * (0.9f + Math.Min(3.5f, intoOpposing * 0.28f));
+                }
+            }
+            else if (s.Lanes >= 3)
+            {
+                // Split is unknown: only a weak side preference.
+                if (lateral > 1.0f)
+                    cost += s.FlowConfidence * Math.Min(0.65f, lateral * 0.10f);
+            }
         }
 
         private void BuildDebugGrid()
         {
             DebugCells.Clear();
-            // Coarse grid only; planning uses continuous evaluation.
+            float egoHeading = RaceMath.HeadingFromVector(egoForward);
+
             for (float forward = 0f; forward <= 70f; forward += 5f)
             {
                 for (float lat = -18f; lat <= 18f; lat += 4f)
@@ -377,24 +514,33 @@ namespace StreetRacing
                         egoOrigin.X + egoForward.X * forward + egoLeft.X * lat,
                         egoOrigin.Y + egoForward.Y * forward + egoLeft.Y * lat,
                         egoOrigin.Z);
-                    float outDist;
+
+                    Vector3 projected;
+                    float flow;
                     float conf;
-                    bool road = SurfaceAt(p, out outDist, out conf);
+                    bool opposing;
+                    bool road = TryProjectToSurface(
+                        p, egoHeading, egoOrigin.Z,
+                        out projected, out flow, out conf, out opposing);
+                    if (road) p = projected;
+
                     bool occupied = false;
                     for (int i = 0; i < actors.Count; i++)
                     {
-                        if (ActorClearance(actors[i], p, RaceMath.HeadingFromVector(egoForward), 0f) <= 0.2f)
+                        if (ActorClearance(actors[i], p, egoHeading, 0f) <= 0.2f)
                         {
                             occupied = true;
                             break;
                         }
                     }
+
                     DebugCells.Add(new DebugCell
                     {
                         Position = p,
                         OnRoad = road,
                         Occupied = occupied,
-                        SurfaceCost = road ? (1f - conf) * 2f : 14f + Math.Max(0f, outDist),
+                        FlowCost = flow,
+                        SurfaceCost = road ? (1f - conf) * 2f : 14f,
                     });
                 }
             }
@@ -404,18 +550,45 @@ namespace StreetRacing
         {
             Vector3 d;
             if (i <= 0)
-                d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, 0f);
+                d = new Vector3(path[1].X - path[0].X, path[1].Y - path[0].Y, path[1].Z - path[0].Z);
             else if (i >= path.Count - 1)
-                d = new Vector3(path[i].X - path[i - 1].X, path[i].Y - path[i - 1].Y, 0f);
+                d = new Vector3(path[i].X - path[i - 1].X, path[i].Y - path[i - 1].Y, path[i].Z - path[i - 1].Z);
             else
-                d = new Vector3(path[i + 1].X - path[i - 1].X, path[i + 1].Y - path[i - 1].Y, 0f);
-            return RaceMath.FlatLength(d) > 0.2f ? RaceMath.FlatNormalize(d) : new Vector3(0f, 1f, 0f);
+                d = new Vector3(path[i + 1].X - path[i - 1].X, path[i + 1].Y - path[i - 1].Y, path[i + 1].Z - path[i - 1].Z);
+
+            Vector3 flat = new Vector3(d.X, d.Y, 0f);
+            return RaceMath.FlatLength(flat) > 0.2f
+                ? RaceMath.FlatNormalize(flat)
+                : new Vector3(0f, 1f, 0f);
+        }
+
+        private static float GradeAt(IList<Vector3> path, int i)
+        {
+            if (path == null || path.Count < 2) return 0f;
+            int a = Math.Max(0, i - 1);
+            int b = Math.Min(path.Count - 1, i + 1);
+            Vector3 d = new Vector3(
+                path[b].X - path[a].X,
+                path[b].Y - path[a].Y,
+                path[b].Z - path[a].Z);
+            float flat = (float)Math.Sqrt(d.X * d.X + d.Y * d.Y);
+            if (flat < 0.5f) return 0f;
+            return RaceMath.Clamp(d.Z / flat, -0.45f, 0.45f);
         }
 
         private static float AxisHeadingError(float a, float b)
         {
             float d = Math.Abs(RaceMath.HeadingDiffDeg(a, b));
             return Math.Min(d, Math.Abs(180f - d));
+        }
+
+        private static float AlignHeadingAxis(float h, float reference)
+        {
+            if (Math.Abs(RaceMath.HeadingDiffDeg(h, reference)) <= 90f) return h;
+            float x = h + 180f;
+            while (x >= 360f) x -= 360f;
+            while (x < 0f) x += 360f;
+            return x;
         }
     }
 }
