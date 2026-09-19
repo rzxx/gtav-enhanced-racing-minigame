@@ -50,6 +50,8 @@ namespace StreetRacing
         private const float SampleM = 2f;
         private const int Layers = 7;
         private const int BeamWidth = 32;
+        private static readonly float[] CurvatureSet =
+            { -0.075f, -0.045f, -0.022f, 0f, 0.022f, 0.045f, 0.075f };
 
         public void Reset()
         {
@@ -114,10 +116,12 @@ namespace StreetRacing
                 {
                     int parentIndex = beam[i];
                     var parent = arena[parentIndex];
-                    var curvatures = CurvatureChoices(parent.LastCurvature, layer);
-                    for (int k = 0; k < curvatures.Count; k++)
+                    for (int k = 0; k < CurvatureSet.Length; k++)
                     {
-                        int childIndex = Expand(arena, parentIndex, curvatures[k],
+                        float curvature = CurvatureSet[k];
+                        if (layer == 0 && Math.Abs(curvature - parent.LastCurvature) > 0.10f)
+                            continue;
+                        int childIndex = Expand(arena, parentIndex, curvature,
                             searchSpeed, world, spatialGoal, aLat, layer);
                         if (childIndex >= 0) expanded.Add(childIndex);
                     }
@@ -283,22 +287,6 @@ namespace StreetRacing
 
             arena.Add(n);
             return arena.Count - 1;
-        }
-
-        private static List<float> CurvatureChoices(float previous, int layer)
-        {
-            // Geometric action set. Speed feasibility is handled separately;
-            // tight arcs are allowed if the resulting speed profile slows.
-            float[] baseK = { -0.075f, -0.045f, -0.022f, 0f, 0.022f, 0.045f, 0.075f };
-            var r = new List<float>(baseK.Length);
-            for (int i = 0; i < baseK.Length; i++)
-            {
-                float k = baseK[i];
-                // First layer avoids instant opposite-lock from previous plan.
-                if (layer == 0 && Math.Abs(k - previous) > 0.10f) continue;
-                r.Add(k);
-            }
-            return r;
         }
 
         private static List<int> DiverseBeam(
