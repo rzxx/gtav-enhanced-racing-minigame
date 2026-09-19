@@ -128,7 +128,7 @@ namespace StreetRacing
             {
                 // Unknown/non-road is expensive but not a wall. This is the
                 // hook for future sidewalk/grass classification.
-                result.SurfaceCost = 7.5f + Math.Min(18f, Math.Max(0f, signedOutside) * 1.8f);
+                result.SurfaceCost = 14.0f + Math.Min(24f, Math.Max(0f, signedOutside) * 2.2f);
             }
 
             for (int i = 0; i < actors.Count; i++)
@@ -393,7 +393,7 @@ namespace StreetRacing
                         Position = p,
                         OnRoad = road,
                         Occupied = occupied,
-                        SurfaceCost = road ? (1f - conf) * 2f : 8f + Math.Max(0f, outDist),
+                        SurfaceCost = road ? (1f - conf) * 2f : 14f + Math.Max(0f, outDist),
                     });
                 }
             }
