@@ -27,7 +27,7 @@ namespace StreetRacing.Race
     /// normal driver.
     internal sealed class RecoveryPrimitive
     {
-        public enum Stage { Idle, Stop, Reverse, Forward, Rejoin }
+        public enum Stage { Idle, Stop, Reverse, ReverseSettle, Forward, Rejoin }
 
         public Stage Current = Stage.Idle;
         public string Reason = "";
@@ -100,7 +100,7 @@ namespace StreetRacing.Race
         /// permanent zero-speed hold: Forward/Rejoin always move so the pose
         /// changes and can become mergeable.
         public ManeuverCommand Tick(RaceRoute route, RoadCorridor corridor,
-            Vector3 egoPos, Vector3 egoFwd, float egoHeading, float egoSpeed,
+            Vector3 egoPos, Vector3 egoFwd, float egoHeading, float signedLongMps,
             float alongS, int nowMs, float recCruise)
         {
             var hold = new ManeuverCommand
@@ -165,10 +165,14 @@ namespace StreetRacing.Race
                             float heldS = (nowMs - SinceMs) / 1000f;
                             if (backed >= reverseTargetM || heldS > 6f)
                             {
-                                Current = Stage.Forward;
+                                // Never hand a forward/rejoin maneuver to Direct
+                                // while the vehicle still has substantial
+                                // backwards momentum.
+                                Current = Stage.ReverseSettle;
                                 SinceMs = nowMs;
-                                Reason = "reverse-done";
-                                goto case Stage.Forward;
+                                stopUntil = nowMs + 1800;
+                                Reason = "reverse-settle";
+                                goto case Stage.ReverseSettle;
                             }
                             // Reverse path: straight back along -ego heading.
                             var back = new Vector3(egoPos.X - egoFwd.X * 12f, egoPos.Y - egoFwd.Y * 12f, egoPos.Z);
@@ -182,6 +186,19 @@ namespace StreetRacing.Race
                                 Reason = "Recovery:Reverse",
                                 Reverse = true, // EXPLICIT: only place this is set
                             };
+                        }
+
+                    case Stage.ReverseSettle:
+                        {
+                            if (Math.Abs(signedLongMps) < 0.8f || nowMs >= stopUntil)
+                            {
+                                Current = Stage.Forward;
+                                SinceMs = nowMs;
+                                Reason = "reverse-settled";
+                                goto case Stage.Forward;
+                            }
+                            hold.Reason = "Recovery:ReverseSettle";
+                            return hold;
                         }
 
                     case Stage.Forward:
