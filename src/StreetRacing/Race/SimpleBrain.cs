@@ -740,7 +740,7 @@ namespace StreetRacing.Race
                     else
                     {
                         ManeuverCommand rm = recovery.Tick(route, corridor, egoPos, egoFwd,
-                            egoHeading, forwardPlanSpeed, route.AlongS, now, Math.Min(EffectiveCruise(), 6f));
+                            egoHeading, signedLongSpeed, route.AlongS, now, Math.Min(EffectiveCruise(), 6f));
                         rm.PlanId = ++maneuverPlanId;
                         joinState = "Recovery:" + recovery.Current;
                         TargetSpeed = Math.Max(0f, rm.TargetSpeed);
