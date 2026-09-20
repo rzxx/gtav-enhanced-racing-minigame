@@ -21,7 +21,8 @@ namespace StreetRacing
     ///   desRoad_mps,cmd_mps,lookX,lookY,joinState,
     ///   vLong_mps,vLat_mps,slip_deg,yawRate_deg_s,yawTarget_deg_s,
     ///   steerAct_deg,thrAct01,thrPowerAct01,brkAct01,steerSat_s,stability,
-    ///   gear,nextGear,rpm,gtaTrafficLight,burnout,seatOk
+    ///   gear,nextGear,rpm,gtaTrafficLight,burnout,seatOk,
+    ///   oppFrac,unknownFrac,flowCost,elevDelta_m,gatesPassed,surfaceComp,gateMiss,planMs
     /// Milestone note: v_tgt is the PERSISTENT commanded speed (accel-limited),
     /// desRoad_mps is the curvature-based desired road speed (cruise-capped,
     /// braking-feasible at ego), cmd_mps duplicates v_tgt explicitly so
@@ -45,7 +46,7 @@ namespace StreetRacing
         {
             samples = new StreamWriter($"scripts\\StreetRacing_race_{raceId}.csv", false);
             events = new StreamWriter($"scripts\\StreetRacing_race_{raceId}_events.csv", false);
-            samples.WriteLine("t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,cmdStyle,routeLost,impact,reissue,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa,chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt,egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m,desRoad_mps,cmd_mps,lookX,lookY,joinState,vLong_mps,vLat_mps,slip_deg,yawRate_deg_s,yawTarget_deg_s,steerAct_deg,thrAct01,thrPowerAct01,brkAct01,steerSat_s,stability,gear,nextGear,rpm,gtaTrafficLight,burnout,seatOk");
+            samples.WriteLine("t_ms,style,tactical,prog_m,prog_pct,look_m,lat_m,halfW_m,offCorr_m,headErr_deg,curv,aimLat,chScore,rejLat,rejScore,v_tgt,v_act,v_lim,brakeNeed,aBrake,aLat,nActors,nearD,nearTTC,nearClose,cmdCruise,cmdStyle,routeLost,impact,reissue,finishGap,routeSrc,minHalfW,pathErrLat,pathErrHead,speedErr,distToPath,brakePtS,capConf,actuator,chosenReject,minMargin,maxKappa,chIdx,chMeanV,chMinV,constrHandle,constrKind,constrS,minPredClear,planId,steerDeg,thr01,brk01,localVTgt,egoHead_deg,routeHead_deg,firstTangErr_deg,locExpected_m,locJump_m,desRoad_mps,cmd_mps,lookX,lookY,joinState,vLong_mps,vLat_mps,slip_deg,yawRate_deg_s,yawTarget_deg_s,steerAct_deg,thrAct01,thrPowerAct01,brkAct01,steerSat_s,stability,gear,nextGear,rpm,gtaTrafficLight,burnout,seatOk,oppFrac,unknownFrac,flowCost,elevDelta_m,gatesPassed,surfaceComp,gateMiss,planMs");
             events.WriteLine("t_ms,type,detail");
             Event(0, "START", "style=" + style + ";profile=" + (profile ?? "?"));
         }
@@ -75,11 +76,14 @@ namespace StreetRacing
             float steerActualDeg = 0f, float thrActual01 = 0f, float thrPowerActual01 = 0f,
             float brkActual01 = 0f, float steerSatS = 0f, string stability = "",
             int gear = 0, int nextGear = 0, float rpm = 0f,
-            int gtaTrafficLight = 0, int burnout = 0, int seatOk = 0)
+            int gtaTrafficLight = 0, int burnout = 0, int seatOk = 0,
+            float oppFrac = 0f, float unknownFrac = 0f, float flowCost = 0f,
+            float elevDeltaM = 0f, int gatesPassed = 0, int surfaceComp = -1,
+            float gateMiss = 0f, float planMs = 0f)
         {
             if (closed) return;
             samples.WriteLine(string.Format(CultureInfo.InvariantCulture,
-                "{0},{1},{2},{3:F0},{4:F3},{5:F0},{6:F1},{7:F1},{8:F1},{9:F0},{10:F4},{11:F1},{12:F2},{13:F1},{14:F2},{15:F1},{16:F1},{17},{18:F2},{19:F1},{20:F1},{21},{22:F0},{23:F1},{24:F1},{25:F1},{26},{27},{28},{29},{30:F0},{31},{32:F1},{33:F1},{34:F1},{35:F1},{36:F1},{37:F0},{38:F2},{39},{40},{41:F1},{42:F4},{43},{44:F1},{45:F1},{46},{47},{48:F0},{49:F1},{50},{51:F1},{52:F2},{53:F2},{54:F1},{55:F0},{56:F0},{57:F1},{58:F0},{59:F1},{60:F1},{61:F1},{62:F0},{63:F0},{64},{65:F1},{66:F1},{67:F1},{68:F1},{69:F1},{70:F1},{71:F2},{72:F2},{73:F2},{74:F2},{75},{76},{77},{78:F3},{79},{80},{81}",
+                "{0},{1},{2},{3:F0},{4:F3},{5:F0},{6:F1},{7:F1},{8:F1},{9:F0},{10:F4},{11:F1},{12:F2},{13:F1},{14:F2},{15:F1},{16:F1},{17},{18:F2},{19:F1},{20:F1},{21},{22:F0},{23:F1},{24:F1},{25:F1},{26},{27},{28},{29},{30:F0},{31},{32:F1},{33:F1},{34:F1},{35:F1},{36:F1},{37:F0},{38:F2},{39},{40},{41:F1},{42:F4},{43},{44:F1},{45:F1},{46},{47},{48:F0},{49:F1},{50},{51:F1},{52:F2},{53:F2},{54:F1},{55:F0},{56:F0},{57:F1},{58:F0},{59:F1},{60:F1},{61:F1},{62:F0},{63:F0},{64},{65:F1},{66:F1},{67:F1},{68:F1},{69:F1},{70:F1},{71:F2},{72:F2},{73:F2},{74:F2},{75},{76},{77},{78:F3},{79},{80},{81},{82:F3},{83:F3},{84:F3},{85:F1},{86},{87},{88:F1},{89:F2}",
                 t, style, tactical, progM, progPct, lookM, latM, halfW, offCorr, headErr, curv,
                 aimLat, chScore, rejLat, rejScore, vTgt, vAct, vLim, brakeNeed, aBrake, aLat,
                 nActors, nearD, nearTtc, nearClose, cmdCruise, cmdStyle, routeLost, impact, reissue, finishGap,
@@ -90,7 +94,9 @@ namespace StreetRacing
                 desRoadMps, cmdMps, lookX, lookY, joinState ?? "",
                 vLongMps, vLatMps, slipDeg, yawRateDegS, yawTargetDegS,
                 steerActualDeg, thrActual01, thrPowerActual01, brkActual01, steerSatS, stability ?? "",
-                gear, nextGear, rpm, gtaTrafficLight, burnout, seatOk));
+                gear, nextGear, rpm, gtaTrafficLight, burnout, seatOk,
+                oppFrac, unknownFrac, flowCost, elevDeltaM,
+                gatesPassed, surfaceComp, gateMiss, planMs));
             if (++sampleCount % 50 == 0)
             {
                 try { samples.Flush(); events.Flush(); } catch { }
