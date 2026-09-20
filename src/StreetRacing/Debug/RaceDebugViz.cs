@@ -92,6 +92,7 @@ namespace StreetRacing.Debug
                 else if (roadReference == null)
                     DrawCorridor(corridor);
                 DrawRoadReference(roadReference);
+                DrawRouteGates(traj);
                 DrawCandidates(traj);
                 DrawActors(perception, egoSpeed);
                 DrawAimAndBraking(route, traj, speedPlan);
@@ -286,6 +287,35 @@ namespace StreetRacing.Debug
             catch { }
         }
 
+        private static void DrawRouteGates(TrajectoryPlanner traj)
+        {
+            try
+            {
+                if (traj == null || traj.DebugGateCenters == null) return;
+                for (int i = 0; i < traj.DebugGateCenters.Count; i++)
+                {
+                    Vector3 p = traj.DebugGateCenters[i];
+                    var col = i == 0
+                        ? System.Drawing.Color.FromArgb(230, 255, 255, 255)
+                        : System.Drawing.Color.FromArgb(155, 80, 180, 255);
+                    World.DrawLine(
+                        new Vector3(p.X, p.Y, p.Z + 0.2f),
+                        new Vector3(p.X, p.Y, p.Z + 5.0f), col);
+                    try
+                    {
+                        float s = i == 0 ? 1.5f : 1.0f;
+                        World.DrawMarker(MarkerType.Sphere,
+                            p + new Vector3(0f, 0f, 1.0f),
+                            new Vector3(), new Vector3(),
+                            new Vector3(s, s, s), col,
+                            false, false, false, "", "", false);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
         private static void DrawCandidates(TrajectoryPlanner traj)
         {
             try
@@ -335,6 +365,7 @@ namespace StreetRacing.Debug
                     {
                         case ActorKind.Rival: col = System.Drawing.Color.FromArgb(220, 255, 0, 255); break;
                         case ActorKind.Ped: col = System.Drawing.Color.FromArgb(220, 255, 140, 0); break;
+                        case ActorKind.Debris: col = System.Drawing.Color.FromArgb(130, 170, 170, 170); break;
                         case ActorKind.Obstacle: col = System.Drawing.Color.FromArgb(220, 255, 0, 0); break;
                         default: col = System.Drawing.Color.FromArgb(200, 255, 255, 0); break;
                     }
