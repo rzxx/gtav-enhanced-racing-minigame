@@ -1470,6 +1470,10 @@ namespace StreetRacing.Race
             try
             {
                 trajViz.LastCandidates.Clear();
+                trajViz.DebugGateCenters.Clear();
+                for (int gi = 0; gi < spatialPlanner.DebugGateCenters.Count; gi++)
+                    trajViz.DebugGateCenters.Add(spatialPlanner.DebugGateCenters[gi]);
+
                 if (joined && spatialPlanner.LastCandidates.Count > 0)
                 {
                     for (int i = 0; i < spatialPlanner.LastCandidates.Count; i++)
