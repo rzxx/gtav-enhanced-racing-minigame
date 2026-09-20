@@ -104,7 +104,8 @@ namespace StreetRacing
             float egoHeading,
             float egoSpeed,
             float cruise,
-            int nowMs)
+            int nowMs,
+            Vector3 finishTarget)
         {
             long perfStart = Stopwatch.GetTimestamp();
             var result = new Result();
@@ -124,7 +125,7 @@ namespace StreetRacing
             aBrake = RaceMath.Clamp(aBrake, 3.5f, 11.5f);
 
             float searchSpeed = RaceMath.Clamp(Math.Max(egoSpeed, 8f), 8f, Math.Min(cruise, 20f));
-            BuildRouteGates(route);
+            BuildRouteGates(route, finishTarget);
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
             Vector3 spatialGoal = routeGates.Count > 0
                 ? routeGates[routeGates.Count - 1].Center
@@ -694,11 +695,12 @@ namespace StreetRacing
             catch { return "?"; }
         }
 
-        private void BuildRouteGates(RaceRoute route)
+        private void BuildRouteGates(RaceRoute route, Vector3 finishTarget)
         {
             routeGates.Clear();
             if (route == null || !route.Built) return;
 
+            float remaining = Math.Max(0f, route.TotalLength - route.AlongS);
             float[] offsets = { 12f, 25f, 40f, 57f, 75f };
             float lastS = -999f;
             for (int i = 0; i < offsets.Length; i++)
@@ -720,6 +722,40 @@ namespace StreetRacing
                 });
                 lastS = s;
                 if (s >= route.TotalLength - 0.5f) break;
+            }
+
+            // GPS extraction may stop at the routable street endpoint while
+            // the actual race checkpoint is still tens of metres away. Near
+            // route end, make the real checkpoint the final ordered gate
+            // instead of letting DrivingReference exhaustion become
+            // RoadUncertain.
+            if (remaining <= 70f)
+            {
+                Vector3 routeEnd = route.PointAtS(route.TotalLength);
+                float finishGapFromRoute = RaceMath.FlatDistance(routeEnd, finishTarget);
+                float finishGapFromEgoRoute = RaceMath.FlatDistance(
+                    route.PointAtS(route.AlongS), finishTarget);
+                if (finishGapFromRoute > 3f && finishGapFromRoute < 80f
+                    && finishGapFromEgoRoute < 130f)
+                {
+                    Vector3 from = routeGates.Count > 0
+                        ? routeGates[routeGates.Count - 1].Center
+                        : routeEnd;
+                    Vector3 d = new Vector3(
+                        finishTarget.X - from.X,
+                        finishTarget.Y - from.Y, 0f);
+                    if (RaceMath.FlatLength(d) < 1f)
+                        d = RaceMath.VectorFromHeading(route.HeadingAtS(route.TotalLength));
+                    d = RaceMath.FlatNormalize(d);
+                    routeGates.Add(new RouteGate
+                    {
+                        Center = finishTarget,
+                        Dir = d,
+                        S = route.TotalLength + finishGapFromRoute,
+                        HalfWidthM = 13.5f,
+                        ZToleranceM = 6.0f,
+                    });
+                }
             }
         }
 
