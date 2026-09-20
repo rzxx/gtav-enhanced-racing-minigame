@@ -36,7 +36,7 @@ namespace StreetRacing.Race
 
         private int stopUntil;
         private float reverseStartS;
-        private float reverseTargetM = 8f;
+        private float reverseTargetM = 6f;
 
         // Lack-of-progress detector state (corroborated stuck, not one sample).
         private float progressMarkS = -9999f;
@@ -158,12 +158,12 @@ namespace StreetRacing.Race
 
                     case Stage.Reverse:
                         {
-                            // Controlled reverse: 8 m at ~3 m/s, steering toward
-                            // the merge bearing (inverted by Direct for reverse).
-                            // Distance measured by AlongS change OR time fallback.
+                            // Controlled short reverse at ~3 m/s. AlongS can
+                            // freeze when already off-route, so the time cap is
+                            // deliberately short as a second distance bound.
                             float backed = Math.Abs(alongS - reverseStartS);
                             float heldS = (nowMs - SinceMs) / 1000f;
-                            if (backed >= reverseTargetM || heldS > 6f)
+                            if (backed >= reverseTargetM || heldS > 2.8f)
                             {
                                 // Never hand a forward/rejoin maneuver to Direct
                                 // while the vehicle still has substantial
