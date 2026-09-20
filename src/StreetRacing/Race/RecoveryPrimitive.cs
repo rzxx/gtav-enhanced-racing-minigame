@@ -190,13 +190,15 @@ namespace StreetRacing.Race
 
                     case Stage.ReverseSettle:
                         {
-                            if (Math.Abs(signedLongMps) < 0.8f || nowMs >= stopUntil)
+                            if (Math.Abs(signedLongMps) < 0.8f)
                             {
                                 Current = Stage.Forward;
                                 SinceMs = nowMs;
                                 Reason = "reverse-settled";
                                 goto case Stage.Forward;
                             }
+                            if (nowMs >= stopUntil)
+                                Reason = $"reverse-still-moving:{signedLongMps:F1}";
                             // Stay in explicit reverse mode while
                             // braking backward momentum. If we flip Reverse
                             // false here, Direct sees "reverse motion" as an
