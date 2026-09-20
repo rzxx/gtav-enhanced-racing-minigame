@@ -82,6 +82,7 @@ namespace StreetRacing
     internal sealed class TrajectoryPlanner
     {
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
+        public readonly List<Vector3> DebugGateCenters = new List<Vector3>(8);
         public TrajectoryCandidate Chosen;
         public bool HasChosen;
         public float BrakingPointS = -1f;
@@ -94,6 +95,7 @@ namespace StreetRacing
         public void Reset()
         {
             LastCandidates.Clear();
+            DebugGateCenters.Clear();
             HasChosen = false;
             BrakingPointS = -1f;
             PlanId = 0;
