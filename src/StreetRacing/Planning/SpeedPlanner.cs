@@ -57,6 +57,7 @@ namespace StreetRacing
             switch (kind)
             {
                 case ActorKind.Ped: return 0.45f;
+                case ActorKind.Debris: return 0.30f;
                 case ActorKind.Obstacle: return 0.9f;
                 default: return 1.1f;
             }
@@ -158,6 +159,10 @@ namespace StreetRacing
                 float pathLat = (pathLats != null && k < pathLats.Count) ? pathLats[k] : 0f;
                 foreach (var a in perception.Actors)
                 {
+                    // Small debris is deliberately handled as a soft spatial
+                    // cost, never as a zero-speed longitudinal blocker.
+                    if (a.Kind == ActorKind.Debris) continue;
+
                     if (a.RouteValid)
                     {
                         if (a.RouteDist < -8f || a.RouteDist > s + 90f) continue;
