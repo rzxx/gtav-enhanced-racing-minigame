@@ -200,6 +200,19 @@ namespace StreetRacing
                     result.BlockingHandle = a.Handle;
                 }
 
+                if (a.Kind == ActorKind.Debris)
+                {
+                    // Small road junk is a preference, not a wall. Hitting it
+                    // is allowed when the alternative is traffic/oncoming.
+                    float caution = 0.9f;
+                    if (clear < caution)
+                    {
+                        float x = caution - clear;
+                        result.ActorCost += x * x * 1.2f;
+                    }
+                    continue;
+                }
+
                 float hardMargin = a.Kind == ActorKind.Ped ? 0.9f : 0.15f;
                 if (clear <= hardMargin)
                 {
