@@ -144,7 +144,8 @@ namespace StreetRacing.Race
         private bool commandedInit;
         private int prevPlanMs = -1;
 
-        // --- One-time join latch. Once TRACK, never go back (no recovery).
+        // --- One-time startup join latch. Normal spatial planning owns the
+        // route after this; explicit recovery may temporarily take over.
         private bool joined;
         private string joinState = "Init";
 
@@ -304,8 +305,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1+Gates");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -484,8 +485,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LocalWorldModel + SpatialPlannerV1 + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1+Gates;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -740,7 +741,7 @@ namespace StreetRacing.Race
                     else
                     {
                         ManeuverCommand rm = recovery.Tick(route, corridor, egoPos, egoFwd,
-                            egoHeading, forwardPlanSpeed, route.AlongS, now, Math.Min(EffectiveCruise(), 6f));
+                            egoHeading, signedLongSpeed, route.AlongS, now, Math.Min(EffectiveCruise(), 6f));
                         rm.PlanId = ++maneuverPlanId;
                         joinState = "Recovery:" + recovery.Current;
                         TargetSpeed = Math.Max(0f, rm.TargetSpeed);
@@ -773,8 +774,9 @@ namespace StreetRacing.Race
                 catch { dtPlan = 0.1f; }
                 prevPlanMs = now;
 
-                // One-time join: only when NOT yet joined and still misaligned.
-                // Once joined, stay in TRACK forever (no rejoin, no recovery).
+                // One-time startup join: only when NOT yet joined and still
+                // misaligned. After that, spatial planning owns normal driving;
+                // explicit recovery is a separate physical-failure mode.
                 ManeuverCommand m;
                 if (!joined)
                 {
@@ -964,6 +966,20 @@ namespace StreetRacing.Race
             {
                 int now = Game.GameTime;
                 lastRefDetail = rr != null ? rr.Detail : "null";
+                float routeRemain = Math.Max(0f, route.TotalLength - route.AlongS);
+                bool terminalPhase = routeRemain <= 45f && FinishGap <= 100f;
+
+                if (terminalPhase)
+                {
+                    try
+                    {
+                        telemetry?.Event(now - t0, "TERMINAL_SPATIAL",
+                            $"reference-ended;routeRemain={routeRemain:F1};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                    }
+                    catch { }
+                    return BuildTerminalSpatial(egoPos, egoSpeed, dtPlan, cruise);
+                }
+
                 if (referenceInvalidSinceMs < 0)
                 {
                     referenceInvalidSinceMs = now;
@@ -1016,7 +1032,7 @@ namespace StreetRacing.Race
             {
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
                 sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime);
+                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
             }
             catch { sp = null; }
 
@@ -1043,6 +1059,34 @@ namespace StreetRacing.Race
             referenceInvalidSinceMs = -1;
             joinState = sp.Intent;
             return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
+        }
+
+        private ManeuverCommand BuildTerminalSpatial(
+            Vector3 egoPos, float egoSpeed, float dtPlan, float cruise)
+        {
+            try
+            {
+                // No long DrivingReference is required here: nearby structural
+                // road nodes + ordered route/finish gates are sufficient for
+                // the final local search.
+                localWorld.Build(null, perception, egoPos, lastEgoHeading,
+                    egoHalfLength, egoHalfWidth, viz.Enabled);
+                var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
+                if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
+                {
+                    referenceInvalidSinceMs = -1;
+                    plannerInvalidSinceMs = -1;
+                    joinState = "Terminal";
+                    return BuildCommandFromCandidate(
+                        sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
+                }
+            }
+            catch { }
+
+            joinState = "TerminalUncertain";
+            return BuildFailSoftFromCurrent(
+                egoPos, Math.Min(5f, cruise), "TerminalUncertain");
         }
 
         private ManeuverCommand BuildFailSoftFromCurrent(Vector3 egoPos, float cap, string why)
@@ -1428,6 +1472,10 @@ namespace StreetRacing.Race
             try
             {
                 trajViz.LastCandidates.Clear();
+                trajViz.DebugGateCenters.Clear();
+                for (int gi = 0; gi < spatialPlanner.DebugGateCenters.Count; gi++)
+                    trajViz.DebugGateCenters.Add(spatialPlanner.DebugGateCenters[gi]);
+
                 if (joined && spatialPlanner.LastCandidates.Count > 0)
                 {
                     for (int i = 0; i < spatialPlanner.LastCandidates.Count; i++)
@@ -1609,7 +1657,10 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.SteerSaturationS : 0f,
                     pe.Valid ? pe.StabilityMode : "",
                     gear, nextGear, rpm,
-                    gtaTrafficLight, burnout, seatOk);
+                    gtaTrafficLight, burnout, seatOk,
+                    c.OpposingFraction, c.UnknownFraction, c.MeanFlowCost,
+                    c.ElevationDeltaM, c.RouteGatesPassed, c.SurfaceComponentId,
+                    c.GateMissCost, spatialPlanner.LastPlanMs);
             }
             catch { }
         }

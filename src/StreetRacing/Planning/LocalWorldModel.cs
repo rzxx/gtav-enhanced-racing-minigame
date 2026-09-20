@@ -27,6 +27,7 @@ namespace StreetRacing
             public int BackwardLanes;
             public float MedianWidth;
             public float FlowConfidence;
+            public int SurfaceComponentId; // connected 2.5D surface layer
             public string Source;
         }
 
@@ -52,6 +53,7 @@ namespace StreetRacing
             public float SurfaceZ;
             public float Grade;
             public bool OpposingSide;
+            public int SurfaceComponentId;
         }
 
         private struct SurfaceQuery
@@ -64,6 +66,7 @@ namespace StreetRacing
             public float Grade;
             public float FlowCost;
             public bool OpposingSide;
+            public int SurfaceComponentId;
         }
 
         public readonly List<RoadSupport> Road = new List<RoadSupport>();
@@ -107,6 +110,7 @@ namespace StreetRacing
             AddReferenceSupports(reference);
             AddNearbyNodeSupports(egoPos, egoHeading);
             MergeRedundantSupports();
+            int surfaceComponents = AssignSurfaceComponents();
 
             if (perception != null)
             {
@@ -127,8 +131,15 @@ namespace StreetRacing
                 if (g > maxAbsGrade) maxAbsGrade = g;
                 if (Road[i].FlowConfidence > 0.25f) alignedSupports++;
             }
-            Detail = $"roadSupports={Road.Count};flowSupports={alignedSupports};actors={actors.Count};"
+            Detail = $"roadSupports={Road.Count};surfaceComponents={surfaceComponents};"
+                + $"flowSupports={alignedSupports};actors={actors.Count};"
                 + $"maxGrade={maxAbsGrade:F2};debugCells={DebugCells.Count}";
+        }
+
+        public int LocateSurfaceComponent(Vector3 pos, float headingDeg)
+        {
+            var q = QuerySurface(pos, headingDeg, pos.Z, true, -1);
+            return q.Found ? q.SurfaceComponentId : -1;
         }
 
         public bool TryProjectToSurface(
@@ -140,13 +151,30 @@ namespace StreetRacing
             out float confidence,
             out bool opposingSide)
         {
-            var q = QuerySurface(candidate, headingDeg, previousZ, true);
+            int ignored;
+            return TryProjectToSurface(candidate, headingDeg, previousZ, -1,
+                out projected, out flowCost, out confidence, out opposingSide, out ignored);
+        }
+
+        public bool TryProjectToSurface(
+            Vector3 candidate,
+            float headingDeg,
+            float previousZ,
+            int surfaceComponentHint,
+            out Vector3 projected,
+            out float flowCost,
+            out float confidence,
+            out bool opposingSide,
+            out int surfaceComponentId)
+        {
+            var q = QuerySurface(candidate, headingDeg, previousZ, true, surfaceComponentHint);
             if (!q.Found)
             {
                 projected = candidate;
                 flowCost = 0f;
                 confidence = 0f;
                 opposingSide = false;
+                surfaceComponentId = surfaceComponentHint;
                 return false;
             }
 
@@ -154,12 +182,19 @@ namespace StreetRacing
             flowCost = q.FlowCost;
             confidence = q.Confidence;
             opposingSide = q.OpposingSide;
+            surfaceComponentId = q.SurfaceComponentId;
             return true;
         }
 
         public PoseCost EvaluatePose(Vector3 pos, float headingDeg, float timeS)
         {
-            var q = QuerySurface(pos, headingDeg, pos.Z, false);
+            return EvaluatePose(pos, headingDeg, timeS, -1);
+        }
+
+        public PoseCost EvaluatePose(
+            Vector3 pos, float headingDeg, float timeS, int surfaceComponentHint)
+        {
+            var q = QuerySurface(pos, headingDeg, pos.Z, false, surfaceComponentHint);
             var result = new PoseCost
             {
                 HardCollision = false,
@@ -173,6 +208,7 @@ namespace StreetRacing
                 SurfaceZ = q.Found ? q.SurfaceZ : pos.Z,
                 Grade = q.Grade,
                 OpposingSide = q.OpposingSide,
+                SurfaceComponentId = q.SurfaceComponentId,
             };
 
             if (q.Found)
@@ -198,6 +234,19 @@ namespace StreetRacing
                 {
                     result.ClearanceM = clear;
                     result.BlockingHandle = a.Handle;
+                }
+
+                if (a.Kind == ActorKind.Debris)
+                {
+                    // Small road junk is a preference, not a wall. Hitting it
+                    // is allowed when the alternative is traffic/oncoming.
+                    float caution = 0.9f;
+                    if (clear < caution)
+                    {
+                        float x = caution - clear;
+                        result.ActorCost += x * x * 1.2f;
+                    }
+                    continue;
                 }
 
                 float hardMargin = a.Kind == ActorKind.Ped ? 0.9f : 0.15f;
@@ -414,11 +463,92 @@ namespace StreetRacing
             Road.AddRange(merged);
         }
 
+        private int AssignSurfaceComponents()
+        {
+            int n = Road.Count;
+            if (n == 0) return 0;
+            var component = new int[n];
+            for (int i = 0; i < n; i++) component[i] = -1;
+            var queue = new Queue<int>();
+            int nextId = 0;
+
+            for (int seed = 0; seed < n; seed++)
+            {
+                if (component[seed] >= 0) continue;
+                component[seed] = nextId;
+                queue.Enqueue(seed);
+
+                while (queue.Count > 0)
+                {
+                    int a = queue.Dequeue();
+                    for (int b = 0; b < n; b++)
+                    {
+                        if (component[b] >= 0 || a == b) continue;
+                        if (!SupportsConnect(Road[a], Road[b])) continue;
+                        component[b] = nextId;
+                        queue.Enqueue(b);
+                    }
+                }
+                nextId++;
+            }
+
+            for (int i = 0; i < n; i++)
+            {
+                var s = Road[i];
+                s.SurfaceComponentId = component[i];
+                Road[i] = s;
+            }
+            return nextId;
+        }
+
+        private static bool SupportsConnect(RoadSupport a, RoadSupport b)
+        {
+            float flat = RaceMath.FlatDistance(a.Center, b.Center);
+            float maxReach = Math.Min(34f, a.HalfLengthM + b.HalfLengthM + 5f);
+            if (flat > maxReach) return false;
+
+            // Estimate each support's surface height at the other's center.
+            Vector3 af = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(a.HeadingDeg));
+            Vector3 bf = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(b.HeadingDeg));
+            Vector3 ab = new Vector3(b.Center.X - a.Center.X, b.Center.Y - a.Center.Y, 0f);
+            float za = a.Center.Z + RaceMath.FlatDot(ab, af) * a.Grade;
+            float zb = b.Center.Z + RaceMath.FlatDot(
+                new Vector3(a.Center.X - b.Center.X, a.Center.Y - b.Center.Y, 0f), bf) * b.Grade;
+            float dz = Math.Min(Math.Abs(za - b.Center.Z), Math.Abs(zb - a.Center.Z));
+            float allowedDz = 1.8f + flat * 0.12f;
+            if (dz > allowedDz) return false;
+
+            // Sequential/overlapping rectangles on the same physical surface
+            // connect. Parallel streets separated laterally do not. Crossing
+            // supports connect only when their actual layers are vertically
+            // compatible (checked above), which preserves real intersections.
+            float outAB = OutsideSupportXY(a, b.Center);
+            float outBA = OutsideSupportXY(b, a.Center);
+            if (outAB <= 3.5f || outBA <= 3.5f) return true;
+
+            // At a junction, centers may sit just outside both short support
+            // rectangles. Allow a small endpoint gap when axes differ.
+            float axis = AxisHeadingError(a.HeadingDeg, b.HeadingDeg);
+            return axis > 25f && flat < 12f;
+        }
+
+        private static float OutsideSupportXY(RoadSupport s, Vector3 p)
+        {
+            Vector3 f = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(s.HeadingDeg));
+            Vector3 l = new Vector3(-f.Y, f.X, 0f);
+            Vector3 rel = new Vector3(p.X - s.Center.X, p.Y - s.Center.Y, 0f);
+            float along = Math.Abs(RaceMath.FlatDot(rel, f)) - s.HalfLengthM;
+            float latSigned = RaceMath.FlatDot(rel, l);
+            float lat = latSigned >= 0f ? latSigned - s.LeftM : -latSigned - s.RightM;
+            return Math.Max(along, lat);
+        }
+
         private SurfaceQuery QuerySurface(
             Vector3 p,
             float headingDeg,
             float zHint,
-            bool projectionMode)
+            bool projectionMode,
+            int surfaceComponentHint)
         {
             var best = new SurfaceQuery
             {
@@ -430,12 +560,15 @@ namespace StreetRacing
                 Grade = 0f,
                 FlowCost = 0f,
                 OpposingSide = false,
+                SurfaceComponentId = -1,
             };
             float bestScore = float.MaxValue;
 
             for (int i = 0; i < Road.Count; i++)
             {
                 var s = Road[i];
+                if (surfaceComponentHint >= 0 && s.SurfaceComponentId != surfaceComponentHint)
+                    continue;
                 float broadReach = s.HalfLengthM + Math.Max(s.LeftM, s.RightM) + 3f;
                 float dx = p.X - s.Center.X;
                 float dy = p.Y - s.Center.Y;
@@ -489,6 +622,7 @@ namespace StreetRacing
                     Grade = s.Grade,
                     FlowCost = flowCost,
                     OpposingSide = opposing,
+                    SurfaceComponentId = s.SurfaceComponentId,
                 };
             }
             return best;

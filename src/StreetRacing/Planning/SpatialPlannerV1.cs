@@ -23,6 +23,15 @@ namespace StreetRacing
             public float Desired;
         }
 
+        private struct RouteGate
+        {
+            public Vector3 Center;
+            public Vector3 Dir;
+            public float S;
+            public float HalfWidthM;
+            public float ZToleranceM;
+        }
+
         private struct SearchNode
         {
             public Vector3 Pos;
@@ -34,12 +43,16 @@ namespace StreetRacing
             public float LastCurvature;
             public float Curvature;
             public int ParentIndex;
+            public int GateIndex;
+            public int SurfaceComponentId;
+            public float GateMissCost;
         }
 
         private static readonly float[] CurvatureSet =
             { -0.075f, -0.045f, -0.022f, 0f, 0.022f, 0.045f, 0.075f };
 
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
+        public readonly List<Vector3> DebugGateCenters = new List<Vector3>(8);
         public TrajectoryCandidate LastChosen;
         public bool HasChosen;
         public string LastDecision { get; private set; } = "";
@@ -52,6 +65,7 @@ namespace StreetRacing
         private readonly List<int> nextBeam = new List<int>(32);
         private readonly HashSet<long> diversity = new HashSet<long>();
         private readonly List<int> chain = new List<int>(16);
+        private readonly List<RouteGate> routeGates = new List<RouteGate>(8);
 
         private float lastFirstCurvature;
         private bool hasLastCurvature;
@@ -65,6 +79,7 @@ namespace StreetRacing
         public void Reset()
         {
             LastCandidates.Clear();
+            DebugGateCenters.Clear();
             LastChosen = new TrajectoryCandidate();
             HasChosen = false;
             LastDecision = "";
@@ -79,6 +94,7 @@ namespace StreetRacing
             nextBeam.Clear();
             diversity.Clear();
             chain.Clear();
+            routeGates.Clear();
         }
 
         public Result Plan(
@@ -90,7 +106,8 @@ namespace StreetRacing
             float egoHeading,
             float egoSpeed,
             float cruise,
-            int nowMs)
+            int nowMs,
+            Vector3 finishTarget)
         {
             long perfStart = Stopwatch.GetTimestamp();
             var result = new Result();
@@ -110,8 +127,12 @@ namespace StreetRacing
             aBrake = RaceMath.Clamp(aBrake, 3.5f, 11.5f);
 
             float searchSpeed = RaceMath.Clamp(Math.Max(egoSpeed, 8f), 8f, Math.Min(cruise, 20f));
+            BuildRouteGates(route, finishTarget);
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
-            Vector3 spatialGoal = route.PointAtS(goalS);
+            Vector3 spatialGoal = routeGates.Count > 0
+                ? routeGates[routeGates.Count - 1].Center
+                : route.PointAtS(goalS);
+            int rootSurface = world.LocateSurfaceComponent(egoPos, egoHeading);
 
             pool.Clear();
             beam.Clear();
@@ -126,6 +147,9 @@ namespace StreetRacing
                 LastCurvature = 0f,
                 Curvature = 0f,
                 ParentIndex = -1,
+                GateIndex = 0,
+                SurfaceComponentId = rootSurface,
+                GateMissCost = 0f,
             };
             pool.Add(root);
             beam.Add(0);
@@ -232,6 +256,8 @@ namespace StreetRacing
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
                 + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};"
                 + $"flow={chosen.MeanFlowCost:F2};dz={chosen.ElevationDeltaM:F1};"
+                + $"gates={chosen.RouteGatesPassed}/{routeGates.Count};surf={chosen.SurfaceComponentId};"
+                + $"gateMiss={chosen.GateMissCost:F1};"
                 + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
@@ -262,6 +288,9 @@ namespace StreetRacing
                 LastCurvature = curvature,
                 Curvature = curvature,
                 ParentIndex = parentIndex,
+                GateIndex = parent.GateIndex,
+                SurfaceComponentId = parent.SurfaceComponentId,
+                GateMissCost = parent.GateMissCost,
             };
 
             if (layer == 0 && hasLastCurvature)
@@ -288,16 +317,20 @@ namespace StreetRacing
                     n.Pos.Z);
 
                 float newHeading = WrapHeading(n.HeadingDeg + dHead);
+                Vector3 prevPos = n.Pos;
                 Vector3 projected;
                 float projectedFlow;
                 float projectedConfidence;
                 bool projectedOpposing;
+                int projectedSurface;
                 if (world.TryProjectToSurface(
-                    candidate, newHeading, n.Pos.Z,
+                    candidate, newHeading, n.Pos.Z, n.SurfaceComponentId,
                     out projected, out projectedFlow,
-                    out projectedConfidence, out projectedOpposing))
+                    out projectedConfidence, out projectedOpposing,
+                    out projectedSurface))
                 {
                     n.Pos = projected;
+                    n.SurfaceComponentId = projectedSurface;
                 }
                 else
                 {
@@ -310,7 +343,9 @@ namespace StreetRacing
                 n.HeadingDeg = newHeading;
                 n.TimeS += ds / Math.Max(primitiveSpeed, 1f);
 
-                var pc = world.EvaluatePose(n.Pos, n.HeadingDeg, n.TimeS);
+                ApplyGateProgress(ref n, prevPos, n.Pos);
+                var pc = world.EvaluatePose(
+                    n.Pos, n.HeadingDeg, n.TimeS, n.SurfaceComponentId);
                 n.Cost += pc.SurfaceCost * ds * 0.42f;
                 n.Cost += pc.FlowCost * ds * 0.95f;
                 n.Cost += pc.ActorCost * 0.12f;
@@ -321,9 +356,21 @@ namespace StreetRacing
             float newGoalDist = RaceMath.FlatDistance(n.Pos, spatialGoal);
             float goalProgress = parent.GoalDist - newGoalDist;
             n.GoalDist = newGoalDist;
-            n.Cost -= goalProgress * 3.4f;
+
+            // Ordered route gates are the primary topology objective. The far
+            // goal remains a weak preference inside the valid gate corridor.
+            int gatesAdvanced = n.GateIndex - parent.GateIndex;
+            if (gatesAdvanced > 0)
+                n.Cost -= gatesAdvanced * 28f;
+            if (n.GateIndex < routeGates.Count)
+            {
+                float gd = RaceMath.FlatDistance(n.Pos, routeGates[n.GateIndex].Center);
+                n.Cost += Math.Min(35f, gd * 0.32f);
+            }
+
+            n.Cost -= goalProgress * 1.35f;
             if (goalProgress < -1f)
-                n.Cost += Math.Abs(goalProgress) * 9f;
+                n.Cost += Math.Abs(goalProgress) * 5f;
 
             Vector3 toGoal = new Vector3(
                 spatialGoal.X - n.Pos.X,
@@ -369,6 +416,9 @@ namespace StreetRacing
                 Score = -leaf.Cost,
                 FirstTangentErrDeg = 0f,
                 RouteHeadErrDeg = route.HeadingErrorDeg,
+                RouteGatesPassed = leaf.GateIndex,
+                SurfaceComponentId = leaf.SurfaceComponentId,
+                GateMissCost = leaf.GateMissCost,
             };
 
             int n = c.Path.Count;
@@ -401,7 +451,8 @@ namespace StreetRacing
             for (int i = 0; i < n; i++)
             {
                 float h = i < headings.Count ? headings[i] : HeadingAt(c.Path, i);
-                var pc = world.EvaluatePose(c.Path[i], h, arrival[i]);
+                var pc = world.EvaluatePose(
+                    c.Path[i], h, arrival[i], c.SurfaceComponentId);
                 if (pc.RoadConfidence < c.MinRoadConfidence)
                     c.MinRoadConfidence = pc.RoadConfidence;
                 if (pc.ClearanceM < minClear)
@@ -541,6 +592,7 @@ namespace StreetRacing
             SearchNode root = pool[chain[0]];
             Vector3 pos = root.Pos;
             float heading = root.HeadingDeg;
+            int surfaceComponent = root.SurfaceComponentId;
             path.Add(pos);
             headings.Add(heading);
 
@@ -570,12 +622,19 @@ namespace StreetRacing
                     float flow;
                     float conf;
                     bool opposing;
+                    int projectedSurface;
                     if (world.TryProjectToSurface(
-                        candidate, heading, pos.Z,
-                        out projected, out flow, out conf, out opposing))
+                        candidate, heading, pos.Z, surfaceComponent,
+                        out projected, out flow, out conf, out opposing,
+                        out projectedSurface))
+                    {
                         pos = projected;
+                        surfaceComponent = projectedSurface;
+                    }
                     else
+                    {
                         pos = candidate;
+                    }
 
                     path.Add(pos);
                     headings.Add(heading);
@@ -599,9 +658,11 @@ namespace StreetRacing
                 int qx = (int)Math.Round(n.Pos.X / 3.5f);
                 int qy = (int)Math.Round(n.Pos.Y / 3.5f);
                 int qh = (int)Math.Round(WrapHeading(n.HeadingDeg) / 12f);
-                long key = ((long)(qx & 0x1FFFFF) << 33)
-                    ^ ((long)(qy & 0x1FFFFF) << 12)
-                    ^ (long)(qh & 0xFFF);
+                long key = ((long)(qx & 0xFFFFF) << 40)
+                    ^ ((long)(qy & 0xFFFFF) << 20)
+                    ^ ((long)(qh & 0x3FF) << 10)
+                    ^ ((long)(n.GateIndex & 0x1F) << 5)
+                    ^ (long)(n.SurfaceComponentId & 0x1F);
                 if (!diversity.Add(key)) continue;
                 nextBeam.Add(sorted[i]);
             }
@@ -629,11 +690,123 @@ namespace StreetRacing
                     parts.Add($"{i}:{c.Shape}/S{c.Score:F0}/V{c.MeanSpeed:F1}/M{c.MinSpeed:F1}/"
                         + $"L{c.LateralM:F1}/{b}@{c.ConstrainS:F0}/C{c.MinPredClearance:F1}/"
                         + $"O{c.OpposingFraction * 100f:F0}/U{c.UnknownFraction * 100f:F0}/"
-                        + $"Z{c.ElevationDeltaM:F1}");
+                        + $"Z{c.ElevationDeltaM:F1}/G{c.RouteGatesPassed}/S{c.SurfaceComponentId}");
                 }
                 return string.Join("|", parts);
             }
             catch { return "?"; }
+        }
+
+        private void BuildRouteGates(RaceRoute route, Vector3 finishTarget)
+        {
+            routeGates.Clear();
+            DebugGateCenters.Clear();
+            if (route == null || !route.Built) return;
+
+            float remaining = Math.Max(0f, route.TotalLength - route.AlongS);
+            float[] offsets = { 12f, 25f, 40f, 57f, 75f };
+            float lastS = -999f;
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                float s = Math.Min(route.TotalLength, route.AlongS + offsets[i]);
+                if (s <= route.AlongS + 5f) continue;
+                if (s - lastS < 6f) continue;
+
+                Vector3 center = route.PointAtS(s);
+                float h = route.HeadingAtS(s);
+                Vector3 dir = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(h));
+                routeGates.Add(new RouteGate
+                {
+                    Center = center,
+                    Dir = dir,
+                    S = s,
+                    HalfWidthM = 11.5f,
+                    ZToleranceM = 4.0f,
+                });
+                DebugGateCenters.Add(center);
+                lastS = s;
+                if (s >= route.TotalLength - 0.5f) break;
+            }
+
+            // GPS extraction may stop at the routable street endpoint while
+            // the actual race checkpoint is still tens of metres away. Near
+            // route end, make the real checkpoint the final ordered gate
+            // instead of letting DrivingReference exhaustion become
+            // RoadUncertain.
+            if (remaining <= 70f)
+            {
+                Vector3 routeEnd = route.PointAtS(route.TotalLength);
+                float finishGapFromRoute = RaceMath.FlatDistance(routeEnd, finishTarget);
+                float finishGapFromEgoRoute = RaceMath.FlatDistance(
+                    route.PointAtS(route.AlongS), finishTarget);
+                if (finishGapFromRoute > 3f && finishGapFromRoute < 80f
+                    && finishGapFromEgoRoute < 130f)
+                {
+                    Vector3 from = routeGates.Count > 0
+                        ? routeGates[routeGates.Count - 1].Center
+                        : routeEnd;
+                    Vector3 d = new Vector3(
+                        finishTarget.X - from.X,
+                        finishTarget.Y - from.Y, 0f);
+                    if (RaceMath.FlatLength(d) < 1f)
+                        d = RaceMath.VectorFromHeading(route.HeadingAtS(route.TotalLength));
+                    d = RaceMath.FlatNormalize(d);
+                    routeGates.Add(new RouteGate
+                    {
+                        Center = finishTarget,
+                        Dir = d,
+                        S = route.TotalLength + finishGapFromRoute,
+                        HalfWidthM = 13.5f,
+                        ZToleranceM = 6.0f,
+                    });
+                    DebugGateCenters.Add(finishTarget);
+                }
+            }
+        }
+
+        private void ApplyGateProgress(
+            ref SearchNode node, Vector3 previousPos, Vector3 currentPos)
+        {
+            while (node.GateIndex < routeGates.Count)
+            {
+                RouteGate g = routeGates[node.GateIndex];
+                Vector3 relPrev = new Vector3(
+                    previousPos.X - g.Center.X,
+                    previousPos.Y - g.Center.Y, 0f);
+                Vector3 relNow = new Vector3(
+                    currentPos.X - g.Center.X,
+                    currentPos.Y - g.Center.Y, 0f);
+                float prevAlong = RaceMath.FlatDot(relPrev, g.Dir);
+                float nowAlong = RaceMath.FlatDot(relNow, g.Dir);
+                float lat = Math.Abs(RaceMath.FlatCross(g.Dir, relNow));
+                float dz = Math.Abs(currentPos.Z - g.Center.Z);
+
+                bool crossed = prevAlong <= 0.5f && nowAlong >= -0.5f
+                    && lat <= g.HalfWidthM
+                    && dz <= g.ZToleranceM;
+                bool near = RaceMath.FlatDistance(currentPos, g.Center) <= g.HalfWidthM * 0.55f
+                    && dz <= g.ZToleranceM;
+
+                if (crossed || near)
+                {
+                    node.GateIndex++;
+                    continue;
+                }
+
+                // Passing the gate plane far outside its 3D aperture means the
+                // trajectory missed a required turn/bridge layer. Keep it in
+                // the beam for graceful fallback, but make it decisively lose.
+                if (nowAlong > 4f)
+                {
+                    float miss = Math.Min(55f,
+                        (nowAlong - 4f) * 2.0f
+                        + Math.Max(0f, lat - g.HalfWidthM) * 3.0f
+                        + Math.Max(0f, dz - g.ZToleranceM) * 8.0f);
+                    node.Cost += miss;
+                    node.GateMissCost += miss;
+                }
+                break;
+            }
         }
 
         private static List<float> BuildStationS(IList<Vector3> path)

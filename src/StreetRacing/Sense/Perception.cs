@@ -10,6 +10,7 @@ namespace StreetRacing
         TrafficVehicle,
         Rival,
         Ped,
+        Debris,       // small/low consequence prop: soft avoidance only
         Obstacle,
     }
 
@@ -411,15 +412,20 @@ namespace StreetRacing
                     int h = SafeHandle(pr);
                     if (h == 0) h = FallbackKey(pp);
                     if (observed.ContainsKey(h)) continue;
+                    float halfLen = EntityHalfLength(pr, 0.8f);
+                    float halfWid = EntityHalfWidth(pr, 0.8f);
+                    float height = EntityHeight(pr, 1.6f);
+                    float flatMax = Math.Max(halfLen * 2f, halfWid * 2f);
+                    bool softDebris = flatMax < 1.15f && height < 1.25f;
                     observed[h] = new Observation
                     {
                         Handle = h,
-                        Kind = ActorKind.Obstacle,
+                        Kind = softDebris ? ActorKind.Debris : ActorKind.Obstacle,
                         Position = pp,
                         Velocity = new Vector3(),
                         HeadingDeg = SafeHeading(pr),
-                        HalfLengthM = EntityHalfLength(pr, 0.8f),
-                        HalfWidthM = EntityHalfWidth(pr, 0.8f),
+                        HalfLengthM = halfLen,
+                        HalfWidthM = halfWid,
                     };
                     added++;
                 }
@@ -494,7 +500,7 @@ namespace StreetRacing
                         t.Position = new Vector3(
                             t.Position.X + t.Velocity.X * dtScanS,
                             t.Position.Y + t.Velocity.Y * dtScanS,
-                            t.Position.Z);
+                            t.Position.Z + t.Velocity.Z * dtScanS);
                     }
                     catch { }
                     t.Stale = true;
@@ -656,7 +662,7 @@ namespace StreetRacing
             return new Vector3(
                 a.Position.X + a.Velocity.X * dt,
                 a.Position.Y + a.Velocity.Y * dt,
-                a.Position.Z);
+                a.Position.Z + a.Velocity.Z * dt);
         }
 
         private TrackedActor BuildActor(PersistedTrack t,
@@ -688,7 +694,7 @@ namespace StreetRacing
                 Stale = t.Stale,
                 OffRoadway = false,
                 Position = pos,
-                Velocity = new Vector3(vel.X, vel.Y, 0f),
+                Velocity = vel,
                 HeadingDeg = t.HeadingDeg,
                 HalfLengthM = t.HalfLengthM > 0.1f ? t.HalfLengthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 2.3f : 0.5f),
                 HalfWidthM = t.HalfWidthM > 0.1f ? t.HalfWidthM : (t.Kind == ActorKind.TrafficVehicle || t.Kind == ActorKind.Rival ? 1.0f : 0.5f),
@@ -775,6 +781,20 @@ namespace StreetRacing
                 e.Model.GetDimensions(out min, out max);
                 float width = Math.Abs(max.X - min.X);
                 if (width > 0.2f && width < 15f) return width * 0.5f;
+            }
+            catch { }
+            return fallback;
+        }
+
+        private static float EntityHeight(Entity e, float fallback)
+        {
+            try
+            {
+                Vector3 min;
+                Vector3 max;
+                e.Model.GetDimensions(out min, out max);
+                float h = Math.Abs(max.Z - min.Z);
+                if (h > 0.1f && h < 30f) return h;
             }
             catch { }
             return fallback;

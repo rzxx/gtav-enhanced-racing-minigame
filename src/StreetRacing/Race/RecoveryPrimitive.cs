@@ -27,7 +27,7 @@ namespace StreetRacing.Race
     /// normal driver.
     internal sealed class RecoveryPrimitive
     {
-        public enum Stage { Idle, Stop, Reverse, Forward, Rejoin }
+        public enum Stage { Idle, Stop, Reverse, ReverseSettle, Forward, Rejoin }
 
         public Stage Current = Stage.Idle;
         public string Reason = "";
@@ -36,7 +36,7 @@ namespace StreetRacing.Race
 
         private int stopUntil;
         private float reverseStartS;
-        private float reverseTargetM = 8f;
+        private float reverseTargetM = 6f;
 
         // Lack-of-progress detector state (corroborated stuck, not one sample).
         private float progressMarkS = -9999f;
@@ -100,7 +100,7 @@ namespace StreetRacing.Race
         /// permanent zero-speed hold: Forward/Rejoin always move so the pose
         /// changes and can become mergeable.
         public ManeuverCommand Tick(RaceRoute route, RoadCorridor corridor,
-            Vector3 egoPos, Vector3 egoFwd, float egoHeading, float egoSpeed,
+            Vector3 egoPos, Vector3 egoFwd, float egoHeading, float signedLongMps,
             float alongS, int nowMs, float recCruise)
         {
             var hold = new ManeuverCommand
@@ -158,17 +158,21 @@ namespace StreetRacing.Race
 
                     case Stage.Reverse:
                         {
-                            // Controlled reverse: 8 m at ~3 m/s, steering toward
-                            // the merge bearing (inverted by Direct for reverse).
-                            // Distance measured by AlongS change OR time fallback.
+                            // Controlled short reverse at ~3 m/s. AlongS can
+                            // freeze when already off-route, so the time cap is
+                            // deliberately short as a second distance bound.
                             float backed = Math.Abs(alongS - reverseStartS);
                             float heldS = (nowMs - SinceMs) / 1000f;
-                            if (backed >= reverseTargetM || heldS > 6f)
+                            if (backed >= reverseTargetM || heldS > 2.8f)
                             {
-                                Current = Stage.Forward;
+                                // Never hand a forward/rejoin maneuver to Direct
+                                // while the vehicle still has substantial
+                                // backwards momentum.
+                                Current = Stage.ReverseSettle;
                                 SinceMs = nowMs;
-                                Reason = "reverse-done";
-                                goto case Stage.Forward;
+                                stopUntil = nowMs + 1800;
+                                Reason = "reverse-settle";
+                                goto case Stage.ReverseSettle;
                             }
                             // Reverse path: straight back along -ego heading.
                             var back = new Vector3(egoPos.X - egoFwd.X * 12f, egoPos.Y - egoFwd.Y * 12f, egoPos.Z);
@@ -181,6 +185,38 @@ namespace StreetRacing.Race
                                 TargetSpeed = 3f,
                                 Reason = "Recovery:Reverse",
                                 Reverse = true, // EXPLICIT: only place this is set
+                            };
+                        }
+
+                    case Stage.ReverseSettle:
+                        {
+                            if (Math.Abs(signedLongMps) < 0.8f)
+                            {
+                                Current = Stage.Forward;
+                                SinceMs = nowMs;
+                                Reason = "reverse-settled";
+                                goto case Stage.Forward;
+                            }
+                            if (nowMs >= stopUntil)
+                                Reason = $"reverse-still-moving:{signedLongMps:F1}";
+                            // Stay in explicit reverse mode while
+                            // braking backward momentum. If we flip Reverse
+                            // false here, Direct sees "reverse motion" as an
+                            // instability and may apply handbrake/stability
+                            // intervention instead of controlled braking.
+                            var settleBack = new Vector3(
+                                egoPos.X - egoFwd.X * 5f,
+                                egoPos.Y - egoFwd.Y * 5f,
+                                egoPos.Z);
+                            return new ManeuverCommand
+                            {
+                                Path = new List<Vector3> { egoPos, settleBack },
+                                StationS = new List<float> { 0f, 5f },
+                                SpeedProfile = new List<float> { 0f, 0f },
+                                AimPoint = settleBack,
+                                TargetSpeed = 0f,
+                                Reason = "Recovery:ReverseSettle",
+                                Reverse = true,
                             };
                         }
 

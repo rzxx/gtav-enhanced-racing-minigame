@@ -57,6 +57,7 @@ namespace StreetRacing
             switch (kind)
             {
                 case ActorKind.Ped: return 0.45f;
+                case ActorKind.Debris: return 0.30f;
                 case ActorKind.Obstacle: return 0.9f;
                 default: return 1.1f;
             }
@@ -158,6 +159,10 @@ namespace StreetRacing
                 float pathLat = (pathLats != null && k < pathLats.Count) ? pathLats[k] : 0f;
                 foreach (var a in perception.Actors)
                 {
+                    // Small debris is deliberately handled as a soft spatial
+                    // cost, never as a zero-speed longitudinal blocker.
+                    if (a.Kind == ActorKind.Debris) continue;
+
                     if (a.RouteValid)
                     {
                         if (a.RouteDist < -8f || a.RouteDist > s + 90f) continue;
@@ -178,6 +183,20 @@ namespace StreetRacing
                         // matter when the path actually goes near them
                         // (radius test below decides).
                         if (a.Dist > 12f) continue;
+                    }
+
+                    // Every Join/path candidate shares the immutable ego
+                    // pose at station zero. A side-by-side or rear actor is not
+                    // a longitudinal blocker merely because its inflated
+                    // footprint overlaps the origin. This is the same semantic
+                    // rule used by SpatialPlannerV1.
+                    if (s < 3.0f)
+                    {
+                        float latReach = VehicleHalfWidthM + ActorHalfWidth(a.Kind) + 0.55f;
+                        bool genuinelyAhead = a.Longitudinal > 0.75f
+                            && Math.Abs(a.Lateral) < latReach;
+                        if (!genuinelyAhead)
+                            continue;
                     }
 
                     // Defensive self-zone guard: an actor coincident with ego

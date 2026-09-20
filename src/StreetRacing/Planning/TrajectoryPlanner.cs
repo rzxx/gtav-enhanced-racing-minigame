@@ -22,6 +22,9 @@ namespace StreetRacing
         public float UnknownFraction;    // fraction outside supported road surface
         public float MeanFlowCost;       // mean soft directional-road cost
         public float ElevationDeltaM;    // path end Z - start Z
+        public int RouteGatesPassed;      // ordered route obligations crossed
+        public int SurfaceComponentId;    // connected 2.5D surface used by search
+        public float GateMissCost;        // topology penalty from missing/late gates
         public float MaxKappa;      // max path curvature rad/m
 
         // --- Joint maneuver fields: this candidate WITH its executable speed.
@@ -79,6 +82,7 @@ namespace StreetRacing
     internal sealed class TrajectoryPlanner
     {
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
+        public readonly List<Vector3> DebugGateCenters = new List<Vector3>(8);
         public TrajectoryCandidate Chosen;
         public bool HasChosen;
         public float BrakingPointS = -1f;
@@ -91,6 +95,7 @@ namespace StreetRacing
         public void Reset()
         {
             LastCandidates.Clear();
+            DebugGateCenters.Clear();
             HasChosen = false;
             BrakingPointS = -1f;
             PlanId = 0;
