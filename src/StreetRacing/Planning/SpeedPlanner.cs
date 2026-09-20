@@ -185,6 +185,20 @@ namespace StreetRacing
                         if (a.Dist > 12f) continue;
                     }
 
+                    // Every Join/path candidate shares the immutable ego
+                    // pose at station zero. A side-by-side or rear actor is not
+                    // a longitudinal blocker merely because its inflated
+                    // footprint overlaps the origin. This is the same semantic
+                    // rule used by SpatialPlannerV1.
+                    if (s < 3.0f)
+                    {
+                        float latReach = VehicleHalfWidthM + ActorHalfWidth(a.Kind) + 0.55f;
+                        bool genuinelyAhead = a.Longitudinal > 0.75f
+                            && Math.Abs(a.Lateral) < latReach;
+                        if (!genuinelyAhead)
+                            continue;
+                    }
+
                     // Defensive self-zone guard: an actor coincident with ego
                     // at path station s=0 cannot create a stop constraint
                     // unless it is a real external collision threat.
