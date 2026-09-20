@@ -61,6 +61,7 @@ namespace StreetRacing.Control
 
         // Longitudinal state (simple PI + anti-windup via clamp).
         private float speedInt;
+        private bool lastReverseCmd;
         private float lastSteer;
         private float lastThr;
         private float lastBrk;
@@ -160,6 +161,7 @@ namespace StreetRacing.Control
             cmd = new ManeuverCommand();
             LastError = new PathFollowingError { Valid = false };
             speedInt = 0f;
+            lastReverseCmd = false;
             lastSteer = 0f;
             lastThr = 0f;
             lastBrk = 0f;
@@ -377,6 +379,14 @@ namespace StreetRacing.Control
 
             bool reversing = false;
             try { reversing = cmd.Reverse; } catch { reversing = false; }
+            if (reversing != lastReverseCmd)
+            {
+                // Do not carry the forward PI integral into reverse (or vice
+                // versa). Recovery traces showed this transition could retain
+                // enough integral to make speed regulation meaningless.
+                speedInt = 0f;
+                lastReverseCmd = reversing;
+            }
             if (reversing) steerDeg = -steerDeg;
 
             // Do not teleport the steering rack between opposite locks.
@@ -443,7 +453,22 @@ namespace StreetRacing.Control
             float brk = 0f;
             if (reversing)
             {
-                thr = -0.6f;
+                // Reverse has a real speed target. The old implementation
+                // ignored speedErr and applied a fixed -0.6 throttle forever,
+                // which produced 10-14 m/s reverse during recovery despite a
+                // 3 m/s command.
+                if (u > 0f)
+                {
+                    float mag = RaceMath.Clamp(u, stalled ? 0.30f : 0f, 0.55f);
+                    if (stalled && mag < 0.30f) mag = 0.30f;
+                    thr = -mag;
+                }
+                else
+                {
+                    thr = 0f;
+                    brk = RaceMath.Clamp(-u, 0.15f, 1f);
+                    if (controlSpeed > lookSpeed + 2f) brk = 1f;
+                }
             }
             else if (u >= 0f)
             {
@@ -495,9 +520,8 @@ namespace StreetRacing.Control
                 {
                     vehicle.Throttle = thr;
                     vehicle.ThrottlePower = thr;
-                    vehicle.BrakePower = 0f;
+                    vehicle.BrakePower = brk;
                     vehicle.IsHandbrakeForcedOn = false;
-                    brk = 0f;
                 }
                 else
                 {
