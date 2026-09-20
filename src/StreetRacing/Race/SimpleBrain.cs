@@ -964,6 +964,20 @@ namespace StreetRacing.Race
             {
                 int now = Game.GameTime;
                 lastRefDetail = rr != null ? rr.Detail : "null";
+                float routeRemain = Math.Max(0f, route.TotalLength - route.AlongS);
+                bool terminalPhase = routeRemain <= 45f && FinishGap <= 100f;
+
+                if (terminalPhase)
+                {
+                    try
+                    {
+                        telemetry?.Event(now - t0, "TERMINAL_SPATIAL",
+                            $"reference-ended;routeRemain={routeRemain:F1};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                    }
+                    catch { }
+                    return BuildTerminalSpatial(egoPos, egoSpeed, dtPlan, cruise);
+                }
+
                 if (referenceInvalidSinceMs < 0)
                 {
                     referenceInvalidSinceMs = now;
@@ -1016,7 +1030,7 @@ namespace StreetRacing.Race
             {
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
                 sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime);
+                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
             }
             catch { sp = null; }
 
@@ -1043,6 +1057,34 @@ namespace StreetRacing.Race
             referenceInvalidSinceMs = -1;
             joinState = sp.Intent;
             return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
+        }
+
+        private ManeuverCommand BuildTerminalSpatial(
+            Vector3 egoPos, float egoSpeed, float dtPlan, float cruise)
+        {
+            try
+            {
+                // No long DrivingReference is required here: nearby structural
+                // road nodes + ordered route/finish gates are sufficient for
+                // the final local search.
+                localWorld.Build(null, perception, egoPos, lastEgoHeading,
+                    egoHalfLength, egoHalfWidth, viz.Enabled);
+                var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
+                if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
+                {
+                    referenceInvalidSinceMs = -1;
+                    plannerInvalidSinceMs = -1;
+                    joinState = "Terminal";
+                    return BuildCommandFromCandidate(
+                        sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
+                }
+            }
+            catch { }
+
+            joinState = "TerminalUncertain";
+            return BuildFailSoftFromCurrent(
+                egoPos, Math.Min(5f, cruise), "TerminalUncertain");
         }
 
         private ManeuverCommand BuildFailSoftFromCurrent(Vector3 egoPos, float cap, string why)
