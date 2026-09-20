@@ -1655,7 +1655,10 @@ namespace StreetRacing.Race
                     pe.Valid ? pe.SteerSaturationS : 0f,
                     pe.Valid ? pe.StabilityMode : "",
                     gear, nextGear, rpm,
-                    gtaTrafficLight, burnout, seatOk);
+                    gtaTrafficLight, burnout, seatOk,
+                    c.OpposingFraction, c.UnknownFraction, c.MeanFlowCost,
+                    c.ElevationDeltaM, c.RouteGatesPassed, c.SurfaceComponentId,
+                    c.GateMissCost, spatialPlanner.LastPlanMs);
             }
             catch { }
         }
