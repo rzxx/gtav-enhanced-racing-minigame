@@ -197,8 +197,25 @@ namespace StreetRacing.Race
                                 Reason = "reverse-settled";
                                 goto case Stage.Forward;
                             }
-                            hold.Reason = "Recovery:ReverseSettle";
-                            return hold;
+                            // Stay in explicit reverse mode while
+                            // braking backward momentum. If we flip Reverse
+                            // false here, Direct sees "reverse motion" as an
+                            // instability and may apply handbrake/stability
+                            // intervention instead of controlled braking.
+                            var settleBack = new Vector3(
+                                egoPos.X - egoFwd.X * 5f,
+                                egoPos.Y - egoFwd.Y * 5f,
+                                egoPos.Z);
+                            return new ManeuverCommand
+                            {
+                                Path = new List<Vector3> { egoPos, settleBack },
+                                StationS = new List<float> { 0f, 5f },
+                                SpeedProfile = new List<float> { 0f, 0f },
+                                AimPoint = settleBack,
+                                TargetSpeed = 0f,
+                                Reason = "Recovery:ReverseSettle",
+                                Reverse = true,
+                            };
                         }
 
                     case Stage.Forward:
