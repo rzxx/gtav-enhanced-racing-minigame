@@ -52,6 +52,7 @@ namespace StreetRacing
             { -0.075f, -0.045f, -0.022f, 0f, 0.022f, 0.045f, 0.075f };
 
         public readonly List<TrajectoryCandidate> LastCandidates = new List<TrajectoryCandidate>();
+        public readonly List<Vector3> DebugGateCenters = new List<Vector3>(8);
         public TrajectoryCandidate LastChosen;
         public bool HasChosen;
         public string LastDecision { get; private set; } = "";
@@ -78,6 +79,7 @@ namespace StreetRacing
         public void Reset()
         {
             LastCandidates.Clear();
+            DebugGateCenters.Clear();
             LastChosen = new TrajectoryCandidate();
             HasChosen = false;
             LastDecision = "";
@@ -698,6 +700,7 @@ namespace StreetRacing
         private void BuildRouteGates(RaceRoute route, Vector3 finishTarget)
         {
             routeGates.Clear();
+            DebugGateCenters.Clear();
             if (route == null || !route.Built) return;
 
             float remaining = Math.Max(0f, route.TotalLength - route.AlongS);
@@ -720,6 +723,7 @@ namespace StreetRacing
                     HalfWidthM = 11.5f,
                     ZToleranceM = 4.0f,
                 });
+                DebugGateCenters.Add(center);
                 lastS = s;
                 if (s >= route.TotalLength - 0.5f) break;
             }
@@ -755,6 +759,7 @@ namespace StreetRacing
                         HalfWidthM = 13.5f,
                         ZToleranceM = 6.0f,
                     });
+                    DebugGateCenters.Add(finishTarget);
                 }
             }
         }
