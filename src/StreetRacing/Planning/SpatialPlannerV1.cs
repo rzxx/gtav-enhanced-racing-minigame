@@ -71,6 +71,9 @@ namespace StreetRacing
         private readonly List<float> committedStationS = new List<float>(40);
         private bool continuityActive;
         private float continuityBaseS;
+        private float motionRootCurvature;
+        private float motionCurvatureStep;
+        private float continuityWeight;
 
         private float lastFirstCurvature;
         private bool hasLastCurvature;
@@ -104,6 +107,9 @@ namespace StreetRacing
             committedStationS.Clear();
             continuityActive = false;
             continuityBaseS = 0f;
+            motionRootCurvature = 0f;
+            motionCurvatureStep = 0.075f;
+            continuityWeight = 0.75f;
         }
 
         public Result Plan(
@@ -114,6 +120,7 @@ namespace StreetRacing
             Vector3 egoPos,
             float egoHeading,
             float egoSpeed,
+            float egoYawRateRadS,
             float cruise,
             int nowMs,
             Vector3 finishTarget)
@@ -136,6 +143,33 @@ namespace StreetRacing
             aBrake = RaceMath.Clamp(aBrake, 3.5f, 11.5f);
 
             float searchSpeed = RaceMath.Clamp(Math.Max(egoSpeed, 8f), 8f, Math.Min(cruise, 20f));
+
+            // Start from the motion the car ACTUALLY has, not an imaginary
+            // zero-curvature state. yawRate / forward speed is the instantaneous
+            // path curvature implied by the current body motion. At low speed
+            // yaw is noisy, so fade toward zero.
+            float motionSpeed = Math.Max(egoSpeed, 2.5f);
+            float motionKLimit = Math.Min(
+                0.09f, (aLat * 1.20f) / Math.Max(motionSpeed * motionSpeed, 9f));
+            motionRootCurvature = RaceMath.Clamp(
+                egoYawRateRadS / motionSpeed, -motionKLimit, motionKLimit);
+            if (egoSpeed < 4f)
+                motionRootCurvature *= RaceMath.Clamp((egoSpeed - 1.5f) / 2.5f, 0f, 1f);
+
+            // Curvature slew is the planner equivalent of preserving momentum.
+            // A fast car may still choose a very different eventual line, but
+            // it must bend into that line over distance instead of teleporting
+            // between opposite arcs every reaction tick.
+            motionCurvatureStep = egoSpeed >= 22f ? 0.012f
+                : egoSpeed >= 16f ? 0.017f
+                : egoSpeed >= 10f ? 0.026f
+                : egoSpeed >= 6f ? 0.040f
+                : 0.070f;
+            continuityWeight = egoSpeed >= 20f ? 2.4f
+                : egoSpeed >= 14f ? 1.8f
+                : egoSpeed >= 8f ? 1.25f
+                : 0.75f;
+
             BuildRouteGates(route, finishTarget);
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
             Vector3 spatialGoal = routeGates.Count > 0
@@ -163,9 +197,9 @@ namespace StreetRacing
                 TimeS = 0f,
                 Cost = 0f,
                 GoalDist = RaceMath.FlatDistance(egoPos, spatialGoal),
-                FirstCurvature = 0f,
-                LastCurvature = 0f,
-                Curvature = 0f,
+                FirstCurvature = motionRootCurvature,
+                LastCurvature = motionRootCurvature,
+                Curvature = motionRootCurvature,
                 ParentIndex = -1,
                 GateIndex = 0,
                 SurfaceComponentId = rootSurface,
@@ -186,9 +220,16 @@ namespace StreetRacing
 
                     for (int ki = 0; ki < CurvatureSet.Length; ki++)
                     {
-                        float curvature = CurvatureSet[ki];
-                        if (layer == 0 && Math.Abs(curvature - parent.LastCurvature) > 0.10f)
-                            continue;
+                        // CurvatureSet expresses where we would eventually like
+                        // to go. Clamp each primitive to a speed-dependent delta
+                        // from the motion inherited by its parent. This creates
+                        // continuous curvature ramps without exploding the beam
+                        // with another state dimension.
+                        float desiredCurvature = CurvatureSet[ki];
+                        float curvature = RaceMath.Clamp(
+                            desiredCurvature,
+                            parent.LastCurvature - motionCurvatureStep,
+                            parent.LastCurvature + motionCurvatureStep);
 
                         SearchNode child = Expand(
                             parent, parentIndex, curvature, searchSpeed,
@@ -273,6 +314,7 @@ namespace StreetRacing
             LastPoolCount = pool.Count;
             LastPlanMs = (float)((Stopwatch.GetTimestamp() - perfStart) * 1000.0 / Stopwatch.Frequency);
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
+                + $"motionK={motionRootCurvature:F3};kStep={motionCurvatureStep:F3};commitW={continuityWeight:F2};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
                 + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};"
@@ -335,9 +377,13 @@ namespace StreetRacing
             };
 
             if (layer == 0 && hasLastCurvature)
-                n.Cost += Math.Abs(curvature - lastFirstCurvature) * 140f;
-            n.Cost += Math.Abs(curvature - parent.LastCurvature) * 18f;
-            n.Cost += Math.Abs(curvature) * 5f;
+                n.Cost += Math.Abs(curvature - lastFirstCurvature) * 80f;
+
+            // Penalize curvature acceleration, not steering itself. The clamp
+            // above is the hard physical envelope; this term simply prefers the
+            // smallest necessary change inside that envelope.
+            n.Cost += Math.Abs(curvature - parent.LastCurvature) * 65f;
+            n.Cost += Math.Abs(curvature) * 4f;
 
             float feasibleV = Math.Abs(curvature) < 0.002f
                 ? searchSpeed
@@ -429,8 +475,14 @@ namespace StreetRacing
                 Vector3 committed = PointOnPathAtS(
                     committedPath, committedStationS, expectedS);
                 float dCommit = RaceMath.FlatDistance(n.Pos, committed);
-                float excess = Math.Max(0f, dCommit - 1.25f);
-                n.Cost += excess * excess * 0.75f;
+                // The near future is a real commitment at racing speed; the
+                // far future is allowed to fan out. Actor collision costs are
+                // orders of magnitude larger, so a newly unsafe committed path
+                // still yields immediately.
+                float freeBand = layer <= 1 ? 0.75f : 1.25f;
+                float layerFade = layer <= 1 ? 1f : (layer <= 3 ? 0.72f : 0.40f);
+                float excess = Math.Max(0f, dCommit - freeBand);
+                n.Cost += excess * excess * continuityWeight * layerFade;
             }
 
             n.Cost -= goalProgress * 1.35f;

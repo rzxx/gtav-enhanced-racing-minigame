@@ -1032,7 +1032,8 @@ namespace StreetRacing.Race
             {
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
                 sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                    cruise, Game.GameTime, finish);
             }
             catch { sp = null; }
 
@@ -1072,7 +1073,8 @@ namespace StreetRacing.Race
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
                     egoHalfLength, egoHalfWidth, viz.Enabled);
                 var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, cruise, Game.GameTime, finish);
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                    cruise, Game.GameTime, finish);
                 if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
                 {
                     referenceInvalidSinceMs = -1;
