@@ -16,10 +16,10 @@ namespace StreetRacing.Race
     ///   - severe off-route state (IsLost), or heading-incompatible route, or
     ///   - sustained lack of progress (low speed + no AlongS advance).
     ///
-    /// Explicit action sequence:
-    ///   Stop -> Reverse (controlled distance, explicit Reverse=true) ->
-    ///   Reposition/Forward (crawl toward a heading-compatible future segment)
-    ///   -> Rejoin (pose-feasible connector to that segment).
+    /// Explicit action sequence for the current safety pass:
+    ///   Stop -> Forward/Reposition -> Rejoin.
+    /// Reverse recovery is temporarily disabled because two independent GTA
+    /// runs hard-froze while the reverse primitive was active.
     /// Reverse is commanded here via ManeuverCommand.Reverse, never inferred
     /// inside DirectActuator. If no merge exists, the primitive CRAWLS to
     /// change pose (never holds 0 indefinitely). GTA DriveTo may be used ONLY
@@ -128,20 +128,11 @@ namespace StreetRacing.Race
                     case Stage.Stop:
                         if (nowMs >= stopUntil)
                         {
-                            // STOPPED is not evidence that reverse is needed;
-                            // Stop is literally the stage we just commanded.
-                            // Reverse only for a genuinely severe pose where
-                            // creating space is useful.
-                            bool needReverse = Math.Abs(route.HeadingErrorDeg) > 70f
-                                || route.DistToRoute > 10f;
-                            if (needReverse)
-                            {
-                                Current = Stage.Reverse;
-                                SinceMs = nowMs;
-                                reverseStartS = alongS;
-                                Reason = "reverse-severe-pose:" + mergeDetail;
-                            }
-                            else if (haveMerge)
+                            // Reverse recovery is intentionally disabled for
+                            // now. Two telemetry runs hard-froze GTA while the
+                            // reverse stage was active; a slow forward recovery
+                            // is preferable to forcing a full game restart.
+                            if (haveMerge)
                             {
                                 Current = Stage.Rejoin;
                                 SinceMs = nowMs;
@@ -157,67 +148,12 @@ namespace StreetRacing.Race
                         return hold;
 
                     case Stage.Reverse:
-                        {
-                            // Controlled short reverse at ~3 m/s. AlongS can
-                            // freeze when already off-route, so the time cap is
-                            // deliberately short as a second distance bound.
-                            float backed = Math.Abs(alongS - reverseStartS);
-                            float heldS = (nowMs - SinceMs) / 1000f;
-                            if (backed >= reverseTargetM || heldS > 2.8f)
-                            {
-                                // Never hand a forward/rejoin maneuver to Direct
-                                // while the vehicle still has substantial
-                                // backwards momentum.
-                                Current = Stage.ReverseSettle;
-                                SinceMs = nowMs;
-                                stopUntil = nowMs + 1800;
-                                Reason = "reverse-settle";
-                                goto case Stage.ReverseSettle;
-                            }
-                            // Reverse path: straight back along -ego heading.
-                            var back = new Vector3(egoPos.X - egoFwd.X * 12f, egoPos.Y - egoFwd.Y * 12f, egoPos.Z);
-                            return new ManeuverCommand
-                            {
-                                Path = new List<Vector3> { egoPos, back },
-                                StationS = new List<float> { 0f, 12f },
-                                SpeedProfile = new List<float> { 3f, 3f },
-                                AimPoint = back,
-                                TargetSpeed = 3f,
-                                Reason = "Recovery:Reverse",
-                                Reverse = true, // EXPLICIT: only place this is set
-                            };
-                        }
-
                     case Stage.ReverseSettle:
                         {
-                            if (Math.Abs(signedLongMps) < 0.8f)
-                            {
-                                Current = Stage.Forward;
-                                SinceMs = nowMs;
-                                Reason = "reverse-settled";
-                                goto case Stage.Forward;
-                            }
-                            if (nowMs >= stopUntil)
-                                Reason = $"reverse-still-moving:{signedLongMps:F1}";
-                            // Stay in explicit reverse mode while
-                            // braking backward momentum. If we flip Reverse
-                            // false here, Direct sees "reverse motion" as an
-                            // instability and may apply handbrake/stability
-                            // intervention instead of controlled braking.
-                            var settleBack = new Vector3(
-                                egoPos.X - egoFwd.X * 5f,
-                                egoPos.Y - egoFwd.Y * 5f,
-                                egoPos.Z);
-                            return new ManeuverCommand
-                            {
-                                Path = new List<Vector3> { egoPos, settleBack },
-                                StationS = new List<float> { 0f, 5f },
-                                SpeedProfile = new List<float> { 0f, 0f },
-                                AimPoint = settleBack,
-                                TargetSpeed = 0f,
-                                Reason = "Recovery:ReverseSettle",
-                                Reverse = true,
-                            };
+                            Current = Stage.Forward;
+                            SinceMs = nowMs;
+                            Reason = "reverse-disabled-safety";
+                            goto case Stage.Forward;
                         }
 
                     case Stage.Forward:
@@ -239,20 +175,16 @@ namespace StreetRacing.Race
                                 target.X - egoPos.X, target.Y - egoPos.Y, 0f));
                             float ahead = RaceMath.FlatDot(toTarget, egoFwd);
 
-                            // If the useful route target is clearly behind us,
-                            // create space instead of driving farther away.
-                            if (ahead < -0.35f && Math.Abs(route.HeadingErrorDeg) > 45f)
-                            {
-                                Current = Stage.Reverse;
-                                SinceMs = nowMs;
-                                reverseStartS = alongS;
-                                Reason = "reverse-target-behind";
-                                goto case Stage.Reverse;
-                            }
-
+                            // If the useful route target is behind, make a
+                            // conservative forward arc instead of reversing.
+                            // This is intentionally dumb-but-safe until recovery
+                            // is folded into the spatial planner itself.
+                            float egoWeight = ahead < -0.35f ? 0.85f : 0.45f;
+                            float targetWeight = 1f - egoWeight;
+                            if (ahead < -0.35f) crawl = Math.Min(crawl, 2.2f);
                             Vector3 blended = RaceMath.FlatNormalize(new Vector3(
-                                egoFwd.X * 0.45f + toTarget.X * 0.55f,
-                                egoFwd.Y * 0.45f + toTarget.Y * 0.55f, 0f));
+                                egoFwd.X * egoWeight + toTarget.X * targetWeight,
+                                egoFwd.Y * egoWeight + toTarget.Y * targetWeight, 0f));
                             var guide = new Vector3(
                                 egoPos.X + blended.X * 10f,
                                 egoPos.Y + blended.Y * 10f,
