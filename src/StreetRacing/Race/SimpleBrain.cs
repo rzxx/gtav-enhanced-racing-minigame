@@ -1660,7 +1660,8 @@ namespace StreetRacing.Race
                     gtaTrafficLight, burnout, seatOk,
                     c.OpposingFraction, c.UnknownFraction, c.MeanFlowCost,
                     c.ElevationDeltaM, c.RouteGatesPassed, c.SurfaceComponentId,
-                    c.GateMissCost, spatialPlanner.LastPlanMs);
+                    c.GateMissCost, spatialPlanner.LastPlanMs,
+                    pe.Valid ? pe.RawDesiredYawRateDegS : 0f);
             }
             catch { }
         }
