@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using GTA;
 using GTA.Math;
+using GTA.Native;
 
 namespace StreetRacing
 {
@@ -73,8 +74,19 @@ namespace StreetRacing
         public readonly List<DebugCell> DebugCells = new List<DebugCell>();
         public string Detail { get; private set; } = "";
 
+        private struct CachedRoadProbe
+        {
+            public Vector3 Center;
+            public float HeadingDeg;
+            public float PreferredHeadingDeg;
+            public int SeenMs;
+        }
+
         private readonly List<TrackedActor> actors = new List<TrackedActor>();
+        private readonly List<CachedRoadProbe> positiveRoadProbeCache = new List<CachedRoadProbe>(180);
         private Perception perception;
+        private int positiveProbeTests;
+        private int positiveProbeHits;
         private Vector3 egoOrigin;
         private Vector3 egoForward;
         private Vector3 egoLeft;
@@ -83,10 +95,18 @@ namespace StreetRacing
 
         public void Reset()
         {
+            ClearFrame();
+            positiveRoadProbeCache.Clear();
+        }
+
+        private void ClearFrame()
+        {
             Road.Clear();
             DebugCells.Clear();
             actors.Clear();
             perception = null;
+            positiveProbeTests = 0;
+            positiveProbeHits = 0;
             Detail = "";
         }
 
@@ -99,7 +119,7 @@ namespace StreetRacing
             float egoHalfWidth,
             bool buildDebugGrid = false)
         {
-            Reset();
+            ClearFrame();
             this.perception = perception;
             egoOrigin = egoPos;
             egoForward = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(egoHeading));
@@ -109,6 +129,16 @@ namespace StreetRacing
 
             AddReferenceSupports(reference);
             AddNearbyNodeSupports(egoPos, egoHeading);
+
+            // Vehicle nodes and GET_CLOSEST_ROAD describe road structure, but
+            // their inferred lane-width rectangles routinely under-fill broad
+            // asphalt, junction aprons and highway merges. IS_POINT_ON_ROAD is
+            // deliberately used as POSITIVE evidence only: a true sample may
+            // expand traversable space, while a false sample never contracts it.
+            // Probe hits persist briefly so the local surface is not rebuilt from
+            // scratch every reaction tick.
+            AddPositiveRoadProbes(reference, egoPos, egoHeading);
+            AddCachedRoadProbes(egoPos);
             MergeRedundantSupports();
             int surfaceComponents = AssignSurfaceComponents();
 
@@ -131,9 +161,13 @@ namespace StreetRacing
                 if (g > maxAbsGrade) maxAbsGrade = g;
                 if (Road[i].FlowConfidence > 0.25f) alignedSupports++;
             }
+            int probeSupports = 0;
+            for (int i = 0; i < Road.Count; i++)
+                if (Road[i].Source == "RoadProbe") probeSupports++;
             Detail = $"roadSupports={Road.Count};surfaceComponents={surfaceComponents};"
-                + $"flowSupports={alignedSupports};actors={actors.Count};"
-                + $"maxGrade={maxAbsGrade:F2};debugCells={DebugCells.Count}";
+                + $"flowSupports={alignedSupports};probeSupports={probeSupports};"
+                + $"probeHit={positiveProbeHits}/{positiveProbeTests};probeCache={positiveRoadProbeCache.Count};"
+                + $"actors={actors.Count};maxGrade={maxAbsGrade:F2};debugCells={DebugCells.Count}";
         }
 
         public int LocateSurfaceComponent(Vector3 pos, float headingDeg)
@@ -415,6 +449,139 @@ namespace StreetRacing
             }
         }
 
+        private void AddPositiveRoadProbes(
+            DrivingReference.Result reference, Vector3 egoPos, float egoHeading)
+        {
+            int now = 0;
+            try { now = Game.GameTime; } catch { }
+            TrimPositiveRoadProbeCache(egoPos, now);
+
+            // Roughly 30-45 native tests per plan at normal lookahead. This is
+            // intentionally sparse: cached positive hits turn them into a local
+            // free-space memory rather than a dense per-frame width scan.
+            if (reference != null && reference.Path != null && reference.Path.Count >= 2)
+            {
+                float[] lateralOffsets = { -12f, -8f, -4f, 4f, 8f, 12f };
+                for (int i = 0; i < reference.Path.Count; i += 3)
+                {
+                    Vector3 center = reference.Path[i];
+                    Vector3 dir = DirectionAt(reference.Path, i);
+                    float preferredHeading = RaceMath.HeadingFromVector(dir);
+                    float roadHeading = i < reference.RoadHeadingDeg.Count
+                        ? reference.RoadHeadingDeg[i]
+                        : preferredHeading;
+                    Vector3 axis = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(roadHeading));
+                    Vector3 left = new Vector3(-axis.Y, axis.X, 0f);
+
+                    for (int j = 0; j < lateralOffsets.Length; j++)
+                    {
+                        float lat = lateralOffsets[j];
+                        Vector3 p = new Vector3(
+                            center.X + left.X * lat,
+                            center.Y + left.Y * lat,
+                            center.Z);
+                        ProbePositiveRoadPoint(p, roadHeading, preferredHeading, now);
+                    }
+                }
+            }
+            else
+            {
+                // Terminal/reference-loss fallback: still learn positive space
+                // immediately around the car, but never infer negative space.
+                Vector3 fwd = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(egoHeading));
+                Vector3 left = new Vector3(-fwd.Y, fwd.X, 0f);
+                float[] forwards = { 0f, 10f, 20f, 30f, 40f };
+                float[] laterals = { -10f, -5f, 5f, 10f };
+                for (int i = 0; i < forwards.Length; i++)
+                {
+                    for (int j = 0; j < laterals.Length; j++)
+                    {
+                        Vector3 p = new Vector3(
+                            egoPos.X + fwd.X * forwards[i] + left.X * laterals[j],
+                            egoPos.Y + fwd.Y * forwards[i] + left.Y * laterals[j],
+                            egoPos.Z);
+                        ProbePositiveRoadPoint(p, egoHeading, egoHeading, now);
+                    }
+                }
+            }
+        }
+
+        private void ProbePositiveRoadPoint(
+            Vector3 p, float roadHeading, float preferredHeading, int now)
+        {
+            bool onRoad = false;
+            positiveProbeTests++;
+            try
+            {
+                onRoad = Function.Call<bool>(
+                    Hash.IS_POINT_ON_ROAD, p.X, p.Y, p.Z + 0.5f, 0);
+            }
+            catch { }
+            if (!onRoad) return;
+
+            positiveProbeHits++;
+            for (int i = 0; i < positiveRoadProbeCache.Count; i++)
+            {
+                CachedRoadProbe old = positiveRoadProbeCache[i];
+                if (RaceMath.FlatDistance(old.Center, p) > 2.75f) continue;
+                if (AxisHeadingError(old.HeadingDeg, roadHeading) > 30f) continue;
+                old.Center = p;
+                old.HeadingDeg = roadHeading;
+                old.PreferredHeadingDeg = preferredHeading;
+                old.SeenMs = now;
+                positiveRoadProbeCache[i] = old;
+                return;
+            }
+
+            positiveRoadProbeCache.Add(new CachedRoadProbe
+            {
+                Center = p,
+                HeadingDeg = roadHeading,
+                PreferredHeadingDeg = preferredHeading,
+                SeenMs = now,
+            });
+            if (positiveRoadProbeCache.Count > 180)
+                positiveRoadProbeCache.RemoveAt(0);
+        }
+
+        private void TrimPositiveRoadProbeCache(Vector3 egoPos, int now)
+        {
+            for (int i = positiveRoadProbeCache.Count - 1; i >= 0; i--)
+            {
+                CachedRoadProbe p = positiveRoadProbeCache[i];
+                bool stale = now > 0 && p.SeenMs > 0 && now - p.SeenMs > 12000;
+                bool far = RaceMath.FlatDistance(egoPos, p.Center) > 140f;
+                if (stale || far)
+                    positiveRoadProbeCache.RemoveAt(i);
+            }
+        }
+
+        private void AddCachedRoadProbes(Vector3 egoPos)
+        {
+            for (int i = 0; i < positiveRoadProbeCache.Count; i++)
+            {
+                CachedRoadProbe p = positiveRoadProbeCache[i];
+                if (RaceMath.FlatDistance(egoPos, p.Center) > 125f) continue;
+                Road.Add(new RoadSupport
+                {
+                    Center = p.Center,
+                    HeadingDeg = p.HeadingDeg,
+                    PreferredHeadingDeg = p.PreferredHeadingDeg,
+                    Grade = 0f,
+                    HalfLengthM = 5.5f,
+                    LeftM = 2.6f,
+                    RightM = 2.6f,
+                    Confidence = 0.52f,
+                    Lanes = 1,
+                    ForwardLanes = 0,
+                    BackwardLanes = 0,
+                    MedianWidth = 0f,
+                    FlowConfidence = 0f,
+                    Source = "RoadProbe",
+                });
+            }
+        }
+
         private void AddNearbyNodeSupports(Vector3 egoPos, float egoHeading)
         {
             for (int nth = 1; nth <= 24; nth++)
@@ -469,7 +636,9 @@ namespace StreetRacing
                 for (int j = 0; j < merged.Count; j++)
                 {
                     var m = merged[j];
-                    if (RaceMath.FlatDistance(s.Center, m.Center) > 5.5f) continue;
+                    bool probePair = s.Source == "RoadProbe" || m.Source == "RoadProbe";
+                    float mergeDistance = probePair ? 2.2f : 5.5f;
+                    if (RaceMath.FlatDistance(s.Center, m.Center) > mergeDistance) continue;
                     if (AxisHeadingError(s.HeadingDeg, m.HeadingDeg) > 22f) continue;
                     if (s.Confidence <= m.Confidence + 0.10f)
                     {
@@ -627,10 +796,6 @@ namespace StreetRacing
                     score -= 100f;
                 if (score >= bestScore) continue;
 
-                float flowCost;
-                bool opposing;
-                EvaluateFlow(s, lat, headingDeg, out flowCost, out opposing);
-
                 bestScore = score;
                 best = new SurfaceQuery
                 {
@@ -640,12 +805,77 @@ namespace StreetRacing
                     Confidence = s.Confidence,
                     SurfaceZ = surfaceZ,
                     Grade = s.Grade,
-                    FlowCost = flowCost,
-                    OpposingSide = opposing,
+                    FlowCost = 0f,
+                    OpposingSide = false,
                     SurfaceComponentId = s.SurfaceComponentId,
                 };
             }
+
+            // Traversability and traffic flow are deliberately separate.
+            // Positive road probes may establish "there is asphalt here", but
+            // they never invent lane direction. Flow is annotated from the
+            // nearest structural (reference/node) support on the same surface.
+            if (best.Found)
+            {
+                float flowCost;
+                bool opposing;
+                QueryFlowAnnotation(
+                    p, headingDeg, zHint, best.SurfaceComponentId,
+                    out flowCost, out opposing);
+                best.FlowCost = flowCost;
+                best.OpposingSide = opposing;
+            }
             return best;
+        }
+
+        private void QueryFlowAnnotation(
+            Vector3 p,
+            float headingDeg,
+            float zHint,
+            int surfaceComponentHint,
+            out float cost,
+            out bool opposing)
+        {
+            cost = 0f;
+            opposing = false;
+            float bestScore = float.MaxValue;
+            int best = -1;
+            float bestLat = 0f;
+
+            for (int i = 0; i < Road.Count; i++)
+            {
+                RoadSupport s = Road[i];
+                if (s.Source == "RoadProbe" || s.FlowConfidence <= 0.05f) continue;
+                if (surfaceComponentHint >= 0 && s.SurfaceComponentId != surfaceComponentHint)
+                    continue;
+
+                Vector3 f = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(s.HeadingDeg));
+                Vector3 l = new Vector3(-f.Y, f.X, 0f);
+                Vector3 rel = new Vector3(p.X - s.Center.X, p.Y - s.Center.Y, 0f);
+                float alongSigned = RaceMath.FlatDot(rel, f);
+                float along = Math.Abs(alongSigned);
+                float lat = RaceMath.FlatDot(rel, l);
+                float outsideAlong = along - s.HalfLengthM;
+                float outsideLat = lat >= 0f ? lat - s.LeftM : -lat - s.RightM;
+                float outside = Math.Max(outsideAlong, outsideLat);
+                if (outside > 8f) continue;
+
+                float surfaceZ = s.Center.Z + alongSigned * s.Grade;
+                float dz = Math.Abs(zHint - surfaceZ);
+                if (dz > 7f) continue;
+
+                float score = Math.Max(0f, outside) * 2.5f
+                    + dz * 1.8f
+                    + (1f - s.FlowConfidence) * 1.5f;
+                if (outside <= 0f) score -= 4f;
+                if (score >= bestScore) continue;
+                bestScore = score;
+                best = i;
+                bestLat = lat;
+            }
+
+            if (best >= 0)
+                EvaluateFlow(Road[best], bestLat, headingDeg, out cost, out opposing);
         }
 
         private static void EvaluateFlow(
