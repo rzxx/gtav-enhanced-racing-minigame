@@ -149,8 +149,10 @@ namespace StreetRacing
             // path curvature implied by the current body motion. At low speed
             // yaw is noisy, so fade toward zero.
             float motionSpeed = Math.Max(egoSpeed, 2.5f);
+            float motionKLimit = Math.Min(
+                0.09f, (aLat * 1.20f) / Math.Max(motionSpeed * motionSpeed, 9f));
             motionRootCurvature = RaceMath.Clamp(
-                egoYawRateRadS / motionSpeed, -0.09f, 0.09f);
+                egoYawRateRadS / motionSpeed, -motionKLimit, motionKLimit);
             if (egoSpeed < 4f)
                 motionRootCurvature *= RaceMath.Clamp((egoSpeed - 1.5f) / 2.5f, 0f, 1f);
 
