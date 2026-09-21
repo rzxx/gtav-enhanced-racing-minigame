@@ -10,7 +10,7 @@ namespace StreetRacing.Control
     /// pathfinding in the loop. The planner ticks at ~10 Hz; this controller
     /// runs every script tick (~20 Hz) against the latest maneuver:
     ///   - local speed-dependent lookahead point on the SELECTED path;
-    ///   - pure-pursuit steering to that point (cross-track + heading error);
+    ///   - curvature feed-forward + pursuit + yaw/slip feedback;
     ///   - PI longitudinal tracking of the LOCAL planned speed.
     ///
     /// COLLAPSED rules (Phases 1-3):
@@ -63,6 +63,7 @@ namespace StreetRacing.Control
         private float speedInt;
         private bool lastReverseCmd;
         private float lastSteer;
+        private float lastDesiredYawRate;
         private float lastThr;
         private float lastBrk;
 
@@ -163,6 +164,7 @@ namespace StreetRacing.Control
             speedInt = 0f;
             lastReverseCmd = false;
             lastSteer = 0f;
+            lastDesiredYawRate = 0f;
             lastThr = 0f;
             lastBrk = 0f;
             hasControlKin = false;
@@ -354,9 +356,17 @@ namespace StreetRacing.Control
                 lookSpeed = CurrentCruise;
             }
 
-            // --- Lateral: current geometric follower, now with rate limiting
-            // and explicit stability observation. Controller V2 will replace
-            // this law after the benchmark tells us which failure modes dominate.
+            // --- Lateral Controller V2.
+            //
+            // The previous controller only chased the latest geometric path.
+            // Telemetry showed the selected path/yaw target could flip every
+            // 100-150 ms, so even a physically stable car was commanded into
+            // repeated left/right transients. V2 combines:
+            //   1) curvature feed-forward,
+            //   2) gentle pursuit/heading/cross-track feedback,
+            //   3) actual yaw-rate feedback,
+            //   4) sideslip damping,
+            //   5) slew limits on BOTH desired yaw and steering.
             var to = new Vector3(lookPt.X - egoPos.X, lookPt.Y - egoPos.Y, 0f);
             float distToLook = RaceMath.FlatLength(to);
             float desiredHeading = distToLook > 1f
@@ -364,46 +374,75 @@ namespace StreetRacing.Control
                 : pathHeading;
             float headErr = RaceMath.HeadingDiffDeg(desiredHeading, egoHeading);
 
-            float alphaRad = headErr * (float)Math.PI / 180f;
+            float rawKappaPath = 0f;
+            float rawYawTargetDegS = 0f;
+            try
+            {
+                rawKappaPath = CurvatureAtS(cmd.Path, cum, sEgo + ld * 0.5f);
+                rawYawTargetDegS = forwardSpeed * rawKappaPath * 180f / (float)Math.PI;
+            }
+            catch { }
+
+            // Do not let a replanning discontinuity instantaneously demand an
+            // opposite yaw rate. This is a command-shaping limit, not a path
+            // constraint: sustained corners still reach their full target.
+            float yawTargetRateLimit = forwardSpeed > 16f ? 120f : 170f; // deg/s per second
+            float maxYawTargetStep = yawTargetRateLimit * dt;
+            float desiredYawRateDegS = rawYawTargetDegS;
+            if (hasControlKin)
+                desiredYawRateDegS = RaceMath.Clamp(
+                    desiredYawRateDegS,
+                    lastDesiredYawRate - maxYawTargetStep,
+                    lastDesiredYawRate + maxYawTargetStep);
+
             float wheelbase = 2.7f;
+            float controlKappa = forwardSpeed > 3f
+                ? desiredYawRateDegS * (float)Math.PI / 180f / forwardSpeed
+                : rawKappaPath;
+            float steerFeedForward = (float)(
+                Math.Atan(wheelbase * controlKappa) * 180.0 / Math.PI);
+
+            float alphaRad = headErr * (float)Math.PI / 180f;
             float steerPursuit = 0f;
             if (distToLook > 1f)
             {
-                float kappa = 2f * (float)Math.Sin(alphaRad) / Math.Max(distToLook, 3f);
-                steerPursuit = (float)(Math.Atan(wheelbase * kappa) * 180.0 / Math.PI);
+                float pursuitKappa = 2f * (float)Math.Sin(alphaRad)
+                    / Math.Max(distToLook, 4f);
+                steerPursuit = (float)(
+                    Math.Atan(wheelbase * pursuitKappa) * 180.0 / Math.PI);
             }
 
-            float steerDeg = steerPursuit * 1.4f + headErr * 0.35f - crossTrack * 1.1f;
-            float steerLimit = egoSpeed > 25f ? 18f : (egoSpeed > 15f ? 24f : 32f);
+            float yawErr = desiredYawRateDegS - yawRateDegS;
+            float steerDeg = steerFeedForward
+                + steerPursuit * 0.55f
+                + headErr * 0.18f
+                - crossTrack * 0.75f
+                + yawErr * 0.10f
+                - slipDeg * 0.14f;
+
+            float steerLimit = egoSpeed > 25f ? 17f
+                : (egoSpeed > 18f ? 20f : (egoSpeed > 10f ? 25f : 32f));
             steerDeg = RaceMath.Clamp(steerDeg, -steerLimit, steerLimit);
 
             bool reversing = false;
             try { reversing = cmd.Reverse; } catch { reversing = false; }
             if (reversing != lastReverseCmd)
             {
-                // Do not carry the forward PI integral into reverse (or vice
-                // versa). Recovery traces showed this transition could retain
-                // enough integral to make speed regulation meaningless.
                 speedInt = 0f;
+                lastDesiredYawRate = 0f;
                 lastReverseCmd = reversing;
             }
             if (reversing) steerDeg = -steerDeg;
 
-            // Do not teleport the steering rack between opposite locks.
-            float steerRateDegS = egoSpeed > 20f ? 90f : (egoSpeed > 10f ? 120f : 180f);
+            // Steering rack slew is intentionally slower at racing speed.
+            // The old 90-120 deg/s limits let a 10 Hz planner flip enough lock
+            // to create visible lane-to-lane oscillation.
+            float steerRateDegS = egoSpeed > 20f ? 55f
+                : (egoSpeed > 10f ? 75f : 120f);
             float maxSteerStep = steerRateDegS * dt;
             if (hasControlKin)
-                steerDeg = RaceMath.Clamp(steerDeg, lastSteer - maxSteerStep, lastSteer + maxSteerStep);
-
-            // Curvature/yaw target is telemetry for this pass. It becomes an
-            // explicit feedback term in Controller V2.
-            float desiredYawRateDegS = 0f;
-            try
-            {
-                float kappaPath = CurvatureAtS(cmd.Path, cum, sEgo + ld * 0.5f);
-                desiredYawRateDegS = forwardSpeed * kappaPath * 180f / (float)Math.PI;
-            }
-            catch { }
+                steerDeg = RaceMath.Clamp(
+                    steerDeg, lastSteer - maxSteerStep, lastSteer + maxSteerStep);
 
             bool steerSaturated = Math.Abs(steerDeg) >= steerLimit * 0.92f
                 && (Math.Abs(headErr) > 12f || Math.Abs(crossTrack) > 1.5f);
@@ -543,6 +582,7 @@ namespace StreetRacing.Control
             try { brkActual = vehicle.BrakePower; } catch { }
 
             lastSteer = steerDeg;
+            lastDesiredYawRate = desiredYawRateDegS;
             lastThr = thr;
             lastBrk = brk;
             lastControlHeading = egoHeading;
