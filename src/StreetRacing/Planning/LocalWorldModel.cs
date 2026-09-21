@@ -257,11 +257,31 @@ namespace StreetRacing
                 }
                 else
                 {
-                    float caution = a.Kind == ActorKind.Ped ? 4.5f : 2.8f;
+                    bool movingVehicle = a.Kind == ActorKind.TrafficVehicle
+                        || a.Kind == ActorKind.Rival;
+                    bool sameFlow = false;
+                    if (movingVehicle && a.Speed > 2.0f)
+                    {
+                        float actorHeading = a.HeadingDeg;
+                        if (RaceMath.FlatLength(a.Velocity) > 1.2f)
+                            actorHeading = RaceMath.HeadingFromVector(
+                                RaceMath.FlatNormalize(a.Velocity));
+                        sameFlow = Math.Abs(
+                            RaceMath.HeadingDiffDeg(actorHeading, headingDeg)) < 35f;
+                    }
+
+                    // Parallel moving traffic is not a circular exclusion zone.
+                    // Keep true footprint collision hard, but allow racing-close
+                    // side-by-side gaps without paying the same 2.8 m halo used
+                    // for oncoming/static hazards.
+                    float caution = a.Kind == ActorKind.Ped ? 4.5f
+                        : sameFlow ? 1.45f : 2.8f;
+                    float weight = a.Kind == ActorKind.Ped ? 16f
+                        : sameFlow ? 1.6f : 5f;
                     if (clear < caution)
                     {
                         float x = caution - clear;
-                        result.ActorCost += x * x * (a.Kind == ActorKind.Ped ? 16f : 5f);
+                        result.ActorCost += x * x * weight;
                     }
                 }
             }
