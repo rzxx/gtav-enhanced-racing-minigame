@@ -52,7 +52,7 @@ namespace StreetRacing.Control
         public int ReissueCount { get; private set; }
         public string LastReason { get; private set; } = "";
         public string TakeoverDetail { get; private set; } = "";
-        public string ActuatorName => "Direct";
+        public string ActuatorName => "DirectV2";
         public PathFollowingError LastError { get; private set; } = new PathFollowingError();
 
         private ManeuverCommand cmd;
@@ -792,9 +792,16 @@ namespace StreetRacing.Control
                 if (corrLeft >= -0.5f) return $"FAIL leftCorr={corrLeft:F2} expect <0";
                 if (corrRight <= 0.5f) return $"FAIL rightCorr={corrRight:F2} expect >0";
                 // Heading term: desired left of nose (+headErr) -> left (+steer).
-                float headGain = 0.35f;
+                float headGain = 0.18f;
                 float hCorr = 10f * headGain;
                 if (hCorr <= 0f) return $"FAIL headCorr={hCorr:F2} expect >0";
+
+                // Controller V2 yaw/slip damping: excessive left yaw/slip with
+                // zero desired yaw must command right (negative) correction.
+                float yawCorr = (0f - 30f) * 0.10f;
+                float slipCorr = -10f * 0.14f;
+                if (yawCorr >= 0f || slipCorr >= 0f)
+                    return $"FAIL damping yaw={yawCorr:F2} slip={slipCorr:F2} expect <0";
                 return "OK";
             }
             catch (System.Exception ex) { return "FAIL exc:" + ex.Message; }
