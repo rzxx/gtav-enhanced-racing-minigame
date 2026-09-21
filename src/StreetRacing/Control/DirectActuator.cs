@@ -459,9 +459,9 @@ namespace StreetRacing.Control
             bool reverseMotion = !reversing && signedLong < -1.0f;
             bool wrongYawResponse = !reversing
                 && egoSpeed > 5f
-                && Math.Abs(steerDeg) > 8f
-                && Math.Abs(yawRateDegS) > 8f
-                && steerDeg * yawRateDegS < 0f
+                && Math.Abs(desiredYawRateDegS) > 10f
+                && Math.Abs(yawRateDegS) > 10f
+                && desiredYawRateDegS * yawRateDegS < 0f
                 && (Math.Abs(headErr) > 20f || Math.Abs(slipDeg) > 10f);
             bool unstable = !reversing && (
                 reverseMotion
@@ -522,9 +522,10 @@ namespace StreetRacing.Control
 
             if (!reversing)
             {
-                // Even before Controller V2, never combine full lock with full
-                // throttle. This is deliberately conservative: the supervisor
-                // removes energy when the geometric follower is losing authority.
+                // Grip budget: never combine large steering demand with full
+                // throttle. The supervisor removes energy when V2 is losing
+                // authority, but countersteer itself is no longer treated as a
+                // wrong-yaw failure.
                 float steerFrac = steerLimit > 1f ? Math.Abs(steerDeg) / steerLimit : 0f;
                 if (egoSpeed > 8f)
                 {
