@@ -30,7 +30,8 @@ namespace StreetRacing.Control
         public float LateralVelMps;     // + = moving left in vehicle frame
         public float SlipDeg;           // velocity direction vs nose (+ left)
         public float YawRateDegS;       // + = heading rotating left
-        public float DesiredYawRateDegS;
+        public float DesiredYawRateDegS; // filtered Controller V2 target
+        public float RawDesiredYawRateDegS; // planner/path target before slew limiting
         public float SteerActualDeg;
         public float ThrottleActual01;
         public float ThrottlePowerActual01;

@@ -305,8 +305,8 @@ namespace StreetRacing.Race
                 string poseChk = PoseConnector.SelfTest();
                 string steerChk = DirectActuator.SteeringSignSelfTest();
                 string headingChk = HeadingConventionCheck(vehicle);
-                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1+Gates");
-                telemetry?.Event(0, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(0, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ForwardOnly;controller=V2;spatialPlanner=V1+Gates");
+                telemetry?.Event(0, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ForwardOnly;controller=V2");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -485,8 +485,8 @@ namespace StreetRacing.Race
                 string headingChk = HeadingConventionCheck(vehicle);
                 int tEv = 0;
                 try { tEv = nowGame - t0; } catch { }
-                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ON;spatialPlanner=V1+Gates;fromSnapshot=1");
-                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ON");
+                telemetry?.Event(tEv, "ROUTE", $"src={route.Source};pts={route.Points.Count};len={route.TotalLength:F0};simpleCruise={EffectiveCruise():F0};poseCheck={poseChk};steerCheck={steerChk};headingCheck={headingChk};gpsOnly=1;recovery=ForwardOnly;controller=V2;spatialPlanner=V1+Gates;fromSnapshot=1");
+                telemetry?.Event(tEv, "ACTUATOR", $"Direct;LayeredLocalWorld + SpatialPlannerV1+Gates + persistent cmd speed;iniPassing={enablePassing};gtaRejoin=OFF(override ini={useGtaRejoin});recovery=ForwardOnly;controller=V2");
                 string vStart = "";
                 try { vStart = route.ValidateStart(origin, originHeading, out string vr) ? $"valid;{vr}" : $"INVALID;{vr}"; }
                 catch { vStart = "validate-exc"; }
@@ -1660,7 +1660,8 @@ namespace StreetRacing.Race
                     gtaTrafficLight, burnout, seatOk,
                     c.OpposingFraction, c.UnknownFraction, c.MeanFlowCost,
                     c.ElevationDeltaM, c.RouteGatesPassed, c.SurfaceComponentId,
-                    c.GateMissCost, spatialPlanner.LastPlanMs);
+                    c.GateMissCost, spatialPlanner.LastPlanMs,
+                    pe.Valid ? pe.RawDesiredYawRateDegS : 0f);
             }
             catch { }
         }

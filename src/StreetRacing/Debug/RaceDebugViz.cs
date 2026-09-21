@@ -301,16 +301,9 @@ namespace StreetRacing.Debug
                     World.DrawLine(
                         new Vector3(p.X, p.Y, p.Z + 0.2f),
                         new Vector3(p.X, p.Y, p.Z + 5.0f), col);
-                    try
-                    {
-                        float s = i == 0 ? 1.5f : 1.0f;
-                        World.DrawMarker(MarkerType.Sphere,
-                            p + new Vector3(0f, 0f, 1.0f),
-                            new Vector3(), new Vector3(),
-                            new Vector3(s, s, s), col,
-                            false, false, false, "", "", false);
-                    }
-                    catch { }
+                    // Deliberately no sphere marker: route gates are
+                    // planning cross-sections, not obstacles. Sphere markers
+                    // looked like perceived hazards during in-game debugging.
                 }
             }
             catch { }
