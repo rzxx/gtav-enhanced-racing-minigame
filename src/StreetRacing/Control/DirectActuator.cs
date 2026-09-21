@@ -608,6 +608,7 @@ namespace StreetRacing.Control
                 SlipDeg = slipDeg,
                 YawRateDegS = yawRateDegS,
                 DesiredYawRateDegS = desiredYawRateDegS,
+                RawDesiredYawRateDegS = rawYawTargetDegS,
                 SteerActualDeg = steerActual,
                 ThrottleActual01 = thrActual,
                 ThrottlePowerActual01 = thrPowerActual,
