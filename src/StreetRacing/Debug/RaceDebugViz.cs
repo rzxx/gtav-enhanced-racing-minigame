@@ -212,7 +212,9 @@ namespace StreetRacing.Debug
                         s.Center.Z + 0.45f);
                     var col = s.Source == "Reference"
                         ? System.Drawing.Color.FromArgb(125, 0, 210, 255)
-                        : System.Drawing.Color.FromArgb(80, 80, 160, 255);
+                        : s.Source == "RoadProbe"
+                            ? System.Drawing.Color.FromArgb(135, 80, 255, 150)
+                            : System.Drawing.Color.FromArgb(80, 80, 160, 255);
                     World.DrawLine(a, b, col);
 
                     Vector3 lp = new Vector3(
