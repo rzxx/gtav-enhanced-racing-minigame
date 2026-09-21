@@ -46,6 +46,7 @@ namespace StreetRacing
             public int GateIndex;
             public int SurfaceComponentId;
             public float GateMissCost;
+            public bool GateMissed;
         }
 
         private static readonly float[] CurvatureSet =
@@ -66,6 +67,10 @@ namespace StreetRacing
         private readonly HashSet<long> diversity = new HashSet<long>();
         private readonly List<int> chain = new List<int>(16);
         private readonly List<RouteGate> routeGates = new List<RouteGate>(8);
+        private readonly List<Vector3> committedPath = new List<Vector3>(40);
+        private readonly List<float> committedStationS = new List<float>(40);
+        private bool continuityActive;
+        private float continuityBaseS;
 
         private float lastFirstCurvature;
         private bool hasLastCurvature;
@@ -95,6 +100,10 @@ namespace StreetRacing
             diversity.Clear();
             chain.Clear();
             routeGates.Clear();
+            committedPath.Clear();
+            committedStationS.Clear();
+            continuityActive = false;
+            continuityBaseS = 0f;
         }
 
         public Result Plan(
@@ -134,6 +143,17 @@ namespace StreetRacing
                 : route.PointAtS(goalS);
             int rootSurface = world.LocateSurfaceComponent(egoPos, egoHeading);
 
+            continuityActive = false;
+            continuityBaseS = 0f;
+            if (!route.IsLost && committedPath.Count >= 3
+                && committedStationS.Count == committedPath.Count)
+            {
+                float continuityDist;
+                continuityBaseS = ClosestStationOnPath(
+                    egoPos, committedPath, committedStationS, out continuityDist);
+                continuityActive = continuityDist <= 7.0f;
+            }
+
             pool.Clear();
             beam.Clear();
             var root = new SearchNode
@@ -150,6 +170,7 @@ namespace StreetRacing
                 GateIndex = 0,
                 SurfaceComponentId = rootSurface,
                 GateMissCost = 0f,
+                GateMissed = false,
             };
             pool.Add(root);
             beam.Add(0);
@@ -261,6 +282,25 @@ namespace StreetRacing
                 + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
+            committedPath.Clear();
+            committedStationS.Clear();
+            if (chosen.Path != null)
+            {
+                for (int i = 0; i < chosen.Path.Count; i++)
+                    committedPath.Add(chosen.Path[i]);
+                if (chosen.StationS != null && chosen.StationS.Count == chosen.Path.Count)
+                {
+                    for (int i = 0; i < chosen.StationS.Count; i++)
+                        committedStationS.Add(chosen.StationS[i]);
+                }
+                else
+                {
+                    var ss = BuildStationS(chosen.Path);
+                    for (int i = 0; i < ss.Count; i++)
+                        committedStationS.Add(ss[i]);
+                }
+            }
+
             LastChosen = chosen;
             HasChosen = true;
             LastDecision = result.Detail;
@@ -291,10 +331,11 @@ namespace StreetRacing
                 GateIndex = parent.GateIndex,
                 SurfaceComponentId = parent.SurfaceComponentId,
                 GateMissCost = parent.GateMissCost,
+                GateMissed = parent.GateMissed,
             };
 
             if (layer == 0 && hasLastCurvature)
-                n.Cost += Math.Abs(curvature - lastFirstCurvature) * 55f;
+                n.Cost += Math.Abs(curvature - lastFirstCurvature) * 140f;
             n.Cost += Math.Abs(curvature - parent.LastCurvature) * 18f;
             n.Cost += Math.Abs(curvature) * 5f;
 
@@ -357,15 +398,39 @@ namespace StreetRacing
             float goalProgress = parent.GoalDist - newGoalDist;
             n.GoalDist = newGoalDist;
 
-            // Ordered route gates are the primary topology objective. The far
-            // goal remains a weak preference inside the valid gate corridor.
+            // Gates are TOPOLOGICAL APERTURES, not waypoints. Staying anywhere
+            // inside the road-width aperture is free; only being outside the
+            // required cross-section is penalised. The previous implementation
+            // charged Euclidean distance to each gate CENTER, which pulled the
+            // car left/right across an otherwise open road every replan.
             int gatesAdvanced = n.GateIndex - parent.GateIndex;
             if (gatesAdvanced > 0)
                 n.Cost -= gatesAdvanced * 28f;
             if (n.GateIndex < routeGates.Count)
             {
-                float gd = RaceMath.FlatDistance(n.Pos, routeGates[n.GateIndex].Center);
-                n.Cost += Math.Min(35f, gd * 0.32f);
+                RouteGate g = routeGates[n.GateIndex];
+                Vector3 rel = new Vector3(
+                    n.Pos.X - g.Center.X, n.Pos.Y - g.Center.Y, 0f);
+                float lat = Math.Abs(RaceMath.FlatCross(g.Dir, rel));
+                float dz = Math.Abs(n.Pos.Z - g.Center.Z);
+                float latOutside = Math.Max(0f, lat - g.HalfWidthM);
+                float zOutside = Math.Max(0f, dz - g.ZToleranceM);
+                n.Cost += latOutside * 2.0f + zOutside * 7.0f;
+            }
+
+            // Receding-horizon commitment: in the absence of a real obstacle,
+            // prefer extending the path we already chose instead of selecting
+            // a geometrically different left/right solution every 120 ms.
+            // Hard actor/surface costs are much larger, so this yields
+            // immediately when the old plan becomes unsafe.
+            if (continuityActive)
+            {
+                float expectedS = continuityBaseS + (layer + 1) * PrimitiveM;
+                Vector3 committed = PointOnPathAtS(
+                    committedPath, committedStationS, expectedS);
+                float dCommit = RaceMath.FlatDistance(n.Pos, committed);
+                float excess = Math.Max(0f, dCommit - 1.25f);
+                n.Cost += excess * excess * 0.75f;
             }
 
             n.Cost -= goalProgress * 1.35f;
@@ -407,7 +472,7 @@ namespace StreetRacing
                 Path = path,
                 StationS = BuildStationS(path),
                 AimPoint = path[path.Count - 1],
-                RejectReason = "",
+                RejectReason = leaf.GateMissed ? "missed-route-gate" : "",
                 ConstrainHandle = -1,
                 ConstrainKind = "",
                 ConstrainS = -1f,
@@ -784,29 +849,69 @@ namespace StreetRacing
                 bool crossed = prevAlong <= 0.5f && nowAlong >= -0.5f
                     && lat <= g.HalfWidthM
                     && dz <= g.ZToleranceM;
-                bool near = RaceMath.FlatDistance(currentPos, g.Center) <= g.HalfWidthM * 0.55f
-                    && dz <= g.ZToleranceM;
 
-                if (crossed || near)
+                if (crossed)
                 {
                     node.GateIndex++;
+                    node.GateMissed = false;
                     continue;
                 }
 
-                // Passing the gate plane far outside its 3D aperture means the
-                // trajectory missed a required turn/bridge layer. Keep it in
-                // the beam for graceful fallback, but make it decisively lose.
-                if (nowAlong > 4f)
+                // Crossing a required route cross-section outside its 3D
+                // aperture is a TOPOLOGY failure. Charge it once and mark the
+                // leaf invalid; the old code re-added the miss every 2 m,
+                // producing gateMiss >1000 and violent beam switching.
+                if (nowAlong > 3f && !node.GateMissed)
                 {
-                    float miss = Math.Min(55f,
-                        (nowAlong - 4f) * 2.0f
-                        + Math.Max(0f, lat - g.HalfWidthM) * 3.0f
-                        + Math.Max(0f, dz - g.ZToleranceM) * 8.0f);
+                    float miss = 90f
+                        + Math.Max(0f, lat - g.HalfWidthM) * 4f
+                        + Math.Max(0f, dz - g.ZToleranceM) * 12f;
                     node.Cost += miss;
                     node.GateMissCost += miss;
+                    node.GateMissed = true;
                 }
                 break;
             }
+        }
+
+        private static float ClosestStationOnPath(
+            Vector3 p, IList<Vector3> path, IList<float> stationS, out float distance)
+        {
+            distance = 999f;
+            float bestS = 0f;
+            if (path == null || stationS == null || path.Count < 2
+                || stationS.Count != path.Count) return bestS;
+
+            for (int i = 0; i < path.Count - 1; i++)
+            {
+                var pr = RaceMath.ProjectOnSegment(p, path[i], path[i + 1]);
+                if (pr.Dist >= distance) continue;
+                distance = pr.Dist;
+                bestS = stationS[i] + pr.Along;
+            }
+            return bestS;
+        }
+
+        private static Vector3 PointOnPathAtS(
+            IList<Vector3> path, IList<float> stationS, float s)
+        {
+            if (path == null || path.Count == 0) return Vector3.Zero;
+            if (stationS == null || stationS.Count != path.Count) return path[path.Count - 1];
+            if (s <= stationS[0]) return path[0];
+            if (s >= stationS[stationS.Count - 1]) return path[path.Count - 1];
+            for (int i = 0; i < stationS.Count - 1; i++)
+            {
+                if (s < stationS[i] || s > stationS[i + 1]) continue;
+                float ds = stationS[i + 1] - stationS[i];
+                float t = ds > 1e-4f ? (s - stationS[i]) / ds : 0f;
+                Vector3 a = path[i];
+                Vector3 b = path[i + 1];
+                return new Vector3(
+                    a.X + (b.X - a.X) * t,
+                    a.Y + (b.Y - a.Y) * t,
+                    a.Z + (b.Z - a.Z) * t);
+            }
+            return path[path.Count - 1];
         }
 
         private static List<float> BuildStationS(IList<Vector3> path)
