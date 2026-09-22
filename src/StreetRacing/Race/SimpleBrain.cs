@@ -107,6 +107,8 @@ namespace StreetRacing.Race
         private float spatialUncertainLastHeadErr;
         private int lastLiveRerouteAttemptMs = -100000;
         private int liveRerouteAttempts;
+        private bool finishGoalActive;
+        private int finishGoalEnteredMs = -1;
         private int recoveryEnteredMs = -1;
         private RecoveryPrimitive.Stage lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
         private int stallSinceMs = -1;
@@ -181,7 +183,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "reachable-future-surface-v1";
+        private const string SpatialBuildTag = "reachable-future-surface-v2";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -271,6 +273,8 @@ namespace StreetRacing.Race
             spatialUncertainLastHeadErr = 0f;
             lastLiveRerouteAttemptMs = -100000;
             liveRerouteAttempts = 0;
+            finishGoalActive = false;
+            finishGoalEnteredMs = -1;
             recoveryEnteredMs = -1;
             lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
@@ -463,6 +467,8 @@ namespace StreetRacing.Race
             spatialUncertainLastHeadErr = 0f;
             lastLiveRerouteAttemptMs = -100000;
             liveRerouteAttempts = 0;
+            finishGoalActive = false;
+            finishGoalEnteredMs = -1;
             recoveryEnteredMs = -1;
             lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
@@ -709,7 +715,8 @@ namespace StreetRacing.Race
                     bool physicallyStuck = false;
                     try
                     {
-                        severeRoutePose = route.IsLost
+                        severeRoutePose = !finishGoalActive
+                            && route.IsLost
                             && routeLostSinceMs >= 0
                             && now - routeLostSinceMs >= 1000
                             && (route.DistToRoute > 8f || Math.Abs(route.HeadingErrorDeg) > 55f);
@@ -905,7 +912,8 @@ namespace StreetRacing.Race
                 {
                     physicalSurface.Tick(
                         vehicle, lastRoadReference, route,
-                        egoPos, egoHeading, forwardPlanSpeed, now);
+                        egoPos, egoHeading, forwardPlanSpeed, now,
+                        finishGoalActive, finish);
 
                     if (now - lastPhysicalSurfaceEventMs > 2000)
                     {
@@ -1016,6 +1024,42 @@ namespace StreetRacing.Race
             float cruise = EffectiveCruise();
             float look = LookaheadM;
 
+            // GPS route completion is NOT race completion. Once the routable
+            // route is effectively exhausted but the real checkpoint is still
+            // meaningfully ahead, hand control to an explicit finish-goal
+            // receding-horizon search.
+            float routeRemainNow = Math.Max(
+                0f, route.TotalLength - route.AlongS);
+            bool finishOutstanding = FinishGap > 7f
+                && FinishGap <= (finishGoalActive ? 260f : 180f);
+            bool routeExhausted = route.Progress01 >= 0.985f
+                || routeRemainNow <= 28f;
+
+            if ((finishGoalActive || routeExhausted)
+                && finishOutstanding)
+            {
+                if (!finishGoalActive)
+                {
+                    finishGoalActive = true;
+                    finishGoalEnteredMs = Game.GameTime;
+                    hasCurrent = false;
+                    try { spatialPlanner.Reset(); } catch { }
+                    try { drivingReference.Reset(); } catch { }
+                    lastRoadReference = null;
+                    try
+                    {
+                        telemetry?.Event(
+                            Game.GameTime - t0,
+                            "FINISH_GOAL_ENTER",
+                            $"routeRemain={routeRemainNow:F1};progress={route.Progress01:F3};finishGap={FinishGap:F1}");
+                    }
+                    catch { }
+                }
+
+                return BuildTerminalSpatial(
+                    egoPos, egoSpeed, dtPlan, cruise);
+            }
+
             // Raw GPS is only the global/topological route. Build a separate
             // executable reference that removes short GPS zig-zags and rounds
             // junction vertices while staying on GTA's drivable road.
@@ -1028,17 +1072,28 @@ namespace StreetRacing.Race
                 int now = Game.GameTime;
                 lastRefDetail = rr != null ? rr.Detail : "null";
                 float routeRemain = Math.Max(0f, route.TotalLength - route.AlongS);
-                bool terminalPhase = routeRemain <= 45f && FinishGap <= 100f;
+                bool terminalPhase = routeRemain <= 45f && FinishGap <= 180f;
 
                 if (terminalPhase)
                 {
-                    try
+                    if (!finishGoalActive)
                     {
-                        telemetry?.Event(now - t0, "TERMINAL_SPATIAL",
-                            $"reference-ended;routeRemain={routeRemain:F1};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                        finishGoalActive = true;
+                        finishGoalEnteredMs = now;
+                        hasCurrent = false;
+                        try { spatialPlanner.Reset(); } catch { }
+                        lastRoadReference = null;
+                        try
+                        {
+                            telemetry?.Event(
+                                now - t0,
+                                "FINISH_GOAL_ENTER",
+                                $"reference-ended;routeRemain={routeRemain:F1};progress={route.Progress01:F3};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                        }
+                        catch { }
                     }
-                    catch { }
-                    return BuildTerminalSpatial(egoPos, egoSpeed, dtPlan, cruise);
+                    return BuildTerminalSpatial(
+                        egoPos, egoSpeed, dtPlan, cruise);
                 }
 
                 if (referenceInvalidSinceMs < 0)
@@ -1269,23 +1324,28 @@ namespace StreetRacing.Race
                 // the final local search.
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
                     egoHalfLength, egoHalfWidth, false);
+                float finishCruise = Math.Min(
+                    cruise, FinishGap <= 35f ? 7f : 10f);
                 var sp = spatialPlanner.Plan(localWorld, physicalSurface, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, lastYawRate, egoHalfWidth,
-                    cruise, Game.GameTime, finish);
+                    finishCruise, Game.GameTime, finish, true);
                 if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
                 {
                     referenceInvalidSinceMs = -1;
                     plannerInvalidSinceMs = -1;
-                    joinState = "Terminal";
+                    joinState = "FinishGoal";
                     return BuildCommandFromCandidate(
-                        sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
+                        sp.Chosen, egoSpeed, dtPlan,
+                        Math.Min(cruise, FinishGap <= 35f ? 7f : 10f),
+                        sp.RoadDesired);
                 }
             }
             catch { }
 
-            joinState = "TerminalUncertain";
-            return BuildFailSoftFromCurrent(
-                egoPos, Math.Min(5f, cruise), "TerminalUncertain");
+            joinState = "FinishGoalUncertain";
+            hasCurrent = false;
+            return BuildPlannerStop(
+                egoPos, "FinishGoalUncertain");
         }
 
         private ManeuverCommand BuildFailSoftFromCurrent(Vector3 egoPos, float cap, string why)

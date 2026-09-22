@@ -125,7 +125,8 @@ namespace StreetRacing
             float egoHalfWidth,
             float cruise,
             int nowMs,
-            Vector3 finishTarget)
+            Vector3 finishTarget,
+            bool finishGoalMode = false)
         {
             long perfStart = Stopwatch.GetTimestamp();
             var result = new Result();
@@ -133,7 +134,8 @@ namespace StreetRacing
             HasChosen = false;
             planId++;
 
-            if (world == null || world.Road.Count == 0 || route == null || !route.Built)
+            if (world == null || route == null || !route.Built
+                || (!finishGoalMode && world.Road.Count == 0))
             {
                 result.Detail = "world-or-route-invalid";
                 return result;
@@ -173,16 +175,24 @@ namespace StreetRacing
                 : egoSpeed >= 8f ? 0.80f
                 : 0.60f;
 
-            BuildRouteGates(route, finishTarget);
+            routeGates.Clear();
+            DebugGateCenters.Clear();
+            if (!finishGoalMode)
+                BuildRouteGates(route, finishTarget);
+
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
-            Vector3 spatialGoal = routeGates.Count > 0
-                ? routeGates[routeGates.Count - 1].Center
-                : route.PointAtS(goalS);
+            Vector3 spatialGoal = finishGoalMode
+                ? finishTarget
+                : (routeGates.Count > 0
+                    ? routeGates[routeGates.Count - 1].Center
+                    : route.PointAtS(goalS));
             int rootSurface = world.LocateSurfaceComponent(egoPos, egoHeading);
 
             continuityActive = false;
             continuityBaseS = 0f;
-            if (!route.IsLost && committedPath.Count >= 3
+            if (!finishGoalMode
+                && !route.IsLost
+                && committedPath.Count >= 3
                 && committedStationS.Count == committedPath.Count)
             {
                 float continuityDist;
@@ -285,7 +295,7 @@ namespace StreetRacing
                 int leafIndex = beam[i];
                 var c = FinalizeCandidate(
                     leafIndex, world, physicalSurface, route, aLat, aBrake,
-                    cruise, egoSpeed, searchSpeed, i);
+                    cruise, egoSpeed, searchSpeed, i, finishGoalMode);
                 LastCandidates.Add(c);
             }
 
@@ -362,7 +372,9 @@ namespace StreetRacing
             float lateralEnd = RaceMath.FlatDot(delta, el);
 
             string intent;
-            if (chosen.ConstrainHandle != -1 && chosen.TargetSpeed < cruise - 1.0f)
+            if (finishGoalMode)
+                intent = "FinishGoal";
+            else if (chosen.ConstrainHandle != -1 && chosen.TargetSpeed < cruise - 1.0f)
                 intent = "Follow";
             else if (lateralEnd > 2.0f)
                 intent = "SpatialLeft";
@@ -379,7 +391,7 @@ namespace StreetRacing
             result.Desired = chosen.TargetSpeed;
             LastPoolCount = pool.Count;
             LastPlanMs = (float)((Stopwatch.GetTimestamp() - perfStart) * 1000.0 / Stopwatch.Frequency);
-            result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
+            result.Detail = $"mode={(finishGoalMode ? "finish" : "route")};intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
                 + $"motionK={motionRootCurvature:F3};kStep={motionCurvatureStep:F3};"
                 + $"commitW={continuityWeight:F2};commitActive={(continuityActive ? 1 : 0)};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
@@ -610,18 +622,22 @@ namespace StreetRacing
             float cruise,
             float egoSpeed,
             float searchSpeed,
-            int index)
+            int index,
+            bool finishGoalMode)
         {
             List<Vector3> path;
             List<float> headings;
             ReconstructPath(leafIndex, world, searchSpeed, aLat, out path, out headings);
 
             SearchNode leaf = pool[leafIndex];
-            int requiredGateProgress = Math.Min(2, routeGates.Count);
+            int requiredGateProgress = finishGoalMode
+                ? 0
+                : Math.Min(2, routeGates.Count);
             string routeReject = "";
-            if (leaf.GateMissed)
+            if (!finishGoalMode && leaf.GateMissed)
                 routeReject = "missed-route-gate";
-            else if (leaf.GateIndex < requiredGateProgress)
+            else if (!finishGoalMode
+                && leaf.GateIndex < requiredGateProgress)
                 routeReject = "insufficient-route-gate-progress";
 
             var c = new TrajectoryCandidate
