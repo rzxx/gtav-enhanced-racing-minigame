@@ -102,6 +102,11 @@ namespace StreetRacing.Race
         private int routeLostSinceMs = -1;
         private int referenceInvalidSinceMs = -1;
         private int plannerInvalidSinceMs = -1;
+        private int spatialUncertainSinceMs = -1;
+        private float spatialUncertainStartHeadErr;
+        private float spatialUncertainLastHeadErr;
+        private int lastLiveRerouteAttemptMs = -100000;
+        private int liveRerouteAttempts;
         private int recoveryEnteredMs = -1;
         private RecoveryPrimitive.Stage lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
         private int stallSinceMs = -1;
@@ -176,7 +181,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "physical-traversability-observer-v3";
+        private const string SpatialBuildTag = "physical-traversability-observer-v4";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -261,6 +266,11 @@ namespace StreetRacing.Race
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
             plannerInvalidSinceMs = -1;
+            spatialUncertainSinceMs = -1;
+            spatialUncertainStartHeadErr = 0f;
+            spatialUncertainLastHeadErr = 0f;
+            lastLiveRerouteAttemptMs = -100000;
+            liveRerouteAttempts = 0;
             recoveryEnteredMs = -1;
             lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
@@ -448,6 +458,11 @@ namespace StreetRacing.Race
             routeLostSinceMs = -1;
             referenceInvalidSinceMs = -1;
             plannerInvalidSinceMs = -1;
+            spatialUncertainSinceMs = -1;
+            spatialUncertainStartHeadErr = 0f;
+            spatialUncertainLastHeadErr = 0f;
+            lastLiveRerouteAttemptMs = -100000;
+            liveRerouteAttempts = 0;
             recoveryEnteredMs = -1;
             lastRecoveryStage = RecoveryPrimitive.Stage.Idle;
             stallSinceMs = -1;
@@ -1089,23 +1104,136 @@ namespace StreetRacing.Race
             {
                 int now = Game.GameTime;
                 string why = sp != null ? sp.Detail : "null";
+                float absHead = Math.Abs(route.HeadingErrorDeg);
+
                 if (plannerInvalidSinceMs < 0)
                 {
                     plannerInvalidSinceMs = now;
-                    try { telemetry?.Event(now - t0, "SPATIAL_PLAN_UNCERTAIN", why); } catch { }
+                    spatialUncertainSinceMs = now;
+                    spatialUncertainStartHeadErr = absHead;
+                    spatialUncertainLastHeadErr = absHead;
+
+                    // The incumbent just failed to produce a route-valid
+                    // continuation. Do not let that same committed path bias
+                    // the next search.
+                    try { spatialPlanner.Reset(); } catch { }
+                    hasCurrent = false;
+
+                    try
+                    {
+                        telemetry?.Event(now - t0, "SPATIAL_PLAN_UNCERTAIN",
+                            $"headErr={route.HeadingErrorDeg:F0};dist={route.DistToRoute:F1};{why}");
+                    }
+                    catch { }
                 }
-                // Spatial search uncertainty is not proof of blockage. Keep
-                // moving on the known smooth reference while the world model
-                // rebuilds; never resurrect LocalPlannerV2 rails here.
+
+                int uncertainAge = spatialUncertainSinceMs >= 0
+                    ? now - spatialUncertainSinceMs
+                    : 0;
+                bool headGrowing = absHead >= spatialUncertainStartHeadErr + 10f
+                    || absHead >= spatialUncertainLastHeadErr + 6f;
+                bool routeDiverging = route.IsLost
+                    || route.PlanInvalid
+                    || absHead >= 35f
+                    || (uncertainAge >= 350 && absHead >= 24f && headGrowing)
+                    || (uncertainAge >= 1200 && absHead >= 18f);
+                spatialUncertainLastHeadErr = absHead;
+
+                // Once the old topology is visibly diverging, acquire a fresh
+                // GPS route from the CURRENT rival pose. The route object
+                // validates the candidate before mutating itself.
+                bool shouldReroute = routeDiverging
+                    && (route.PlanInvalid || uncertainAge >= 350)
+                    && now - lastLiveRerouteAttemptMs >= 1200;
+                if (shouldReroute)
+                {
+                    lastLiveRerouteAttemptMs = now;
+                    liveRerouteAttempts++;
+
+                    string rebuildLog = "";
+                    bool rebuilt = false;
+                    try
+                    {
+                        rebuilt = route.TryRebuildFromCurrentGps(
+                            egoPos, lastEgoHeading, egoSpeed,
+                            now, corridor.HalfWidth, out rebuildLog);
+                    }
+                    catch (Exception ex)
+                    {
+                        try { rebuildLog = "exc:" + ex.Message; } catch { }
+                        rebuilt = false;
+                    }
+
+                    if (rebuilt)
+                    {
+                        try { corridor.Reset(); } catch { }
+                        try { corridor.Update(route, egoPos, LookaheadM, now); } catch { }
+                        try { drivingReference.Reset(); } catch { }
+                        try { localWorld.Reset(); } catch { }
+                        try { spatialPlanner.Reset(); } catch { }
+
+                        // PhysicalSurfaceMap is world-space evidence. Keep it
+                        // across a route rebuild; only its future sampling
+                        // scaffold changes on the next observer tick.
+                        plannerInvalidSinceMs = -1;
+                        referenceInvalidSinceMs = -1;
+                        spatialUncertainSinceMs = -1;
+                        spatialUncertainStartHeadErr = 0f;
+                        spatialUncertainLastHeadErr = 0f;
+                        hasCurrent = false;
+                        joined = true;
+                        joinState = "RouteRebuilt";
+
+                        try
+                        {
+                            telemetry?.Event(now - t0, "ROUTE_REBUILD",
+                                $"attempt={liveRerouteAttempts};{rebuildLog}");
+                        }
+                        catch { }
+
+                        // One control tick of braking gives the next planning
+                        // tick a clean chance to build from the new topology.
+                        return BuildPlannerStop(egoPos, "RouteRebuilt");
+                    }
+
+                    try
+                    {
+                        telemetry?.Event(now - t0, "ROUTE_REBUILD_FAIL",
+                            $"attempt={liveRerouteAttempts};age={uncertainAge};headErr={route.HeadingErrorDeg:F0};{rebuildLog}");
+                    }
+                    catch { }
+                }
+
+                // Brief uncertainty while still roughly aligned may crawl along
+                // the smooth reference. Once the heading is materially wrong,
+                // continuing that reference is exactly the failure mode we are
+                // trying to remove: stop and wait for a valid replan/reroute.
+                if (routeDiverging)
+                {
+                    joinState = "SpatialRerouteWait";
+                    hasCurrent = false;
+                    return BuildPlannerStop(
+                        egoPos,
+                        shouldReroute ? "ReroutePending" : "SpatialDiverging");
+                }
+
                 joinState = "SpatialUncertain";
                 var latsFallback = new List<float>(rr.Path.Count);
                 for (int i = 0; i < rr.Path.Count; i++) latsFallback.Add(0f);
-                return BuildCommandFromPath(rr.Path, rr.StationS, latsFallback,
-                    egoSpeed, dtPlan, Math.Min(cruise, 7f), "SpatialUncertain", egoPos);
+                float uncertainCap = uncertainAge < 300
+                    ? Math.Min(cruise, 5f)
+                    : Math.Min(cruise, 3.5f);
+                return BuildCommandFromPath(
+                    rr.Path, rr.StationS, latsFallback,
+                    egoSpeed, dtPlan, uncertainCap,
+                    "SpatialUncertain", egoPos);
             }
 
             plannerInvalidSinceMs = -1;
             referenceInvalidSinceMs = -1;
+            spatialUncertainSinceMs = -1;
+            spatialUncertainStartHeadErr = 0f;
+            spatialUncertainLastHeadErr = 0f;
             joinState = sp.Intent;
             return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
         }

@@ -106,6 +106,7 @@ namespace StreetRacing
         private int desiredCursor;
         private int lastDesiredRefreshMs = -100000;
         private int lastGroundBatchMs = -100000;
+        private int lastGroundSamples;
         private int lastObstacleRayMs = -100000;
         private int lastGraphMs = -100000;
         private int lastEvictMs = -100000;
@@ -131,8 +132,9 @@ namespace StreetRacing
         private const float SampleAheadM = 65f;
         private const float SampleHalfWidthM = 15f;
         private const int MaxDesiredCells = 260;
-        private const int GroundBatchIntervalMs = 75;
-        private const int GroundSamplesPerBatch = 3;
+        private const int GroundBatchIntervalMs = 50;
+        private const int GroundMaxSamplesPerBatch = 16;
+        private const double GroundBudgetMs = 0.55;
         private const int CellFreshMs = 7000;
         private const int ObstacleRayIntervalMs = 60;
         private const float ObstacleRayHeightM = 1.25f;
@@ -165,6 +167,7 @@ namespace StreetRacing
             desiredCursor = 0;
             lastDesiredRefreshMs = -100000;
             lastGroundBatchMs = -100000;
+            lastGroundSamples = 0;
             lastObstacleRayMs = -100000;
             lastGraphMs = -100000;
             lastEvictMs = -100000;
@@ -197,7 +200,7 @@ namespace StreetRacing
             if (nowMs - lastDesiredRefreshMs >= 350)
             {
                 lastDesiredRefreshMs = nowMs;
-                RebuildDesired(reference, route, egoPos, nowMs);
+                RebuildDesired(reference, route, egoPos, egoHeading, nowMs);
             }
 
             if (nowMs - lastGroundBatchMs >= GroundBatchIntervalMs)
@@ -240,12 +243,18 @@ namespace StreetRacing
             DrivingReference.Result reference,
             RaceRoute route,
             Vector3 egoPos,
+            float egoHeading,
             int nowMs)
         {
             desired.Clear();
             desiredKeys.Clear();
 
-            // Small local disk, independent of road semantics.
+            Vector3 egoFwd = RaceMath.FlatNormalize(
+                RaceMath.VectorFromHeading(egoHeading));
+            Vector3 egoLeft = new Vector3(-egoFwd.Y, egoFwd.X, 0f);
+
+            // Small local disk, independent of road semantics. Keep immediate
+            // surroundings first so the reachable component can seed quickly.
             int halo = (int)Math.Ceiling(NearFieldRadiusM / GridM);
             for (int dx = -halo; dx <= halo; dx++)
             {
@@ -260,9 +269,10 @@ namespace StreetRacing
                         egoPos.X + mx,
                         egoPos.Y + my,
                         egoPos.Z);
+                    float d = RaceMath.FlatDistance(egoPos, p);
                     AddDesired(
                         p, egoPos.Z,
-                        RaceMath.FlatDistance(egoPos, p),
+                        d * 0.25f,
                         nowMs);
                 }
             }
@@ -290,10 +300,18 @@ namespace StreetRacing
                             center.X + left.X * lat,
                             center.Y + left.Y * lat,
                             center.Z);
-                        AddDesired(
-                            p, center.Z,
-                            RaceMath.FlatDistance(egoPos, p),
-                            nowMs);
+                        Vector3 rel = new Vector3(
+                            p.X - egoPos.X,
+                            p.Y - egoPos.Y, 0f);
+                        float along = RaceMath.FlatDot(rel, egoFwd);
+                        float lateral = Math.Abs(RaceMath.FlatDot(rel, egoLeft));
+                        // Unsampled space in front of the car is the valuable
+                        // part of the map. Rear/side cells remain eligible, but
+                        // ahead-center cells are filled first.
+                        float priority = along >= -3f
+                            ? Math.Max(0f, along) * 0.18f + lateral * 0.30f
+                            : 50f + Math.Abs(along);
+                        AddDesired(p, center.Z, priority, nowMs);
                     }
                 }
             }
@@ -315,18 +333,39 @@ namespace StreetRacing
                             center.X + left.X * lat,
                             center.Y + left.Y * lat,
                             center.Z);
-                        AddDesired(
-                            p, center.Z,
-                            RaceMath.FlatDistance(egoPos, p),
-                            nowMs);
+                        Vector3 rel = new Vector3(
+                            p.X - egoPos.X,
+                            p.Y - egoPos.Y, 0f);
+                        float along = RaceMath.FlatDot(rel, egoFwd);
+                        float lateral = Math.Abs(RaceMath.FlatDot(rel, egoLeft));
+                        float priority = along >= -3f
+                            ? Math.Max(0f, along) * 0.18f + lateral * 0.30f
+                            : 50f + Math.Abs(along);
+                        AddDesired(p, center.Z, priority, nowMs);
                     }
                 }
             }
 
-            desired.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+            desired.Sort((a, b) =>
+            {
+                Cell ca;
+                Cell cb;
+                bool aKnown = cells.TryGetValue(a.Key, out ca)
+                    && ca.State != SurfaceState.Unknown
+                    && nowMs - ca.LastSampleMs < CellFreshMs;
+                bool bKnown = cells.TryGetValue(b.Key, out cb)
+                    && cb.State != SurfaceState.Unknown
+                    && nowMs - cb.LastSampleMs < CellFreshMs;
+                if (aKnown != bKnown) return aKnown ? 1 : -1;
+                return a.Priority.CompareTo(b.Priority);
+            });
             if (desired.Count > MaxDesiredCells)
                 desired.RemoveRange(MaxDesiredCells, desired.Count - MaxDesiredCells);
-            if (desiredCursor >= desired.Count) desiredCursor = 0;
+
+            // The list is freshly priority-sorted. Start at its front so new
+            // unknown cells directly ahead are sampled before stale side/rear
+            // work left over from the previous scaffold.
+            desiredCursor = 0;
         }
 
         private void AddDesired(
@@ -377,13 +416,20 @@ namespace StreetRacing
 
         private void SampleGround(int nowMs)
         {
+            lastGroundSamples = 0;
             if (desired.Count == 0) return;
 
-            int sampled = 0;
+            long perfStart = Stopwatch.GetTimestamp();
             int scanned = 0;
-            while (sampled < GroundSamplesPerBatch
+
+            while (lastGroundSamples < GroundMaxSamplesPerBatch
                 && scanned < desired.Count)
             {
+                double elapsedMs = (Stopwatch.GetTimestamp() - perfStart)
+                    * 1000.0 / Stopwatch.Frequency;
+                if (lastGroundSamples > 0 && elapsedMs >= GroundBudgetMs)
+                    break;
+
                 if (desiredCursor >= desired.Count) desiredCursor = 0;
                 ProbeRequest req = desired[desiredCursor++];
                 scanned++;
@@ -408,7 +454,7 @@ namespace StreetRacing
                 catch { found = false; }
 
                 cell.LastSampleMs = nowMs;
-                sampled++;
+                lastGroundSamples++;
 
                 if (!found)
                 {
@@ -423,8 +469,6 @@ namespace StreetRacing
                 float dzLayer = Math.Abs(groundZ - req.HintZ);
                 if (dzLayer > LayerAcceptanceM)
                 {
-                    // Most importantly: do not collapse an overpass onto the
-                    // terrain/road several metres below it.
                     groundLayerReject++;
                     cell.State = SurfaceState.NoSurface;
                     cell.Reachable = false;
@@ -831,7 +875,7 @@ namespace StreetRacing
                 + $"trav={traversable};reach={reachable};"
                 + $"reachOffRoad={reachableOffRoad};components={components};"
                 + $"staticBlocked={staticBlocked};noSurface={noSurface};"
-                + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};"
+                + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};gBatch={lastGroundSamples};"
                 + $"obsRays={obstacleRays};obsHits={obstacleHits};"
                 + $"obsWait={obstacleNotReady};obsFail={obstacleFailed};"
                 + $"maxClear={maxClear:F1};"
