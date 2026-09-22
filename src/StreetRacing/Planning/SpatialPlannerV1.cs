@@ -256,7 +256,7 @@ namespace StreetRacing
 
                         SearchNode child = Expand(
                             parent, parentIndex, curvature, searchSpeed,
-                            world, spatialGoal, aLat, layer);
+                            world, physicalSurface, spatialGoal, aLat, layer);
                         int childIndex = pool.Count;
                         pool.Add(child);
                         expanded.Add(childIndex);
@@ -284,7 +284,7 @@ namespace StreetRacing
             {
                 int leafIndex = beam[i];
                 var c = FinalizeCandidate(
-                    leafIndex, world, route, aLat, aBrake,
+                    leafIndex, world, physicalSurface, route, aLat, aBrake,
                     cruise, egoSpeed, searchSpeed, i);
                 LastCandidates.Add(c);
             }
@@ -423,6 +423,7 @@ namespace StreetRacing
             float curvature,
             float searchSpeed,
             LocalWorldModel world,
+            PhysicalSurfaceMap physicalSurface,
             Vector3 spatialGoal,
             float aLat,
             int layer)
@@ -501,7 +502,32 @@ namespace StreetRacing
                 ApplyGateProgress(ref n, prevPos, n.Pos);
                 var pc = world.EvaluatePose(
                     n.Pos, n.HeadingDeg, n.TimeS, n.SurfaceComponentId);
-                n.Cost += pc.SurfaceCost * ds * 0.42f;
+
+                float surfaceCost = pc.SurfaceCost;
+                if (physicalSurface != null)
+                {
+                    PhysicalSurfaceMap.PointQuery pq;
+                    if (physicalSurface.TryQueryPoint(n.Pos, out pq))
+                    {
+                        if (pq.StaticObstacle)
+                        {
+                            // Sampled static obstacle is positive evidence too:
+                            // make this branch extremely unattractive before the
+                            // exact final sweep gets a chance to veto it.
+                            surfaceCost += 45f;
+                            n.Cost += 120f;
+                        }
+                        else if (pq.Reachable)
+                        {
+                            // Connected physical ground overrides the legacy
+                            // model's "unknown/narrow road support" penalty, but
+                            // does NOT erase flow direction or actor costs.
+                            surfaceCost = Math.Min(surfaceCost, 0.35f);
+                        }
+                    }
+                }
+
+                n.Cost += surfaceCost * ds * 0.42f;
                 n.Cost += pc.FlowCost * ds * 0.95f;
                 n.Cost += pc.ActorCost * 0.12f;
                 if (pc.HardCollision)
@@ -572,6 +598,7 @@ namespace StreetRacing
         private TrajectoryCandidate FinalizeCandidate(
             int leafIndex,
             LocalWorldModel world,
+            PhysicalSurfaceMap physicalSurface,
             RaceRoute route,
             float aLat,
             float aBrake,
@@ -650,7 +677,27 @@ namespace StreetRacing
                 if (pc.ClearanceM < minClear)
                     minClear = pc.ClearanceM;
                 if (pc.OpposingSide) opposingSamples++;
-                if (!pc.OnRoad) unknownSamples++;
+
+                bool physicallyKnownFree = false;
+                if (physicalSurface != null)
+                {
+                    PhysicalSurfaceMap.PointQuery pq;
+                    if (physicalSurface.TryQueryPoint(c.Path[i], out pq))
+                    {
+                        if (pq.StaticObstacle && c.StationS[i] >= 1.5f
+                            && string.IsNullOrEmpty(c.RejectReason))
+                        {
+                            c.RejectReason = "physical-map-static";
+                        }
+                        physicallyKnownFree = pq.Reachable
+                            && !pq.StaticObstacle;
+                    }
+                }
+
+                // Unknown means neither the legacy road supports NOR the
+                // connected physical map can explain this sample.
+                if (!pc.OnRoad && !physicallyKnownFree)
+                    unknownSamples++;
                 flowCostSum += pc.FlowCost;
 
                 // Every trajectory shares station zero. Proximity at the
