@@ -1208,7 +1208,7 @@ namespace StreetRacing.Race
                 // the smooth reference. Once the heading is materially wrong,
                 // continuing that reference is exactly the failure mode we are
                 // trying to remove: stop and wait for a valid replan/reroute.
-                if (routeDiverging || uncertainAge >= 1200)
+                if (routeDiverging)
                 {
                     joinState = "SpatialRerouteWait";
                     hasCurrent = false;
