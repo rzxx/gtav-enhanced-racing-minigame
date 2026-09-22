@@ -1132,9 +1132,11 @@ namespace StreetRacing.Race
                     : 0;
                 bool headGrowing = absHead >= spatialUncertainStartHeadErr + 10f
                     || absHead >= spatialUncertainLastHeadErr + 6f;
-                bool routeDiverging = route.PlanInvalid
+                bool routeDiverging = route.IsLost
+                    || route.PlanInvalid
                     || absHead >= 35f
-                    || (uncertainAge >= 350 && absHead >= 24f && headGrowing);
+                    || (uncertainAge >= 350 && absHead >= 24f && headGrowing)
+                    || (uncertainAge >= 1200 && absHead >= 18f);
                 spatialUncertainLastHeadErr = absHead;
 
                 // Once the old topology is visibly diverging, acquire a fresh
@@ -1169,8 +1171,10 @@ namespace StreetRacing.Race
                         try { drivingReference.Reset(); } catch { }
                         try { localWorld.Reset(); } catch { }
                         try { spatialPlanner.Reset(); } catch { }
-                        try { physicalSurface.Reset(); } catch { }
 
+                        // PhysicalSurfaceMap is world-space evidence. Keep it
+                        // across a route rebuild; only its future sampling
+                        // scaffold changes on the next observer tick.
                         plannerInvalidSinceMs = -1;
                         referenceInvalidSinceMs = -1;
                         spatialUncertainSinceMs = -1;
