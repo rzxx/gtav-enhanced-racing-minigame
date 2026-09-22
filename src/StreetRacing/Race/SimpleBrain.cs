@@ -176,7 +176,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "physical-traversability-observer-v1";
+        private const string SpatialBuildTag = "physical-traversability-observer-v2";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,

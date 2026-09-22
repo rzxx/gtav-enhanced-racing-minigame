@@ -252,14 +252,16 @@ namespace StreetRacing.Debug
                 {
                     var cell = world.DebugCells[i];
                     System.Drawing.Color col;
+                    // Legacy inferred-road grid stays deliberately blue/gray.
+                    // Green/cyan are reserved for the physical observer below.
                     if (cell.Occupied)
                         col = System.Drawing.Color.FromArgb(210, 255, 20, 20);
                     else if (cell.OnRoad && cell.FlowCost > 0.75f)
-                        col = System.Drawing.Color.FromArgb(150, 255, 120, 20);
+                        col = System.Drawing.Color.FromArgb(125, 150, 100, 255);
                     else if (cell.OnRoad)
-                        col = System.Drawing.Color.FromArgb(115, 40, 220, 100);
+                        col = System.Drawing.Color.FromArgb(90, 70, 140, 255);
                     else
-                        col = System.Drawing.Color.FromArgb(80, 150, 150, 150);
+                        col = System.Drawing.Color.FromArgb(55, 125, 125, 135);
 
                     Vector3 a = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.2f);
                     Vector3 b = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.7f);

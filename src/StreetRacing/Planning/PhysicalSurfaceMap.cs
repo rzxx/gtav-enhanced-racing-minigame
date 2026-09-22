@@ -125,14 +125,14 @@ namespace StreetRacing
 
         private struct PendingGround
         {
-            public int Handle;
+            public ShapeTestHandle Handle;
             public CellKey Key;
             public int StartedMs;
         }
 
         private struct PendingEdge
         {
-            public int Handle;
+            public ShapeTestHandle Handle;
             public EdgeKey Key;
             public int StartedMs;
         }
@@ -178,10 +178,20 @@ namespace StreetRacing
         private const int CellFreshMs = 12000;
         private const int EdgeFreshMs = 15000;
 
-        // World collision + object collision. Vehicles/peds are deliberately
-        // excluded: dynamic actors belong to Perception, not the static map.
-        private const int StaticTraceFlags = 1 | 16;
-        private const int ShapeOptionFlags = 7;
+        // Ground sampling should discover the actual terrain/road surface,
+        // not the tops of props. Obstacles use map + props + foliage; vehicles
+        // and peds remain in the dynamic Perception layer.
+        private static readonly IntersectFlags GroundIntersectFlags =
+            IntersectFlags.Map;
+        private static readonly IntersectFlags ObstacleIntersectFlags =
+            IntersectFlags.Map | IntersectFlags.Objects | IntersectFlags.Foliage;
+
+        private int groundStartFailed;
+        private int groundReady;
+        private int groundNonExistent;
+        private int edgeStartFailed;
+        private int edgeReady;
+        private int edgeNonExistent;
 
         private static readonly int[] DirX = { 1, -1, 0, 0 };
         private static readonly int[] DirY = { 0, 0, 1, -1 };
@@ -201,6 +211,12 @@ namespace StreetRacing
             lastGraphMs = -100000;
             lastEvictMs = -100000;
             graphDirty = true;
+            groundStartFailed = 0;
+            groundReady = 0;
+            groundNonExistent = 0;
+            edgeStartFailed = 0;
+            edgeReady = 0;
+            edgeNonExistent = 0;
             Detail = "";
         }
 
@@ -390,23 +406,20 @@ namespace StreetRacing
                 Vector3 end = new Vector3(
                     req.Position.X, req.Position.Y, req.HintZ - GroundProbeDownM);
 
-                int ignore = 0;
-                try { if (egoVehicle != null && egoVehicle.Exists()) ignore = egoVehicle.Handle; }
-                catch { ignore = 0; }
-
-                int handle = 0;
+                ShapeTestHandle handle = default(ShapeTestHandle);
                 try
                 {
-                    handle = Function.Call<int>(
-                        Hash.START_SHAPE_TEST_LOS_PROBE,
-                        start.X, start.Y, start.Z,
-                        end.X, end.Y, end.Z,
-                        StaticTraceFlags, ignore, ShapeOptionFlags);
+                    handle = ShapeTest.StartTestLOSProbe(
+                        start, end,
+                        GroundIntersectFlags,
+                        egoVehicle != null && egoVehicle.Exists() ? egoVehicle : null,
+                        ShapeTestOptions.Default);
                 }
-                catch { handle = 0; }
+                catch { }
 
-                if (handle == 0)
+                if (handle.IsRequestFailed)
                 {
+                    groundStartFailed++;
                     cell.LastSampleMs = nowMs;
                     continue;
                 }
@@ -443,44 +456,26 @@ namespace StreetRacing
                     continue;
                 }
 
-                int status = 0;
-                bool hit = false;
-                Vector3 hitPos = cell.SamplePosition;
-                Vector3 normal = new Vector3(0f, 0f, 1f);
+                ShapeTestStatus status = ShapeTestStatus.NonExistent;
+                ShapeTestResult shapeResult = default(ShapeTestResult);
+                try { status = p.Handle.GetResult(out shapeResult); }
+                catch { status = ShapeTestStatus.NonExistent; }
 
-                using (var hitArg = new OutputArgument())
-                using (var endArg = new OutputArgument())
-                using (var normalArg = new OutputArgument())
-                using (var entityArg = new OutputArgument())
-                {
-                    try
-                    {
-                        status = Function.Call<int>(
-                            Hash.GET_SHAPE_TEST_RESULT,
-                            p.Handle, hitArg, endArg, normalArg, entityArg);
-                        if (status == 2)
-                        {
-                            hit = hitArg.GetResult<bool>();
-                            hitPos = endArg.GetResult<Vector3>();
-                            normal = normalArg.GetResult<Vector3>();
-                        }
-                    }
-                    catch { status = 0; hit = false; }
-                }
-
-                if (status == 1) continue;
+                if (status == ShapeTestStatus.NotReady) continue;
 
                 cell.GroundPending = false;
                 cell.LastSampleMs = nowMs;
                 pendingGround.RemoveAt(i);
 
-                if (status != 2)
+                if (status != ShapeTestStatus.Ready)
                 {
+                    groundNonExistent++;
                     cell.State = SurfaceState.Unknown;
                     continue;
                 }
 
-                if (!hit)
+                groundReady++;
+                if (!shapeResult.DidHit)
                 {
                     cell.State = SurfaceState.NoSurface;
                     cell.RoadSemantic = false;
@@ -491,6 +486,8 @@ namespace StreetRacing
                     continue;
                 }
 
+                Vector3 hitPos = shapeResult.HitPosition;
+                Vector3 normal = shapeResult.SurfaceNormal;
                 cell.Position = hitPos;
                 cell.Normal = normal;
                 cell.State = normal.Z >= TraversableNormalZ
@@ -560,23 +557,22 @@ namespace StreetRacing
                         b.Position.X, b.Position.Y,
                         b.Position.Z + EdgeCapsuleHeightM);
 
-                    int ignore = 0;
-                    try { if (egoVehicle != null && egoVehicle.Exists()) ignore = egoVehicle.Handle; }
-                    catch { ignore = 0; }
-
-                    int handle = 0;
+                    ShapeTestHandle handle = default(ShapeTestHandle);
                     try
                     {
-                        handle = Function.Call<int>(
-                            Hash.START_SHAPE_TEST_CAPSULE,
-                            start.X, start.Y, start.Z,
-                            end.X, end.Y, end.Z,
-                            EdgeCapsuleRadiusM,
-                            StaticTraceFlags, ignore, ShapeOptionFlags);
+                        handle = ShapeTest.StartTestCapsule(
+                            start, end, EdgeCapsuleRadiusM,
+                            ObstacleIntersectFlags,
+                            egoVehicle != null && egoVehicle.Exists() ? egoVehicle : null,
+                            ShapeTestOptions.Default);
                     }
-                    catch { handle = 0; }
+                    catch { }
 
-                    if (handle == 0) continue;
+                    if (handle.IsRequestFailed)
+                    {
+                        edgeStartFailed++;
+                        continue;
+                    }
 
                     edge.Pending = true;
                     pendingEdge.Add(new PendingEdge
@@ -610,37 +606,26 @@ namespace StreetRacing
                     continue;
                 }
 
-                int status = 0;
-                bool hit = true;
-                using (var hitArg = new OutputArgument())
-                using (var endArg = new OutputArgument())
-                using (var normalArg = new OutputArgument())
-                using (var entityArg = new OutputArgument())
-                {
-                    try
-                    {
-                        status = Function.Call<int>(
-                            Hash.GET_SHAPE_TEST_RESULT,
-                            p.Handle, hitArg, endArg, normalArg, entityArg);
-                        if (status == 2)
-                            hit = hitArg.GetResult<bool>();
-                    }
-                    catch { status = 0; hit = true; }
-                }
+                ShapeTestStatus status = ShapeTestStatus.NonExistent;
+                ShapeTestResult shapeResult = default(ShapeTestResult);
+                try { status = p.Handle.GetResult(out shapeResult); }
+                catch { status = ShapeTestStatus.NonExistent; }
 
-                if (status == 1) continue;
+                if (status == ShapeTestStatus.NotReady) continue;
 
                 edge.Pending = false;
                 pendingEdge.RemoveAt(i);
 
-                if (status != 2)
+                if (status != ShapeTestStatus.Ready)
                 {
+                    edgeNonExistent++;
                     edge.Known = false;
                     continue;
                 }
 
+                edgeReady++;
                 edge.Known = true;
-                edge.Open = !hit;
+                edge.Open = !shapeResult.DidHit;
                 edge.LastSampleMs = nowMs;
                 graphDirty = true;
             }
@@ -909,6 +894,8 @@ namespace StreetRacing
                 + $"openEdges={openEdges};blockedEdges={blockedEdges};"
                 + $"noSurface={noSurface};steep={tooSteep};"
                 + $"pendingG={pendingGround.Count};pendingE={pendingEdge.Count};"
+                + $"gReady={groundReady};gGone={groundNonExistent};gFail={groundStartFailed};"
+                + $"eReady={edgeReady};eGone={edgeNonExistent};eFail={edgeStartFailed};"
                 + $"maxClear={maxClear:F1}";
         }
 
