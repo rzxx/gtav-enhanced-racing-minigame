@@ -1332,12 +1332,29 @@ namespace StreetRacing
             return neighbor != null;
         }
 
-        private static bool ConnectionOpen(Cell a, Cell b)
+        private bool ConnectionOpen(Cell a, Cell b)
         {
             if (a == null || b == null) return false;
             if (!a.Traversable || !b.Traversable) return false;
-            return Math.Abs(a.Position.Z - b.Position.Z)
-                <= MaxNeighborStepM;
+            if (Math.Abs(a.Position.Z - b.Position.Z) > MaxNeighborStepM)
+                return false;
+
+            Vector3 mid = new Vector3(
+                (a.Position.X + b.Position.X) * 0.5f,
+                (a.Position.Y + b.Position.Y) * 0.5f,
+                (a.Position.Z + b.Position.Z) * 0.5f);
+
+            // Far future is intentionally coarse. Near/mid connectivity must
+            // have an explicit physical edge result.
+            if (RaceMath.FlatDistance(mid, lastEgoPos) > midM + GridM)
+                return true;
+
+            EdgeInfo info;
+            return edges.TryGetValue(
+                    MakeEdgeKey(a.Key, b.Key), out info)
+                && info.Known
+                && info.Open
+                && lastNowMs - info.LastVerifiedMs < EdgeFreshMs;
         }
 
         private Cell FindNearestReachableCell(
@@ -1472,7 +1489,20 @@ namespace StreetRacing
             for (int i = 0; i < remove.Count; i++)
                 cells.Remove(remove[i]);
 
-            if (remove.Count > 0) graphDirty = true;
+            if (remove.Count > 0)
+            {
+                var removeEdges = new List<EdgeKey>();
+                foreach (EdgeKey key in edges.Keys)
+                {
+                    if (!cells.ContainsKey(key.A)
+                        || !cells.ContainsKey(key.B))
+                        removeEdges.Add(key);
+                }
+                for (int i = 0; i < removeEdges.Count; i++)
+                    edges.Remove(removeEdges[i]);
+
+                graphDirty = true;
+            }
         }
 
         private void UpdateDetail()
@@ -1515,6 +1545,8 @@ namespace StreetRacing
                 + $"staticBlocked={staticBlocked};noSurface={noSurface};"
                 + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};"
                 + $"gBatch={lastGroundSamples};expanded={frontierExpanded};"
+                + $"edgeChecks={edgeChecks};edgeBlocks={edgeBlocks};"
+                + $"edgeBudget={edgeBudgetStops};edgeMs={lastEdgeMs:F2};edgePeak={peakEdgeMs:F2};"
                 + $"obsRays={obstacleRays};obsHits={obstacleHits};"
                 + $"obsWait={obstacleNotReady};obsFail={obstacleFailed};"
                 + $"sweeps={trajectorySweeps};sweepHits={trajectorySweepHits};"
@@ -1522,6 +1554,24 @@ namespace StreetRacing
                 + $"sweepMs={lastSweepMs:F2};sweepPeak={peakSweepMs:F2};"
                 + $"maxClear={maxClear:F1};"
                 + $"tickMs={lastTickMs:F2};peakMs={peakTickMs:F2}";
+        }
+
+        private static EdgeKey MakeEdgeKey(
+            CellKey a,
+            CellKey b)
+        {
+            if (CompareKey(a, b) <= 0)
+                return new EdgeKey { A = a, B = b };
+            return new EdgeKey { A = b, B = a };
+        }
+
+        private static int CompareKey(
+            CellKey a,
+            CellKey b)
+        {
+            if (a.X != b.X) return a.X.CompareTo(b.X);
+            if (a.Y != b.Y) return a.Y.CompareTo(b.Y);
+            return a.Layer.CompareTo(b.Layer);
         }
 
         private static CellKey KeyFor(
