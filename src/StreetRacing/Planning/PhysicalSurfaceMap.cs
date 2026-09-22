@@ -7,12 +7,15 @@ using GTA.Native;
 
 namespace StreetRacing
 {
-    /// Debug-only physical traversability observer.
+    /// Persistent, ego-connected physical free-space observer.
     ///
-    /// V3 deliberately avoids long-lived asynchronous shape tests. Ground
-    /// geometry comes from GTA's direct ground-height query under a strict
-    /// local Z-layer gate. Static obstacles are sampled sparsely with a small
-    /// synchronous LOS fan. SpatialPlannerV1 does NOT consume this map yet.
+    /// The map grows OUTWARD from the currently reachable surface instead of
+    /// sampling arbitrary road-aligned points. Speed changes the time horizon:
+    /// near space is wide/dense, mid-field is narrower, and far-field follows
+    /// the momentum/route tube. GTA road classification is annotation only.
+    ///
+    /// SpatialPlannerV1 still owns trajectory generation, but its final choices
+    /// can be physically vetoed by a small, budgeted map/object/foliage sweep.
     internal sealed class PhysicalSurfaceMap
     {
         internal enum SurfaceState
@@ -37,7 +40,8 @@ namespace StreetRacing
             public int LastSampleMs;
             public int LastObstacleMs;
 
-            public bool Traversable => State == SurfaceState.Traversable && !StaticObstacle;
+            public bool Traversable =>
+                State == SurfaceState.Traversable && !StaticObstacle;
         }
 
         internal struct DebugEdge
@@ -51,6 +55,18 @@ namespace StreetRacing
         {
             public Vector3 Position;
             public Vector3 Normal;
+        }
+
+        internal struct TrajectoryCheck
+        {
+            public bool Available;
+            public bool Blocked;
+            public bool BudgetExhausted;
+            public float BlockedS;
+            public Vector3 HitPosition;
+            public int Rays;
+            public float Ms;
+            public string Detail;
         }
 
         internal struct CellKey : IEquatable<CellKey>
@@ -81,30 +97,39 @@ namespace StreetRacing
             }
         }
 
-        private struct ProbeRequest
+        private struct FrontierRequest
         {
             public CellKey Key;
             public Vector3 Position;
             public float HintZ;
             public float Priority;
+            public CellKey ParentKey;
+            public bool HasParent;
         }
 
-        public readonly List<Cell> DebugCells = new List<Cell>(260);
+        public readonly List<Cell> DebugCells = new List<Cell>(220);
         public readonly List<DebugEdge> DebugEdges = new List<DebugEdge>(80);
-        public readonly List<DebugObstacle> DebugObstacles = new List<DebugObstacle>(20);
+        public readonly List<DebugObstacle> DebugObstacles = new List<DebugObstacle>(24);
         public string Detail { get; private set; } = "";
 
         private readonly Dictionary<CellKey, Cell> cells =
             new Dictionary<CellKey, Cell>();
-        private readonly List<ProbeRequest> desired =
-            new List<ProbeRequest>(300);
-        private readonly HashSet<CellKey> desiredKeys =
+        private readonly List<FrontierRequest> frontier =
+            new List<FrontierRequest>(420);
+        private readonly HashSet<CellKey> frontierKeys =
             new HashSet<CellKey>();
-        private readonly Queue<Cell> flood = new Queue<Cell>(320);
-        private readonly Queue<Cell> distanceFlood = new Queue<Cell>(320);
+        private readonly List<Vector3> guidePoints =
+            new List<Vector3>(32);
+        private readonly Queue<Cell> flood = new Queue<Cell>(420);
+        private readonly Queue<Cell> distanceFlood = new Queue<Cell>(420);
 
-        private int desiredCursor;
-        private int lastDesiredRefreshMs = -100000;
+        private Vehicle lastEgoVehicle;
+        private Vector3 lastEgoPos;
+        private float lastEgoHeading;
+        private float lastEgoSpeed;
+        private int lastNowMs;
+
+        private int lastFrontierRefreshMs = -100000;
         private int lastGroundBatchMs = -100000;
         private int lastGroundSamples;
         private int lastObstacleRayMs = -100000;
@@ -114,58 +139,91 @@ namespace StreetRacing
         private bool graphDirty = true;
         private int obstacleRayCursor;
 
+        private float horizonM;
+        private float nearM;
+        private float midM;
+        private int activeReachable;
+        private int activeComponents;
+
         private int groundOk;
         private int groundMiss;
         private int groundLayerReject;
+        private int frontierExpanded;
         private int obstacleRays;
         private int obstacleHits;
         private int obstacleNotReady;
         private int obstacleFailed;
+        private int trajectorySweeps;
+        private int trajectorySweepHits;
+        private int trajectorySweepBudgetStops;
+        private float lastSweepMs;
+        private float peakSweepMs;
         private float lastTickMs;
         private float peakTickMs;
 
         private const float GridM = 3.0f;
         private const float LayerBucketM = 4.0f;
-        private const float LayerAcceptanceM = 2.8f;
-        private const float MaxNeighborStepM = 0.95f;
-        private const float NearFieldRadiusM = 15f;
-        private const float SampleAheadM = 65f;
-        private const float SampleHalfWidthM = 15f;
-        private const int MaxDesiredCells = 260;
-        private const int GroundBatchIntervalMs = 50;
-        private const int GroundMaxSamplesPerBatch = 16;
-        private const double GroundBudgetMs = 0.55;
-        private const int CellFreshMs = 7000;
-        private const int ObstacleRayIntervalMs = 60;
-        private const float ObstacleRayHeightM = 1.25f;
-        private const float ObstacleRayRangeM = 30f;
-        private const int ObstaclePersistenceMs = 2500;
+        private const float LayerAcceptanceM = 3.0f;
+        private const float MaxNeighborStepM = 1.35f;
+        private const float BackKeepM = 10f;
 
-        private static readonly int[] DirX = { 1, -1, 0, 0 };
-        private static readonly int[] DirY = { 0, 0, 1, -1 };
+        private const float FutureTimeS = 4.0f;
+        private const float MinHorizonM = 28f;
+        private const float MaxHorizonM = 100f;
+        private const float NearTimeS = 1.0f;
+        private const float MidTimeS = 2.2f;
+        private const float NearHalfWidthM = 18f;
+        private const float MidHalfWidthM = 14f;
+        private const float FarHalfWidthM = 9f;
+
+        private const int FrontierRefreshMs = 180;
+        private const int GroundBatchIntervalMs = 45;
+        private const int GroundMaxSamplesPerBatch = 18;
+        private const double GroundBudgetMs = 0.60;
+        private const int CellFreshMs = 6500;
+
+        private const int ObstacleRayIntervalMs = 100;
+        private const float ObstacleRayHeightM = 1.15f;
+        private const float ObstacleRayRangeM = 32f;
+        private const int ObstaclePersistenceMs = 3000;
+
+        private const int TrajectorySweepMaxRays = 8;
+        private const double TrajectorySweepBudgetMs = 0.80;
+        private const float TrajectorySweepHeightM = 0.85f;
+        private const float TrajectorySweepDistanceM = 42f;
+
+        private static readonly int[] DirX =
+            { 1, -1, 0, 0, 1, 1, -1, -1 };
+        private static readonly int[] DirY =
+            { 0, 0, 1, -1, 1, -1, 1, -1 };
 
         private static readonly float[] ObstacleAnglesDeg =
         {
-            -90f, -72f, -54f, -36f, -18f,
-             0f,   18f,  36f,  54f,  72f, 90f
+            -70f, -45f, -25f, -10f, 0f, 10f, 25f, 45f, 70f
         };
 
-        private static readonly IntersectFlags ObstacleIntersectFlags =
+        private static readonly IntersectFlags StaticIntersectFlags =
             IntersectFlags.Map | IntersectFlags.Objects | IntersectFlags.Foliage;
 
         public void Reset()
         {
             cells.Clear();
-            desired.Clear();
-            desiredKeys.Clear();
+            frontier.Clear();
+            frontierKeys.Clear();
+            guidePoints.Clear();
             flood.Clear();
             distanceFlood.Clear();
             DebugCells.Clear();
             DebugEdges.Clear();
             DebugObstacles.Clear();
 
-            desiredCursor = 0;
-            lastDesiredRefreshMs = -100000;
+            lastEgoVehicle = null;
+            lastEgoPos = Vector3.Zero;
+            lastEgoHeading = 0f;
+            lastEgoSpeed = 0f;
+            lastNowMs = 0;
+
+            lastFrontierRefreshMs = -100000;
             lastGroundBatchMs = -100000;
             lastGroundSamples = 0;
             lastObstacleRayMs = -100000;
@@ -175,13 +233,25 @@ namespace StreetRacing
             graphDirty = true;
             obstacleRayCursor = 0;
 
+            horizonM = MinHorizonM;
+            nearM = 12f;
+            midM = 22f;
+            activeReachable = 0;
+            activeComponents = 0;
+
             groundOk = 0;
             groundMiss = 0;
             groundLayerReject = 0;
+            frontierExpanded = 0;
             obstacleRays = 0;
             obstacleHits = 0;
             obstacleNotReady = 0;
             obstacleFailed = 0;
+            trajectorySweeps = 0;
+            trajectorySweepHits = 0;
+            trajectorySweepBudgetStops = 0;
+            lastSweepMs = 0f;
+            peakSweepMs = 0f;
             lastTickMs = 0f;
             peakTickMs = 0f;
             Detail = "";
@@ -193,204 +263,367 @@ namespace StreetRacing
             RaceRoute route,
             Vector3 egoPos,
             float egoHeading,
+            float egoSpeed,
             int nowMs)
         {
             long perfStart = Stopwatch.GetTimestamp();
 
-            if (nowMs - lastDesiredRefreshMs >= 350)
+            lastEgoVehicle = egoVehicle;
+            lastEgoPos = egoPos;
+            lastEgoHeading = egoHeading;
+            lastEgoSpeed = Math.Max(0f, egoSpeed);
+            lastNowMs = nowMs;
+
+            horizonM = RaceMath.Clamp(
+                12f + Math.Max(lastEgoSpeed, 4f) * FutureTimeS,
+                MinHorizonM, MaxHorizonM);
+            nearM = RaceMath.Clamp(
+                8f + Math.Max(lastEgoSpeed, 4f) * NearTimeS,
+                12f, 30f);
+            midM = RaceMath.Clamp(
+                10f + Math.Max(lastEgoSpeed, 4f) * MidTimeS,
+                nearM + 6f, Math.Min(horizonM, 65f));
+
+            BuildGuide(reference, route);
+
+            if (nowMs - lastFrontierRefreshMs >= FrontierRefreshMs)
             {
-                lastDesiredRefreshMs = nowMs;
-                RebuildDesired(reference, route, egoPos, egoHeading, nowMs);
+                lastFrontierRefreshMs = nowMs;
+                RebuildFrontier(nowMs);
             }
 
             if (nowMs - lastGroundBatchMs >= GroundBatchIntervalMs)
             {
                 lastGroundBatchMs = nowMs;
-                SampleGround(nowMs);
+                SampleFrontier(nowMs);
             }
 
             if (nowMs - lastObstacleRayMs >= ObstacleRayIntervalMs)
             {
                 lastObstacleRayMs = nowMs;
-                ScanOneObstacleRay(egoVehicle, egoPos, egoHeading, nowMs);
+                ScanOneObstacleRay(nowMs);
             }
 
-            if (graphDirty || nowMs - lastGraphMs >= 300)
+            if (graphDirty || nowMs - lastGraphMs >= 260)
             {
                 lastGraphMs = nowMs;
-                RebuildConnectivity(egoPos, nowMs);
-                BuildDebugSnapshot(egoPos, nowMs);
+                RebuildConnectivity(nowMs);
+                BuildDebugSnapshot(nowMs);
                 graphDirty = false;
             }
 
-            if (nowMs - lastEvictMs >= 1500)
+            if (nowMs - lastEvictMs >= 1000)
             {
                 lastEvictMs = nowMs;
-                EvictFarAndStale(egoPos, nowMs);
+                EvictIrrelevant(nowMs);
             }
 
             lastTickMs = (float)((Stopwatch.GetTimestamp() - perfStart)
                 * 1000.0 / Stopwatch.Frequency);
             if (lastTickMs > peakTickMs) peakTickMs = lastTickMs;
-            if (nowMs - lastDetailMs >= 400)
+
+            if (nowMs - lastDetailMs >= 350)
             {
                 lastDetailMs = nowMs;
                 UpdateDetail();
             }
         }
 
-        private void RebuildDesired(
-            DrivingReference.Result reference,
-            RaceRoute route,
-            Vector3 egoPos,
-            float egoHeading,
-            int nowMs)
+        /// Conservative physical veto for a final trajectory candidate.
+        ///
+        /// This is deliberately small: at most eight synchronous LOS probes
+        /// across the next ~42 m, with a strict sub-millisecond budget. The
+        /// broad free-space map answers "where can I drive"; this answers
+        /// "does this exact line hit a wall/tree/guardrail?".
+        public TrajectoryCheck CheckTrajectory(
+            IList<Vector3> path,
+            IList<float> stationS,
+            float egoHalfWidth)
         {
-            desired.Clear();
-            desiredKeys.Clear();
-
-            Vector3 egoFwd = RaceMath.FlatNormalize(
-                RaceMath.VectorFromHeading(egoHeading));
-            Vector3 egoLeft = new Vector3(-egoFwd.Y, egoFwd.X, 0f);
-
-            // Small local disk, independent of road semantics. Keep immediate
-            // surroundings first so the reachable component can seed quickly.
-            int halo = (int)Math.Ceiling(NearFieldRadiusM / GridM);
-            for (int dx = -halo; dx <= halo; dx++)
+            var result = new TrajectoryCheck
             {
-                for (int dy = -halo; dy <= halo; dy++)
-                {
-                    float mx = dx * GridM;
-                    float my = dy * GridM;
-                    if (mx * mx + my * my > NearFieldRadiusM * NearFieldRadiusM)
-                        continue;
+                Available = lastEgoVehicle != null,
+                Blocked = false,
+                BudgetExhausted = false,
+                BlockedS = -1f,
+                HitPosition = Vector3.Zero,
+                Rays = 0,
+                Ms = 0f,
+                Detail = "",
+            };
 
-                    Vector3 p = new Vector3(
-                        egoPos.X + mx,
-                        egoPos.Y + my,
-                        egoPos.Z);
-                    float d = RaceMath.FlatDistance(egoPos, p);
-                    AddDesired(
-                        p, egoPos.Z,
-                        d * 0.25f,
-                        nowMs);
-                }
+            if (path == null || path.Count < 3
+                || stationS == null || stationS.Count != path.Count
+                || lastEgoVehicle == null)
+            {
+                result.Detail = "unavailable";
+                return result;
             }
 
-            // Wide, sparse sampling scaffold around the executable reference.
-            // The reference decides where to LOOK, never what is traversable.
+            long perfStart = Stopwatch.GetTimestamp();
+            float halfWidth = RaceMath.Clamp(egoHalfWidth * 0.82f, 0.55f, 1.25f);
+            float maxS = Math.Min(
+                TrajectorySweepDistanceM,
+                Math.Max(24f, lastEgoSpeed * 2.0f + 8f));
+
+            int i = 1;
+            bool sideLeft = true;
+            while (i < path.Count - 1
+                && result.Rays < TrajectorySweepMaxRays)
+            {
+                if (stationS[i] > maxS) break;
+
+                int j = i + 1;
+                while (j < path.Count - 1
+                    && stationS[j] - stationS[i] < 7.0f
+                    && stationS[j] <= maxS)
+                    j++;
+
+                if (j >= path.Count) j = path.Count - 1;
+                if (j <= i) break;
+
+                if (ElapsedMs(perfStart) >= TrajectorySweepBudgetMs
+                    && result.Rays > 0)
+                {
+                    result.BudgetExhausted = true;
+                    trajectorySweepBudgetStops++;
+                    break;
+                }
+
+                Vector3 a = path[i];
+                Vector3 b = path[j];
+                Vector3 dir = RaceMath.FlatNormalize(
+                    new Vector3(b.X - a.X, b.Y - a.Y, 0f));
+                if (RaceMath.FlatLength(dir) < 0.1f)
+                {
+                    i = j;
+                    continue;
+                }
+                Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
+
+                // Center rail first.
+                if (CastStaticRail(
+                    a, b, Vector3.Zero,
+                    stationS[i], ref result))
+                    break;
+
+                if (result.Rays >= TrajectorySweepMaxRays) break;
+                if (ElapsedMs(perfStart) >= TrajectorySweepBudgetMs)
+                {
+                    result.BudgetExhausted = true;
+                    trajectorySweepBudgetStops++;
+                    break;
+                }
+
+                // Alternate left/right side rails between segments. Over
+                // consecutive replans both vehicle sides are sampled without
+                // tripling native cost every frame.
+                float sign = sideLeft ? 1f : -1f;
+                sideLeft = !sideLeft;
+                Vector3 side = new Vector3(
+                    left.X * halfWidth * sign,
+                    left.Y * halfWidth * sign,
+                    0f);
+                if (CastStaticRail(
+                    a, b, side,
+                    stationS[i], ref result))
+                    break;
+
+                i = j;
+            }
+
+            result.Ms = (float)ElapsedMs(perfStart);
+            lastSweepMs = result.Ms;
+            if (lastSweepMs > peakSweepMs) peakSweepMs = lastSweepMs;
+            trajectorySweeps++;
+            if (result.Blocked) trajectorySweepHits++;
+
+            result.Detail = result.Blocked
+                ? $"blocked@{result.BlockedS:F0};rays={result.Rays};ms={result.Ms:F2}"
+                : $"clear;rays={result.Rays};budget={(result.BudgetExhausted ? 1 : 0)};ms={result.Ms:F2}";
+            return result;
+        }
+
+        private bool CastStaticRail(
+            Vector3 a,
+            Vector3 b,
+            Vector3 offset,
+            float stationS,
+            ref TrajectoryCheck result)
+        {
+            Vector3 start = new Vector3(
+                a.X + offset.X,
+                a.Y + offset.Y,
+                a.Z + TrajectorySweepHeightM);
+            Vector3 end = new Vector3(
+                b.X + offset.X,
+                b.Y + offset.Y,
+                b.Z + TrajectorySweepHeightM);
+
+            ShapeTestHandle handle = default(ShapeTestHandle);
+            try
+            {
+                handle = ShapeTest.StartExpensiveSyncTestLOSProbe(
+                    start, end,
+                    StaticIntersectFlags,
+                    lastEgoVehicle,
+                    ShapeTestOptions.Default);
+            }
+            catch { }
+
+            result.Rays++;
+            if (handle.IsRequestFailed)
+                return false;
+
+            ShapeTestStatus status = ShapeTestStatus.NonExistent;
+            ShapeTestResult shape = default(ShapeTestResult);
+            try { status = handle.GetResult(out shape); }
+            catch { status = ShapeTestStatus.NonExistent; }
+
+            if (status != ShapeTestStatus.Ready || !shape.DidHit)
+                return false;
+
+            result.Blocked = true;
+            result.BlockedS = stationS;
+            result.HitPosition = shape.HitPosition;
+            DebugObstacles.Add(new DebugObstacle
+            {
+                Position = shape.HitPosition,
+                Normal = shape.SurfaceNormal,
+            });
+            if (DebugObstacles.Count > 24)
+                DebugObstacles.RemoveAt(0);
+            MarkObstacle(shape.HitPosition, lastNowMs);
+            return true;
+        }
+
+        private void BuildGuide(
+            DrivingReference.Result reference,
+            RaceRoute route)
+        {
+            guidePoints.Clear();
+
             if (reference != null
                 && reference.Path != null
                 && reference.Path.Count >= 2)
             {
                 for (int i = 0; i < reference.Path.Count; i += 3)
                 {
-                    Vector3 center = reference.Path[i];
-                    if (RaceMath.FlatDistance(egoPos, center) > SampleAheadM + 20f)
+                    Vector3 p = reference.Path[i];
+                    if (RaceMath.FlatDistance(lastEgoPos, p) > horizonM + 18f)
                         continue;
-
-                    Vector3 dir = ReferenceDirection(reference.Path, i);
-                    Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
-
-                    for (float lat = -SampleHalfWidthM;
-                        lat <= SampleHalfWidthM + 0.01f;
-                        lat += GridM)
-                    {
-                        Vector3 p = new Vector3(
-                            center.X + left.X * lat,
-                            center.Y + left.Y * lat,
-                            center.Z);
-                        Vector3 rel = new Vector3(
-                            p.X - egoPos.X,
-                            p.Y - egoPos.Y, 0f);
-                        float along = RaceMath.FlatDot(rel, egoFwd);
-                        float lateral = Math.Abs(RaceMath.FlatDot(rel, egoLeft));
-                        // Unsampled space in front of the car is the valuable
-                        // part of the map. Rear/side cells remain eligible, but
-                        // ahead-center cells are filled first.
-                        float priority = along >= -3f
-                            ? Math.Max(0f, along) * 0.18f + lateral * 0.30f
-                            : 50f + Math.Abs(along);
-                        AddDesired(p, center.Z, priority, nowMs);
-                    }
+                    guidePoints.Add(p);
+                    if (guidePoints.Count >= 28) break;
                 }
             }
-            else if (route != null && route.Built)
+
+            if (guidePoints.Count < 4
+                && route != null && route.Built)
             {
-                for (float ds = 0f; ds <= SampleAheadM; ds += 9f)
+                float step = Math.Max(7f, horizonM / 10f);
+                for (float ds = 0f; ds <= horizonM; ds += step)
                 {
-                    Vector3 center = route.PointAtS(route.AlongS + ds);
-                    float h = route.HeadingAtS(route.AlongS + ds);
-                    Vector3 f = RaceMath.FlatNormalize(
-                        RaceMath.VectorFromHeading(h));
-                    Vector3 left = new Vector3(-f.Y, f.X, 0f);
-
-                    for (float lat = -SampleHalfWidthM;
-                        lat <= SampleHalfWidthM + 0.01f;
-                        lat += GridM)
-                    {
-                        Vector3 p = new Vector3(
-                            center.X + left.X * lat,
-                            center.Y + left.Y * lat,
-                            center.Z);
-                        Vector3 rel = new Vector3(
-                            p.X - egoPos.X,
-                            p.Y - egoPos.Y, 0f);
-                        float along = RaceMath.FlatDot(rel, egoFwd);
-                        float lateral = Math.Abs(RaceMath.FlatDot(rel, egoLeft));
-                        float priority = along >= -3f
-                            ? Math.Max(0f, along) * 0.18f + lateral * 0.30f
-                            : 50f + Math.Abs(along);
-                        AddDesired(p, center.Z, priority, nowMs);
-                    }
+                    guidePoints.Add(route.PointAtS(route.AlongS + ds));
+                    if (guidePoints.Count >= 24) break;
                 }
             }
-
-            desired.Sort((a, b) =>
-            {
-                Cell ca;
-                Cell cb;
-                bool aKnown = cells.TryGetValue(a.Key, out ca)
-                    && ca.State != SurfaceState.Unknown
-                    && nowMs - ca.LastSampleMs < CellFreshMs;
-                bool bKnown = cells.TryGetValue(b.Key, out cb)
-                    && cb.State != SurfaceState.Unknown
-                    && nowMs - cb.LastSampleMs < CellFreshMs;
-                if (aKnown != bKnown) return aKnown ? 1 : -1;
-                return a.Priority.CompareTo(b.Priority);
-            });
-            if (desired.Count > MaxDesiredCells)
-                desired.RemoveRange(MaxDesiredCells, desired.Count - MaxDesiredCells);
-
-            // The list is freshly priority-sorted. Start at its front so new
-            // unknown cells directly ahead are sampled before stale side/rear
-            // work left over from the previous scaffold.
-            desiredCursor = 0;
         }
 
-        private void AddDesired(
+        private void RebuildFrontier(int nowMs)
+        {
+            frontier.Clear();
+            frontierKeys.Clear();
+
+            Cell egoCell = FindNearestReachableCell(lastEgoPos, 6f);
+            if (egoCell == null)
+            {
+                // Bootstrap only around the current pose. We do NOT seed random
+                // far route points: every future sample must grow from here.
+                AddFrontier(
+                    CenterFor(KeyFor(
+                        lastEgoPos.X, lastEgoPos.Y, lastEgoPos.Z),
+                        lastEgoPos.Z),
+                    lastEgoPos.Z,
+                    -1000f,
+                    default(CellKey),
+                    false,
+                    nowMs);
+
+                Vector3 f = RaceMath.FlatNormalize(
+                    RaceMath.VectorFromHeading(lastEgoHeading));
+                Vector3 l = new Vector3(-f.Y, f.X, 0f);
+                for (int a = -1; a <= 1; a++)
+                {
+                    for (int b = -1; b <= 1; b++)
+                    {
+                        if (a == 0 && b == 0) continue;
+                        Vector3 p = new Vector3(
+                            lastEgoPos.X + f.X * GridM * a + l.X * GridM * b,
+                            lastEgoPos.Y + f.Y * GridM * a + l.Y * GridM * b,
+                            lastEgoPos.Z);
+                        AddFrontier(
+                            p, lastEgoPos.Z,
+                            -900f + Math.Abs(a) + Math.Abs(b),
+                            default(CellKey), false, nowMs);
+                    }
+                }
+            }
+
+            // Grow only from the current reachable component.
+            foreach (Cell c in cells.Values)
+            {
+                if (!c.Reachable || !c.Traversable) continue;
+                if (!InsideFutureEnvelope(c.Position)) continue;
+                AddNeighborsToFrontier(c, nowMs);
+            }
+
+            frontier.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+        }
+
+        private void AddNeighborsToFrontier(Cell parent, int nowMs)
+        {
+            for (int d = 0; d < DirX.Length; d++)
+            {
+                CellKey key = new CellKey
+                {
+                    X = parent.Key.X + DirX[d],
+                    Y = parent.Key.Y + DirY[d],
+                    Layer = parent.Key.Layer,
+                };
+                Vector3 p = new Vector3(
+                    key.X * GridM,
+                    key.Y * GridM,
+                    parent.Position.Z);
+
+                if (!InsideFutureEnvelope(p)) continue;
+
+                Cell existing;
+                if (cells.TryGetValue(key, out existing)
+                    && existing.State != SurfaceState.Unknown
+                    && nowMs - existing.LastSampleMs < CellFreshMs)
+                {
+                    existing.LastWantedMs = nowMs;
+                    continue;
+                }
+
+                float priority = FrontierPriority(p);
+                AddFrontier(
+                    p, parent.Position.Z,
+                    priority,
+                    parent.Key, true, nowMs);
+            }
+        }
+
+        private void AddFrontier(
             Vector3 world,
             float hintZ,
             float priority,
+            CellKey parentKey,
+            bool hasParent,
             int nowMs)
         {
             CellKey key = KeyFor(world.X, world.Y, hintZ);
-            if (!desiredKeys.Add(key))
-            {
-                Cell existing;
-                if (cells.TryGetValue(key, out existing))
-                    existing.LastWantedMs = nowMs;
-                return;
-            }
-
-            Vector3 center = CenterFor(key, hintZ);
-            desired.Add(new ProbeRequest
-            {
-                Key = key,
-                Position = center,
-                HintZ = hintZ,
-                Priority = priority,
-            });
+            if (!frontierKeys.Add(key)) return;
 
             Cell cell;
             if (!cells.TryGetValue(key, out cell))
@@ -398,8 +631,8 @@ namespace StreetRacing
                 cell = new Cell
                 {
                     Key = key,
-                    SamplePosition = center,
-                    Position = center,
+                    SamplePosition = CenterFor(key, hintZ),
+                    Position = CenterFor(key, hintZ),
                     State = SurfaceState.Unknown,
                     LastWantedMs = nowMs,
                     LastSampleMs = -100000,
@@ -409,30 +642,41 @@ namespace StreetRacing
             }
             else
             {
-                cell.SamplePosition = center;
+                cell.SamplePosition = CenterFor(key, hintZ);
                 cell.LastWantedMs = nowMs;
             }
+
+            frontier.Add(new FrontierRequest
+            {
+                Key = key,
+                Position = cell.SamplePosition,
+                HintZ = hintZ,
+                Priority = priority,
+                ParentKey = parentKey,
+                HasParent = hasParent,
+            });
         }
 
-        private void SampleGround(int nowMs)
+        private void SampleFrontier(int nowMs)
         {
             lastGroundSamples = 0;
-            if (desired.Count == 0) return;
+            if (frontier.Count == 0) return;
 
             long perfStart = Stopwatch.GetTimestamp();
-            int scanned = 0;
 
             while (lastGroundSamples < GroundMaxSamplesPerBatch
-                && scanned < desired.Count)
+                && frontier.Count > 0)
             {
-                double elapsedMs = (Stopwatch.GetTimestamp() - perfStart)
-                    * 1000.0 / Stopwatch.Frequency;
-                if (lastGroundSamples > 0 && elapsedMs >= GroundBudgetMs)
+                if (lastGroundSamples > 0
+                    && ElapsedMs(perfStart) >= GroundBudgetMs)
                     break;
 
-                if (desiredCursor >= desired.Count) desiredCursor = 0;
-                ProbeRequest req = desired[desiredCursor++];
-                scanned++;
+                // Frontier is small and re-sorted after appending reachable
+                // children. This is intentionally simple and deterministic.
+                frontier.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+                FrontierRequest req = frontier[0];
+                frontier.RemoveAt(0);
+                frontierKeys.Remove(req.Key);
 
                 Cell cell;
                 if (!cells.TryGetValue(req.Key, out cell)) continue;
@@ -448,12 +692,13 @@ namespace StreetRacing
                         new Vector3(
                             req.Position.X,
                             req.Position.Y,
-                            req.HintZ + 4f),
+                            req.HintZ + 4.5f),
                         out groundZ);
                 }
                 catch { found = false; }
 
                 cell.LastSampleMs = nowMs;
+                cell.LastWantedMs = nowMs;
                 lastGroundSamples++;
 
                 if (!found)
@@ -496,16 +741,96 @@ namespace StreetRacing
                 }
                 catch { road = false; }
                 cell.RoadSemantic = road;
+
+                bool connected = RaceMath.FlatDistance(
+                    cell.Position, lastEgoPos) <= GridM * 1.8f;
+
+                if (req.HasParent)
+                {
+                    Cell parent;
+                    if (cells.TryGetValue(req.ParentKey, out parent)
+                        && parent.Reachable
+                        && parent.Traversable
+                        && Math.Abs(parent.Position.Z - cell.Position.Z)
+                            <= MaxNeighborStepM)
+                    {
+                        connected = true;
+                    }
+                }
+
+                cell.Reachable = connected;
                 graphDirty = true;
+
+                if (connected)
+                {
+                    frontierExpanded++;
+                    AddNeighborsToFrontier(cell, nowMs);
+                }
             }
         }
 
-        private void ScanOneObstacleRay(
-            Vehicle egoVehicle,
-            Vector3 egoPos,
-            float egoHeading,
-            int nowMs)
+        private bool InsideFutureEnvelope(Vector3 p)
         {
+            Vector3 rel = new Vector3(
+                p.X - lastEgoPos.X,
+                p.Y - lastEgoPos.Y,
+                0f);
+            float dist = RaceMath.FlatLength(rel);
+            if (dist <= nearM) return true;
+            if (dist > horizonM) return false;
+
+            Vector3 f = RaceMath.FlatNormalize(
+                RaceMath.VectorFromHeading(lastEgoHeading));
+            Vector3 l = new Vector3(-f.Y, f.X, 0f);
+            float along = RaceMath.FlatDot(rel, f);
+            float lateral = Math.Abs(RaceMath.FlatDot(rel, l));
+
+            if (along < -BackKeepM) return false;
+
+            float guideDist = GuideDistance(p);
+            float halfWidth = dist <= midM
+                ? MidHalfWidthM
+                : FarHalfWidthM;
+
+            // Route curvature can carry the future tube outside the current
+            // ego-heading cone, so guide proximity is an alternate admission.
+            return lateral <= halfWidth
+                || guideDist <= halfWidth + 5f;
+        }
+
+        private float FrontierPriority(Vector3 p)
+        {
+            Vector3 rel = new Vector3(
+                p.X - lastEgoPos.X,
+                p.Y - lastEgoPos.Y,
+                0f);
+            float dist = RaceMath.FlatLength(rel);
+            float guideDist = GuideDistance(p);
+
+            if (dist <= nearM)
+                return dist * 0.16f + guideDist * 0.04f;
+
+            if (dist <= midM)
+                return 10f + dist * 0.10f + guideDist * 0.18f;
+
+            return 24f + dist * 0.07f + guideDist * 0.30f;
+        }
+
+        private float GuideDistance(Vector3 p)
+        {
+            if (guidePoints.Count == 0) return 0f;
+            float best = float.MaxValue;
+            for (int i = 0; i < guidePoints.Count; i++)
+            {
+                float d = RaceMath.FlatDistance(p, guidePoints[i]);
+                if (d < best) best = d;
+            }
+            return best == float.MaxValue ? 0f : best;
+        }
+
+        private void ScanOneObstacleRay(int nowMs)
+        {
+            if (lastEgoVehicle == null) return;
             if (obstacleRayCursor == 0)
                 DebugObstacles.Clear();
 
@@ -514,27 +839,27 @@ namespace StreetRacing
                 obstacleRayCursor = 0;
 
             Vector3 start = new Vector3(
-                egoPos.X,
-                egoPos.Y,
-                egoPos.Z + ObstacleRayHeightM);
-            float h = egoHeading + ObstacleAnglesDeg[i];
+                lastEgoPos.X,
+                lastEgoPos.Y,
+                lastEgoPos.Z + ObstacleRayHeightM);
+            float h = lastEgoHeading + ObstacleAnglesDeg[i];
             Vector3 dir = RaceMath.FlatNormalize(
                 RaceMath.VectorFromHeading(h));
+            float range = Math.Min(
+                ObstacleRayRangeM,
+                Math.Max(18f, lastEgoSpeed * 1.7f + 8f));
             Vector3 end = new Vector3(
-                start.X + dir.X * ObstacleRayRangeM,
-                start.Y + dir.Y * ObstacleRayRangeM,
+                start.X + dir.X * range,
+                start.Y + dir.Y * range,
                 start.Z);
 
             ShapeTestHandle handle = default(ShapeTestHandle);
             try
             {
                 handle = ShapeTest.StartExpensiveSyncTestLOSProbe(
-                    start,
-                    end,
-                    ObstacleIntersectFlags,
-                    egoVehicle != null && egoVehicle.Exists()
-                        ? egoVehicle
-                        : null,
+                    start, end,
+                    StaticIntersectFlags,
+                    lastEgoVehicle,
                     ShapeTestOptions.Default);
             }
             catch { }
@@ -547,8 +872,8 @@ namespace StreetRacing
             }
 
             ShapeTestStatus status = ShapeTestStatus.NonExistent;
-            ShapeTestResult result = default(ShapeTestResult);
-            try { status = handle.GetResult(out result); }
+            ShapeTestResult shape = default(ShapeTestResult);
+            try { status = handle.GetResult(out shape); }
             catch { status = ShapeTestStatus.NonExistent; }
 
             if (status != ShapeTestStatus.Ready)
@@ -556,15 +881,15 @@ namespace StreetRacing
                 obstacleNotReady++;
                 return;
             }
-            if (!result.DidHit) return;
+            if (!shape.DidHit) return;
 
             obstacleHits++;
             DebugObstacles.Add(new DebugObstacle
             {
-                Position = result.HitPosition,
-                Normal = result.SurfaceNormal,
+                Position = shape.HitPosition,
+                Normal = shape.SurfaceNormal,
             });
-            MarkObstacle(result.HitPosition, nowMs);
+            MarkObstacle(shape.HitPosition, nowMs);
         }
 
         private void MarkObstacle(Vector3 hit, int nowMs)
@@ -576,9 +901,9 @@ namespace StreetRacing
             {
                 if (c.State != SurfaceState.Traversable) continue;
                 float d = RaceMath.FlatDistance(c.Position, hit);
-                if (d > GridM * 1.1f) continue;
+                if (d > GridM * 1.2f) continue;
                 float dz = Math.Abs(c.Position.Z - hit.Z);
-                if (dz > 2.5f) continue;
+                if (dz > 2.6f) continue;
                 float score = d + dz * 0.35f;
                 if (score >= bestScore) continue;
                 bestScore = score;
@@ -588,10 +913,11 @@ namespace StreetRacing
             if (best == null) return;
             best.StaticObstacle = true;
             best.LastObstacleMs = nowMs;
+            best.Reachable = false;
             graphDirty = true;
         }
 
-        private void RebuildConnectivity(Vector3 egoPos, int nowMs)
+        private void RebuildConnectivity(int nowMs)
         {
             foreach (Cell c in cells.Values)
             {
@@ -611,29 +937,36 @@ namespace StreetRacing
                 FloodComponent(start, component++);
             }
 
-            Cell egoCell = null;
-            float egoBest = float.MaxValue;
-            foreach (Cell c in cells.Values)
-            {
-                if (!c.Traversable) continue;
-                float dz = Math.Abs(c.Position.Z - egoPos.Z);
-                if (dz > 1.8f) continue;
-                float d = RaceMath.FlatDistance(c.Position, egoPos) + dz * 2f;
-                if (d >= egoBest) continue;
-                egoBest = d;
-                egoCell = c;
-            }
-
-            int reachableComponent = egoCell != null && egoBest <= 6f
+            Cell egoCell = FindNearestTraversableCell(lastEgoPos, 6f);
+            int reachableComponent = egoCell != null
                 ? egoCell.ComponentId
                 : -1;
+
+            activeReachable = 0;
+            activeComponents = 0;
+            var activeComponentIds = new HashSet<int>();
 
             if (reachableComponent >= 0)
             {
                 foreach (Cell c in cells.Values)
+                {
                     c.Reachable = c.ComponentId == reachableComponent;
+                    if (c.Reachable && InsideFutureEnvelope(c.Position))
+                        activeReachable++;
+                    if (InsideFutureEnvelope(c.Position)
+                        && c.ComponentId >= 0)
+                        activeComponentIds.Add(c.ComponentId);
+                }
+            }
+            else
+            {
+                foreach (Cell c in cells.Values)
+                    if (InsideFutureEnvelope(c.Position)
+                        && c.ComponentId >= 0)
+                        activeComponentIds.Add(c.ComponentId);
             }
 
+            activeComponents = activeComponentIds.Count;
             ComputeClearance();
         }
 
@@ -646,7 +979,7 @@ namespace StreetRacing
             while (flood.Count > 0)
             {
                 Cell c = flood.Dequeue();
-                for (int d = 0; d < 4; d++)
+                for (int d = 0; d < DirX.Length; d++)
                 {
                     Cell n;
                     if (!TryFindNeighbor(c, d, out n)) continue;
@@ -713,7 +1046,10 @@ namespace StreetRacing
                     c.ClearanceM = GridM * 0.5f;
         }
 
-        private bool TryFindNeighbor(Cell c, int dir, out Cell neighbor)
+        private bool TryFindNeighbor(
+            Cell c,
+            int dir,
+            out Cell neighbor)
         {
             neighbor = null;
             int nx = c.Key.X + DirX[dir];
@@ -732,8 +1068,10 @@ namespace StreetRacing
                 if (!cells.TryGetValue(key, out candidate)) continue;
                 if (!candidate.Traversable) continue;
 
-                float dz = Math.Abs(candidate.Position.Z - c.Position.Z);
-                if (dz > MaxNeighborStepM || dz >= bestDz) continue;
+                float dz = Math.Abs(
+                    candidate.Position.Z - c.Position.Z);
+                if (dz > MaxNeighborStepM || dz >= bestDz)
+                    continue;
                 bestDz = dz;
                 neighbor = candidate;
             }
@@ -745,34 +1083,73 @@ namespace StreetRacing
         {
             if (a == null || b == null) return false;
             if (!a.Traversable || !b.Traversable) return false;
-            return Math.Abs(a.Position.Z - b.Position.Z) <= MaxNeighborStepM;
+            return Math.Abs(a.Position.Z - b.Position.Z)
+                <= MaxNeighborStepM;
         }
 
-        private void BuildDebugSnapshot(Vector3 egoPos, int nowMs)
+        private Cell FindNearestReachableCell(
+            Vector3 p,
+            float maxDist)
+        {
+            Cell best = null;
+            float bestD = maxDist;
+            foreach (Cell c in cells.Values)
+            {
+                if (!c.Reachable || !c.Traversable) continue;
+                float dz = Math.Abs(c.Position.Z - p.Z);
+                if (dz > 1.8f) continue;
+                float d = RaceMath.FlatDistance(c.Position, p);
+                if (d >= bestD) continue;
+                bestD = d;
+                best = c;
+            }
+            return best;
+        }
+
+        private Cell FindNearestTraversableCell(
+            Vector3 p,
+            float maxDist)
+        {
+            Cell best = null;
+            float bestD = maxDist;
+            foreach (Cell c in cells.Values)
+            {
+                if (!c.Traversable) continue;
+                float dz = Math.Abs(c.Position.Z - p.Z);
+                if (dz > 1.8f) continue;
+                float d = RaceMath.FlatDistance(c.Position, p);
+                if (d >= bestD) continue;
+                bestD = d;
+                best = c;
+            }
+            return best;
+        }
+
+        private void BuildDebugSnapshot(int nowMs)
         {
             DebugCells.Clear();
             DebugEdges.Clear();
 
-            int cellsAdded = 0;
             foreach (Cell c in cells.Values)
             {
-                if (RaceMath.FlatDistance(c.SamplePosition, egoPos) > 70f)
+                if (!InsideFutureEnvelope(c.SamplePosition)) continue;
+                if (nowMs - c.LastWantedMs > 2500
+                    && !c.Reachable)
                     continue;
+
                 DebugCells.Add(c);
-                cellsAdded++;
-                if (cellsAdded >= 160) break;
+                if (DebugCells.Count >= 190) break;
             }
 
-            // Only show BLOCKED local connections. Hundreds of open-edge draw
-            // calls added clutter and measurable frame cost; cell reachability
-            // already shows the connected free region.
+            // Only expose actual local discontinuities, not every open edge.
             foreach (Cell c in cells.Values)
             {
                 if (DebugEdges.Count >= 80) break;
-                if (c.State != SurfaceState.Traversable) continue;
-                if (RaceMath.FlatDistance(c.Position, egoPos) > 42f) continue;
+                if (!c.Reachable || !c.Traversable) continue;
+                if (RaceMath.FlatDistance(c.Position, lastEgoPos) > nearM + 8f)
+                    continue;
 
-                for (int d = 0; d < 4 && DebugEdges.Count < 80; d += 2)
+                for (int d = 0; d < 4 && DebugEdges.Count < 80; d++)
                 {
                     Cell n;
                     if (!TryFindAnySurfaceNeighbor(c, d, out n)) continue;
@@ -815,20 +1192,27 @@ namespace StreetRacing
                 bestDz = dz;
                 neighbor = candidate;
             }
-
             return neighbor != null;
         }
 
-        private void EvictFarAndStale(Vector3 egoPos, int nowMs)
+        private void EvictIrrelevant(int nowMs)
         {
             var remove = new List<CellKey>();
+            float keepRadius = horizonM + 18f;
+
             foreach (KeyValuePair<CellKey, Cell> pair in cells)
             {
                 Cell c = pair.Value;
-                float d = RaceMath.FlatDistance(c.SamplePosition, egoPos);
-                bool unwanted = nowMs - c.LastWantedMs > 6000;
-                bool stale = nowMs - c.LastSampleMs > 20000;
-                if ((unwanted && d > 75f) || (stale && d > 40f))
+                float d = RaceMath.FlatDistance(
+                    c.SamplePosition, lastEgoPos);
+                bool behindFar = !InsideFutureEnvelope(c.SamplePosition)
+                    && d > nearM + 8f;
+                bool stale = nowMs - c.LastWantedMs > 5000;
+                bool veryStale = nowMs - c.LastSampleMs > 18000;
+
+                if (d > keepRadius
+                    || (behindFar && stale)
+                    || (veryStale && d > nearM))
                     remove.Add(pair.Key);
             }
 
@@ -845,18 +1229,16 @@ namespace StreetRacing
             int reachableOffRoad = 0;
             int staticBlocked = 0;
             int noSurface = 0;
-            int components = 0;
             float maxClear = 0f;
 
             foreach (Cell c in cells.Values)
             {
+                if (!InsideFutureEnvelope(c.SamplePosition)) continue;
+
                 if (c.State == SurfaceState.Traversable)
                 {
                     if (c.StaticObstacle) staticBlocked++;
                     else traversable++;
-
-                    if (c.ComponentId + 1 > components)
-                        components = c.ComponentId + 1;
                 }
                 else if (c.State == SurfaceState.NoSurface)
                 {
@@ -867,22 +1249,32 @@ namespace StreetRacing
                 {
                     reachable++;
                     if (!c.RoadSemantic) reachableOffRoad++;
-                    if (c.ClearanceM > maxClear) maxClear = c.ClearanceM;
+                    if (c.ClearanceM > maxClear)
+                        maxClear = c.ClearanceM;
                 }
             }
 
-            Detail = $"cells={cells.Count};desired={desired.Count};"
-                + $"trav={traversable};reach={reachable};"
-                + $"reachOffRoad={reachableOffRoad};components={components};"
+            Detail =
+                $"cells={cells.Count};frontier={frontier.Count};"
+                + $"horizon={horizonM:F0};near={nearM:F0};mid={midM:F0};"
+                + $"trav={traversable};reach={reachable};reachActive={activeReachable};"
+                + $"reachOffRoad={reachableOffRoad};components={activeComponents};"
                 + $"staticBlocked={staticBlocked};noSurface={noSurface};"
-                + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};gBatch={lastGroundSamples};"
+                + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};"
+                + $"gBatch={lastGroundSamples};expanded={frontierExpanded};"
                 + $"obsRays={obstacleRays};obsHits={obstacleHits};"
                 + $"obsWait={obstacleNotReady};obsFail={obstacleFailed};"
+                + $"sweeps={trajectorySweeps};sweepHits={trajectorySweepHits};"
+                + $"sweepBudget={trajectorySweepBudgetStops};"
+                + $"sweepMs={lastSweepMs:F2};sweepPeak={peakSweepMs:F2};"
                 + $"maxClear={maxClear:F1};"
                 + $"tickMs={lastTickMs:F2};peakMs={peakTickMs:F2}";
         }
 
-        private static CellKey KeyFor(float x, float y, float hintZ)
+        private static CellKey KeyFor(
+            float x,
+            float y,
+            float hintZ)
         {
             return new CellKey
             {
@@ -892,7 +1284,9 @@ namespace StreetRacing
             };
         }
 
-        private static Vector3 CenterFor(CellKey key, float hintZ)
+        private static Vector3 CenterFor(
+            CellKey key,
+            float hintZ)
         {
             return new Vector3(
                 key.X * GridM,
@@ -900,28 +1294,10 @@ namespace StreetRacing
                 hintZ);
         }
 
-        private static Vector3 ReferenceDirection(
-            IList<Vector3> path,
-            int i)
+        private static double ElapsedMs(long start)
         {
-            Vector3 d;
-            if (i <= 0)
-                d = new Vector3(
-                    path[1].X - path[0].X,
-                    path[1].Y - path[0].Y,
-                    0f);
-            else if (i >= path.Count - 1)
-                d = new Vector3(
-                    path[i].X - path[i - 1].X,
-                    path[i].Y - path[i - 1].Y,
-                    0f);
-            else
-                d = new Vector3(
-                    path[i + 1].X - path[i - 1].X,
-                    path[i + 1].Y - path[i - 1].Y,
-                    0f);
-
-            return RaceMath.FlatNormalize(d);
+            return (Stopwatch.GetTimestamp() - start)
+                * 1000.0 / Stopwatch.Frequency;
         }
     }
 }
