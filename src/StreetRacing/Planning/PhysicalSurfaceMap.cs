@@ -367,7 +367,10 @@ namespace StreetRacing
                 Math.Max(24f, lastEgoSpeed * 2.0f + 8f));
 
             int i = 1;
-            bool sideLeft = true;
+            // Alternate which side gets the first rail across replans so a
+            // narrow obstacle beside the centerline cannot live forever on
+            // the consistently unsampled side.
+            bool sideLeft = (trajectorySweeps & 1) == 0;
             while (i < path.Count - 1
                 && result.Rays < TrajectorySweepMaxRays)
             {
