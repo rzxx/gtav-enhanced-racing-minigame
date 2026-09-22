@@ -107,6 +107,37 @@ namespace StreetRacing
             }
         }
 
+        private struct FrontierKey : IEquatable<FrontierKey>
+        {
+            public CellKey Target;
+            public CellKey Parent;
+            public bool HasParent;
+
+            public bool Equals(FrontierKey other)
+            {
+                return Target.Equals(other.Target)
+                    && Parent.Equals(other.Parent)
+                    && HasParent == other.HasParent;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is FrontierKey
+                    && Equals((FrontierKey)obj);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = Target.GetHashCode();
+                    h = h * 397 ^ Parent.GetHashCode();
+                    h = h * 397 ^ (HasParent ? 1 : 0);
+                    return h;
+                }
+            }
+        }
+
         private struct FrontierRequest
         {
             public CellKey Key;
@@ -154,8 +185,8 @@ namespace StreetRacing
             new Dictionary<CellKey, Cell>();
         private readonly List<FrontierRequest> frontier =
             new List<FrontierRequest>(420);
-        private readonly HashSet<CellKey> frontierKeys =
-            new HashSet<CellKey>();
+        private readonly HashSet<FrontierKey> frontierKeys =
+            new HashSet<FrontierKey>();
         private readonly Dictionary<EdgeKey, EdgeInfo> edges =
             new Dictionary<EdgeKey, EdgeInfo>();
         private readonly List<Vector3> guidePoints =
@@ -763,7 +794,13 @@ namespace StreetRacing
             int nowMs)
         {
             CellKey key = KeyFor(world.X, world.Y, hintZ);
-            if (!frontierKeys.Add(key)) return;
+            FrontierKey requestKey = new FrontierKey
+            {
+                Target = key,
+                Parent = parentKey,
+                HasParent = hasParent,
+            };
+            if (!frontierKeys.Add(requestKey)) return;
 
             Cell cell;
             if (!cells.TryGetValue(key, out cell))
@@ -816,7 +853,12 @@ namespace StreetRacing
                 frontier.Sort((a, b) => a.Priority.CompareTo(b.Priority));
                 FrontierRequest req = frontier[0];
                 frontier.RemoveAt(0);
-                frontierKeys.Remove(req.Key);
+                frontierKeys.Remove(new FrontierKey
+                {
+                    Target = req.Key,
+                    Parent = req.ParentKey,
+                    HasParent = req.HasParent,
+                });
 
                 Cell cell;
                 if (!cells.TryGetValue(req.Key, out cell)) continue;
