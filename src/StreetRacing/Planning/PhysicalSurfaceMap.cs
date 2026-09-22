@@ -319,7 +319,9 @@ namespace StreetRacing
             Vector3 egoPos,
             float egoHeading,
             float egoSpeed,
-            int nowMs)
+            int nowMs,
+            bool finishGoalMode = false,
+            Vector3 finishGoal = default(Vector3))
         {
             long perfStart = Stopwatch.GetTimestamp();
 
@@ -339,7 +341,7 @@ namespace StreetRacing
                 10f + Math.Max(lastEgoSpeed, 4f) * MidTimeS,
                 nearM + 6f, Math.Min(horizonM, 65f));
 
-            BuildGuide(reference, route);
+            BuildGuide(reference, route, finishGoalMode, finishGoal);
 
             if (nowMs - lastFrontierRefreshMs >= FrontierRefreshMs)
             {
@@ -607,9 +609,40 @@ namespace StreetRacing
 
         private void BuildGuide(
             DrivingReference.Result reference,
-            RaceRoute route)
+            RaceRoute route,
+            bool finishGoalMode,
+            Vector3 finishGoal)
         {
             guidePoints.Clear();
+
+            if (finishGoalMode)
+            {
+                Vector3 delta = new Vector3(
+                    finishGoal.X - lastEgoPos.X,
+                    finishGoal.Y - lastEgoPos.Y,
+                    0f);
+                float distance = RaceMath.FlatLength(delta);
+                Vector3 dir = RaceMath.FlatNormalize(delta);
+                if (distance > 0.5f
+                    && RaceMath.FlatLength(dir) > 0.1f)
+                {
+                    float limit = Math.Min(distance, horizonM);
+                    float step = Math.Max(6f, limit / 10f);
+                    for (float d = 0f; d <= limit; d += step)
+                    {
+                        guidePoints.Add(new Vector3(
+                            lastEgoPos.X + dir.X * d,
+                            lastEgoPos.Y + dir.Y * d,
+                            lastEgoPos.Z));
+                        if (guidePoints.Count >= 24) break;
+                    }
+                    guidePoints.Add(new Vector3(
+                        lastEgoPos.X + dir.X * limit,
+                        lastEgoPos.Y + dir.Y * limit,
+                        lastEgoPos.Z));
+                }
+                return;
+            }
 
             if (reference != null
                 && reference.Path != null
