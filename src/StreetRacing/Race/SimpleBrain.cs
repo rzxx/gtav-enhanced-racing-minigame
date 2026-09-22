@@ -81,6 +81,9 @@ namespace StreetRacing.Race
         // geometry itself is searched in world XY on connected road surfaces rather than route offsets.
         private readonly Perception perception = new Perception();
         private readonly LocalWorldModel localWorld = new LocalWorldModel();
+        // Observer-only physical geometry map. It is visualized/telemetered but
+        // intentionally not consumed by SpatialPlannerV1 until we trust what it sees.
+        private readonly PhysicalSurfaceMap physicalSurface = new PhysicalSurfaceMap();
         private readonly SpatialPlannerV1 spatialPlanner = new SpatialPlannerV1();
         private readonly RecoveryPrimitive recovery = new RecoveryPrimitive();
         private readonly TrajectoryPlanner trajViz = new TrajectoryPlanner();
@@ -127,6 +130,8 @@ namespace StreetRacing.Race
         private int lastVizErrorMs = -100000;
         private int lastRoadModelEventMs = -100000;
         private bool roadModelWasLow;
+        private int lastPhysicalSurfaceEventMs = -100000;
+        private int lastPhysicalSurfaceErrorMs = -100000;
         private float lastRefRawKappa;
         private float lastRefKappa;
         private float lastRefHeadStep;
@@ -171,6 +176,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
+        private const string SpatialBuildTag = "physical-traversability-observer-v1";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -194,6 +200,7 @@ namespace StreetRacing.Race
             try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localWorld.Reset(); } catch { }
+            try { physicalSurface.Reset(); } catch { }
             try { spatialPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
@@ -232,6 +239,7 @@ namespace StreetRacing.Race
             catch { }
             viz.Enabled = debugViz;
             try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "SPATIAL_BUILD", SpatialBuildTag); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -262,6 +270,8 @@ namespace StreetRacing.Race
             TestFailureReason = "";
             lastRoadModelEventMs = -100000;
             roadModelWasLow = false;
+            lastPhysicalSurfaceEventMs = -100000;
+            lastPhysicalSurfaceErrorMs = -100000;
             lastRefRawKappa = 0f;
             lastRefKappa = 0f;
             lastRefHeadStep = 0f;
@@ -376,6 +386,7 @@ namespace StreetRacing.Race
             try { drivingReference.Reset(); } catch { }
             try { perception.Reset(); } catch { }
             try { localWorld.Reset(); } catch { }
+            try { physicalSurface.Reset(); } catch { }
             try { spatialPlanner.Reset(); } catch { }
             try { recovery.Reset(t0); } catch { }
             try { trajViz.Reset(); } catch { }
@@ -415,6 +426,7 @@ namespace StreetRacing.Race
             catch { }
             viz.Enabled = debugViz;
             try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "DEBUG_VIZ", $"enabled={(debugViz ? 1 : 0)}"); } catch { }
+            try { telemetry?.Event(Math.Max(0, Game.GameTime - t0), "SPATIAL_BUILD", SpatialBuildTag); } catch { }
 
             hasKin = false;
             lastSpeed = originSpeed;
@@ -445,6 +457,8 @@ namespace StreetRacing.Race
             TestFailureReason = "";
             lastRoadModelEventMs = -100000;
             roadModelWasLow = false;
+            lastPhysicalSurfaceEventMs = -100000;
+            lastPhysicalSurfaceErrorMs = -100000;
             lastRefRawKappa = 0f;
             lastRefKappa = 0f;
             lastRefHeadStep = 0f;
@@ -522,6 +536,7 @@ namespace StreetRacing.Race
         {
             Running = false;
             try { actuator?.Stop(); } catch { }
+            try { physicalSurface.Reset(); } catch { }
         }
 
         private float EffectiveCruise()
@@ -865,11 +880,41 @@ namespace StreetRacing.Race
             }
             catch { }
 
+            // PhysicalSurfaceMap is deliberately observer-only in this pass.
+            // Keeping it off the control path lets us judge the representation
+            // visually before it can change race behavior.
+            if (viz.Enabled)
+            {
+                try
+                {
+                    physicalSurface.Tick(
+                        vehicle, lastRoadReference, route,
+                        egoPos, egoHeading, now);
+
+                    if (now - lastPhysicalSurfaceEventMs > 2000)
+                    {
+                        lastPhysicalSurfaceEventMs = now;
+                        telemetry?.Event(t, "PHYSICAL_SURFACE",
+                            SpatialBuildTag + ";" + physicalSurface.Detail);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (now - lastPhysicalSurfaceErrorMs > 2000)
+                    {
+                        lastPhysicalSurfaceErrorMs = now;
+                        telemetry?.Event(t, "PHYSICAL_SURFACE_ERROR",
+                            ex.GetType().Name + ":" + ex.Message);
+                    }
+                }
+            }
+
             try
             {
                 if (viz.Enabled)
                 {
-                    viz.Draw(route, corridor, trajViz, perception, speedViz, lastRoadReference, localWorld,
+                    viz.Draw(route, corridor, trajViz, perception, speedViz,
+                        lastRoadReference, localWorld, physicalSurface,
                         egoPos, lastEgoFwd, egoSpeed, LookaheadM, TargetSpeed);
                     if (!string.IsNullOrEmpty(viz.LastError)
                         && (viz.LastError != lastVizError || now - lastVizErrorMs > 3000))
