@@ -361,7 +361,11 @@ namespace StreetRacing
             });
             if (desired.Count > MaxDesiredCells)
                 desired.RemoveRange(MaxDesiredCells, desired.Count - MaxDesiredCells);
-            if (desiredCursor >= desired.Count) desiredCursor = 0;
+
+            // The list is freshly priority-sorted. Start at its front so new
+            // unknown cells directly ahead are sampled before stale side/rear
+            // work left over from the previous scaffold.
+            desiredCursor = 0;
         }
 
         private void AddDesired(
