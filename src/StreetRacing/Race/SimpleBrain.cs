@@ -1135,17 +1135,16 @@ namespace StreetRacing.Race
                     || absHead >= spatialUncertainLastHeadErr + 6f;
                 bool routeDiverging = route.IsLost
                     || route.PlanInvalid
-                    || absHead >= 35f
-                    || (uncertainAge >= 350 && absHead >= 24f && headGrowing)
-                    || (uncertainAge >= 1200 && absHead >= 18f);
+                    || absHead >= 45f
+                    || (uncertainAge >= 650 && absHead >= 35f && headGrowing);
                 spatialUncertainLastHeadErr = absHead;
 
                 // Once the old topology is visibly diverging, acquire a fresh
                 // GPS route from the CURRENT rival pose. The route object
                 // validates the candidate before mutating itself.
                 bool shouldReroute = routeDiverging
-                    && (route.PlanInvalid || uncertainAge >= 350)
-                    && now - lastLiveRerouteAttemptMs >= 1200;
+                    && (route.IsLost || route.PlanInvalid || absHead >= 45f)
+                    && now - lastLiveRerouteAttemptMs >= 2500;
                 if (shouldReroute)
                 {
                     lastLiveRerouteAttemptMs = now;
@@ -1213,6 +1212,23 @@ namespace StreetRacing.Race
                 {
                     joinState = "SpatialRerouteWait";
                     hasCurrent = false;
+
+                    // Do not park forever after a failed/no-op GPS rebuild.
+                    // A severe pose divergence is now a physical recovery
+                    // problem once route reacquisition has had a fair chance.
+                    if (uncertainAge >= 1800
+                        && liveRerouteAttempts > 0
+                        && !recovery.Active)
+                    {
+                        try
+                        {
+                            EnterRecovery(
+                                "spatial-route-divergence",
+                                now);
+                        }
+                        catch { }
+                    }
+
                     return BuildPlannerStop(
                         egoPos,
                         shouldReroute ? "ReroutePending" : "SpatialDiverging");
