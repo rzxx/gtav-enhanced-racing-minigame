@@ -106,11 +106,12 @@ namespace StreetRacing
         private int desiredCursor;
         private int lastDesiredRefreshMs = -100000;
         private int lastGroundBatchMs = -100000;
-        private int lastObstacleScanMs = -100000;
+        private int lastObstacleRayMs = -100000;
         private int lastGraphMs = -100000;
         private int lastEvictMs = -100000;
+        private int lastDetailMs = -100000;
         private bool graphDirty = true;
-        private int obstaclePhase;
+        private int obstacleRayCursor;
 
         private int groundOk;
         private int groundMiss;
@@ -133,7 +134,7 @@ namespace StreetRacing
         private const int GroundBatchIntervalMs = 75;
         private const int GroundSamplesPerBatch = 3;
         private const int CellFreshMs = 7000;
-        private const int ObstacleScanIntervalMs = 350;
+        private const int ObstacleRayIntervalMs = 60;
         private const float ObstacleRayHeightM = 1.25f;
         private const float ObstacleRayRangeM = 30f;
         private const int ObstaclePersistenceMs = 2500;
@@ -164,11 +165,12 @@ namespace StreetRacing
             desiredCursor = 0;
             lastDesiredRefreshMs = -100000;
             lastGroundBatchMs = -100000;
-            lastObstacleScanMs = -100000;
+            lastObstacleRayMs = -100000;
             lastGraphMs = -100000;
             lastEvictMs = -100000;
+            lastDetailMs = -100000;
             graphDirty = true;
-            obstaclePhase = 0;
+            obstacleRayCursor = 0;
 
             groundOk = 0;
             groundMiss = 0;
@@ -204,10 +206,10 @@ namespace StreetRacing
                 SampleGround(nowMs);
             }
 
-            if (nowMs - lastObstacleScanMs >= ObstacleScanIntervalMs)
+            if (nowMs - lastObstacleRayMs >= ObstacleRayIntervalMs)
             {
-                lastObstacleScanMs = nowMs;
-                ScanObstacleFan(egoVehicle, egoPos, egoHeading, nowMs);
+                lastObstacleRayMs = nowMs;
+                ScanOneObstacleRay(egoVehicle, egoPos, egoHeading, nowMs);
             }
 
             if (graphDirty || nowMs - lastGraphMs >= 300)
@@ -227,7 +229,11 @@ namespace StreetRacing
             lastTickMs = (float)((Stopwatch.GetTimestamp() - perfStart)
                 * 1000.0 / Stopwatch.Frequency);
             if (lastTickMs > peakTickMs) peakTickMs = lastTickMs;
-            UpdateDetail();
+            if (nowMs - lastDetailMs >= 400)
+            {
+                lastDetailMs = nowMs;
+                UpdateDetail();
+            }
         }
 
         private void RebuildDesired(
@@ -450,74 +456,71 @@ namespace StreetRacing
             }
         }
 
-        private void ScanObstacleFan(
+        private void ScanOneObstacleRay(
             Vehicle egoVehicle,
             Vector3 egoPos,
             float egoHeading,
             int nowMs)
         {
-            DebugObstacles.Clear();
+            if (obstacleRayCursor == 0)
+                DebugObstacles.Clear();
 
-            Vector3 startBase = new Vector3(
+            int i = obstacleRayCursor++;
+            if (obstacleRayCursor >= ObstacleAnglesDeg.Length)
+                obstacleRayCursor = 0;
+
+            Vector3 start = new Vector3(
                 egoPos.X,
                 egoPos.Y,
                 egoPos.Z + ObstacleRayHeightM);
+            float h = egoHeading + ObstacleAnglesDeg[i];
+            Vector3 dir = RaceMath.FlatNormalize(
+                RaceMath.VectorFromHeading(h));
+            Vector3 end = new Vector3(
+                start.X + dir.X * ObstacleRayRangeM,
+                start.Y + dir.Y * ObstacleRayRangeM,
+                start.Z);
 
-            // Alternate even/odd rays so a full fan is covered over two scans,
-            // while each scan stays cheap.
-            int phase = obstaclePhase++ & 1;
-            for (int i = phase; i < ObstacleAnglesDeg.Length; i += 2)
+            ShapeTestHandle handle = default(ShapeTestHandle);
+            try
             {
-                float h = egoHeading + ObstacleAnglesDeg[i];
-                Vector3 dir = RaceMath.FlatNormalize(
-                    RaceMath.VectorFromHeading(h));
-                Vector3 end = new Vector3(
-                    startBase.X + dir.X * ObstacleRayRangeM,
-                    startBase.Y + dir.Y * ObstacleRayRangeM,
-                    startBase.Z);
-
-                ShapeTestHandle handle = default(ShapeTestHandle);
-                try
-                {
-                    handle = ShapeTest.StartExpensiveSyncTestLOSProbe(
-                        startBase,
-                        end,
-                        ObstacleIntersectFlags,
-                        egoVehicle != null && egoVehicle.Exists()
-                            ? egoVehicle
-                            : null,
-                        ShapeTestOptions.Default);
-                }
-                catch { }
-
-                obstacleRays++;
-                if (handle.IsRequestFailed)
-                {
-                    obstacleFailed++;
-                    continue;
-                }
-
-                ShapeTestStatus status = ShapeTestStatus.NonExistent;
-                ShapeTestResult result = default(ShapeTestResult);
-                try { status = handle.GetResult(out result); }
-                catch { status = ShapeTestStatus.NonExistent; }
-
-                if (status != ShapeTestStatus.Ready)
-                {
-                    obstacleNotReady++;
-                    continue;
-                }
-                if (!result.DidHit) continue;
-
-                obstacleHits++;
-                DebugObstacles.Add(new DebugObstacle
-                {
-                    Position = result.HitPosition,
-                    Normal = result.SurfaceNormal,
-                });
-
-                MarkObstacle(result.HitPosition, nowMs);
+                handle = ShapeTest.StartExpensiveSyncTestLOSProbe(
+                    start,
+                    end,
+                    ObstacleIntersectFlags,
+                    egoVehicle != null && egoVehicle.Exists()
+                        ? egoVehicle
+                        : null,
+                    ShapeTestOptions.Default);
             }
+            catch { }
+
+            obstacleRays++;
+            if (handle.IsRequestFailed)
+            {
+                obstacleFailed++;
+                return;
+            }
+
+            ShapeTestStatus status = ShapeTestStatus.NonExistent;
+            ShapeTestResult result = default(ShapeTestResult);
+            try { status = handle.GetResult(out result); }
+            catch { status = ShapeTestStatus.NonExistent; }
+
+            if (status != ShapeTestStatus.Ready)
+            {
+                obstacleNotReady++;
+                return;
+            }
+            if (!result.DidHit) return;
+
+            obstacleHits++;
+            DebugObstacles.Add(new DebugObstacle
+            {
+                Position = result.HitPosition,
+                Normal = result.SurfaceNormal,
+            });
+            MarkObstacle(result.HitPosition, nowMs);
         }
 
         private void MarkObstacle(Vector3 hit, int nowMs)
@@ -713,7 +716,7 @@ namespace StreetRacing
                     continue;
                 DebugCells.Add(c);
                 cellsAdded++;
-                if (cellsAdded >= 240) break;
+                if (cellsAdded >= 160) break;
             }
 
             // Only show BLOCKED local connections. Hundreds of open-edge draw
