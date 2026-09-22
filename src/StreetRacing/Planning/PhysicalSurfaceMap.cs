@@ -117,6 +117,34 @@ namespace StreetRacing
             public bool HasParent;
         }
 
+        private struct EdgeKey : IEquatable<EdgeKey>
+        {
+            public CellKey A;
+            public CellKey B;
+
+            public bool Equals(EdgeKey other)
+            {
+                return A.Equals(other.A) && B.Equals(other.B);
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is EdgeKey && Equals((EdgeKey)obj);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked { return A.GetHashCode() * 397 ^ B.GetHashCode(); }
+            }
+        }
+
+        private sealed class EdgeInfo
+        {
+            public bool Known;
+            public bool Open;
+            public int LastVerifiedMs;
+        }
+
         public readonly List<Cell> DebugCells = new List<Cell>(220);
         public readonly List<DebugEdge> DebugEdges = new List<DebugEdge>(80);
         public readonly List<DebugObstacle> DebugObstacles = new List<DebugObstacle>(24);
@@ -128,6 +156,8 @@ namespace StreetRacing
             new List<FrontierRequest>(420);
         private readonly HashSet<CellKey> frontierKeys =
             new HashSet<CellKey>();
+        private readonly Dictionary<EdgeKey, EdgeInfo> edges =
+            new Dictionary<EdgeKey, EdgeInfo>();
         private readonly List<Vector3> guidePoints =
             new List<Vector3>(32);
         private readonly Queue<Cell> flood = new Queue<Cell>(420);
@@ -166,6 +196,11 @@ namespace StreetRacing
         private int trajectorySweeps;
         private int trajectorySweepHits;
         private int trajectorySweepBudgetStops;
+        private int edgeChecks;
+        private int edgeBlocks;
+        private int edgeBudgetStops;
+        private float lastEdgeMs;
+        private float peakEdgeMs;
         private float lastSweepMs;
         private float peakSweepMs;
         private float lastTickMs;
@@ -191,6 +226,10 @@ namespace StreetRacing
         private const int GroundMaxSamplesPerBatch = 18;
         private const double GroundBudgetMs = 0.60;
         private const int CellFreshMs = 6500;
+        private const int EdgeFreshMs = 12000;
+        private const int EdgeChecksPerBatch = 5;
+        private const double EdgeBudgetMs = 0.55;
+        private const float EdgeProbeHeightM = 0.90f;
 
         private const int ObstacleRayIntervalMs = 100;
         private const float ObstacleRayHeightM = 1.15f;
@@ -220,6 +259,7 @@ namespace StreetRacing
             cells.Clear();
             frontier.Clear();
             frontierKeys.Clear();
+            edges.Clear();
             guidePoints.Clear();
             flood.Clear();
             distanceFlood.Clear();
@@ -260,6 +300,11 @@ namespace StreetRacing
             trajectorySweeps = 0;
             trajectorySweepHits = 0;
             trajectorySweepBudgetStops = 0;
+            edgeChecks = 0;
+            edgeBlocks = 0;
+            edgeBudgetStops = 0;
+            lastEdgeMs = 0f;
+            peakEdgeMs = 0f;
             lastSweepMs = 0f;
             peakSweepMs = 0f;
             lastTickMs = 0f;
