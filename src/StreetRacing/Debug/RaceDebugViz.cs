@@ -83,6 +83,25 @@ namespace StreetRacing.Debug
             float lookaheadM,
             float targetSpeed)
         {
+            Draw(route, corridor, traj, perception, speedPlan, roadReference,
+                localWorld, null, egoPos, egoFwd, egoSpeed, lookaheadM, targetSpeed);
+        }
+
+        public void Draw(
+            RaceRoute route,
+            RoadCorridor corridor,
+            TrajectoryPlanner traj,
+            Perception perception,
+            SpeedPlanner speedPlan,
+            DrivingReference.Result roadReference,
+            LocalWorldModel localWorld,
+            PhysicalSurfaceMap physicalSurface,
+            Vector3 egoPos,
+            Vector3 egoFwd,
+            float egoSpeed,
+            float lookaheadM,
+            float targetSpeed)
+        {
             if (!Enabled) return;
             try
             {
@@ -91,6 +110,7 @@ namespace StreetRacing.Debug
                     DrawLocalWorld(localWorld);
                 else if (roadReference == null)
                     DrawCorridor(corridor);
+                DrawPhysicalSurface(physicalSurface);
                 DrawRoadReference(roadReference);
                 DrawRouteGates(traj);
                 DrawCandidates(traj);
@@ -244,6 +264,81 @@ namespace StreetRacing.Debug
                     Vector3 a = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.2f);
                     Vector3 b = new Vector3(cell.Position.X, cell.Position.Y, cell.Position.Z + 0.7f);
                     World.DrawLine(a, b, col);
+                }
+            }
+            catch { }
+        }
+
+        private static void DrawPhysicalSurface(PhysicalSurfaceMap map)
+        {
+            try
+            {
+                if (map == null) return;
+
+                // Bright physical mesh over the older road-support model:
+                //   green = reachable + GTA road semantic
+                //   cyan  = reachable physical surface GTA does NOT call road
+                //   violet = traversable but physically disconnected from ego
+                //   red = sampled surface too steep for the car
+                //   dark gray = sampled location with no surface in the layer
+                for (int i = 0; i < map.DebugCells.Count; i++)
+                {
+                    var c = map.DebugCells[i];
+                    System.Drawing.Color col;
+                    Vector3 p;
+
+                    if (c.State == PhysicalSurfaceMap.SurfaceState.Traversable)
+                    {
+                        p = c.Position;
+                        if (c.Reachable)
+                        {
+                            col = c.RoadSemantic
+                                ? System.Drawing.Color.FromArgb(210, 40, 255, 90)
+                                : System.Drawing.Color.FromArgb(230, 20, 230, 255);
+                        }
+                        else
+                        {
+                            col = System.Drawing.Color.FromArgb(175, 185, 80, 255);
+                        }
+                    }
+                    else if (c.State == PhysicalSurfaceMap.SurfaceState.TooSteep)
+                    {
+                        p = c.Position;
+                        col = System.Drawing.Color.FromArgb(220, 255, 45, 35);
+                    }
+                    else if (c.State == PhysicalSurfaceMap.SurfaceState.NoSurface)
+                    {
+                        p = c.SamplePosition;
+                        col = System.Drawing.Color.FromArgb(70, 100, 100, 100);
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    float height = c.Reachable
+                        ? 0.28f + Math.Min(c.ClearanceM, 8f) * 0.035f
+                        : 0.22f;
+                    World.DrawLine(
+                        new Vector3(p.X, p.Y, p.Z + 0.12f),
+                        new Vector3(p.X, p.Y, p.Z + 0.12f + height),
+                        col);
+                }
+
+                // Connectivity is the important part: surface points on opposite
+                // sides of a guardrail must not look connected merely because
+                // both downward rays hit flat ground.
+                for (int i = 0; i < map.DebugEdges.Count; i++)
+                {
+                    var e = map.DebugEdges[i];
+                    var col = e.Open
+                        ? System.Drawing.Color.FromArgb(80, 60, 255, 140)
+                        : System.Drawing.Color.FromArgb(235, 255, 35, 35);
+                    float z = Math.Max(e.A.Z, e.B.Z) + (e.Open ? 0.18f : 0.55f);
+                    World.DrawLine(
+                        new Vector3(e.A.X, e.A.Y, z),
+                        new Vector3(e.B.X, e.B.Y, z),
+                        col);
                 }
             }
             catch { }
