@@ -1030,7 +1030,8 @@ namespace StreetRacing.Race
             // receding-horizon search.
             float routeRemainNow = Math.Max(
                 0f, route.TotalLength - route.AlongS);
-            bool finishOutstanding = FinishGap > 7f && FinishGap <= 180f;
+            bool finishOutstanding = FinishGap > 7f
+                && FinishGap <= (finishGoalActive ? 260f : 180f);
             bool routeExhausted = route.Progress01 >= 0.985f
                 || routeRemainNow <= 28f;
 
@@ -1075,13 +1076,24 @@ namespace StreetRacing.Race
 
                 if (terminalPhase)
                 {
-                    try
+                    if (!finishGoalActive)
                     {
-                        telemetry?.Event(now - t0, "TERMINAL_SPATIAL",
-                            $"reference-ended;routeRemain={routeRemain:F1};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                        finishGoalActive = true;
+                        finishGoalEnteredMs = now;
+                        hasCurrent = false;
+                        try { spatialPlanner.Reset(); } catch { }
+                        lastRoadReference = null;
+                        try
+                        {
+                            telemetry?.Event(
+                                now - t0,
+                                "FINISH_GOAL_ENTER",
+                                $"reference-ended;routeRemain={routeRemain:F1};progress={route.Progress01:F3};finishGap={FinishGap:F1};ref={lastRefDetail}");
+                        }
+                        catch { }
                     }
-                    catch { }
-                    return BuildTerminalSpatial(egoPos, egoSpeed, dtPlan, cruise);
+                    return BuildTerminalSpatial(
+                        egoPos, egoSpeed, dtPlan, cruise);
                 }
 
                 if (referenceInvalidSinceMs < 0)
