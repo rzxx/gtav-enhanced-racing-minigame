@@ -165,10 +165,11 @@ namespace StreetRacing
                 : egoSpeed >= 10f ? 0.026f
                 : egoSpeed >= 6f ? 0.040f
                 : 0.070f;
-            continuityWeight = egoSpeed >= 20f ? 2.4f
-                : egoSpeed >= 14f ? 1.8f
-                : egoSpeed >= 8f ? 1.25f
-                : 0.75f;
+            // Commitment is only a small anti-jitter preference. It must not
+            // overpower route topology or uncertain-but-necessary replanning.
+            continuityWeight = egoSpeed >= 16f ? 1.00f
+                : egoSpeed >= 8f ? 0.80f
+                : 0.60f;
 
             BuildRouteGates(route, finishTarget);
             float goalS = Math.Min(route.TotalLength, route.AlongS + 75f);
@@ -185,7 +186,27 @@ namespace StreetRacing
                 float continuityDist;
                 continuityBaseS = ClosestStationOnPath(
                     egoPos, committedPath, committedStationS, out continuityDist);
-                continuityActive = continuityDist <= 7.0f;
+                continuityActive = continuityDist <= 7.0f
+                    && Math.Abs(route.HeadingErrorDeg) <= 20f;
+
+                // A previously chosen path is not an incumbent merely because
+                // the car is physically close to it. It must still lead through
+                // the next route aperture. Otherwise commitment is exactly the
+                // wrong thing: it makes a missed turn self-reinforcing.
+                if (continuityActive && routeGates.Count > 0)
+                {
+                    RouteGate g = routeGates[0];
+                    Vector3 probe = PointOnPathAtS(
+                        committedPath, committedStationS,
+                        continuityBaseS + 18f);
+                    Vector3 rel = new Vector3(
+                        probe.X - g.Center.X,
+                        probe.Y - g.Center.Y, 0f);
+                    float gateLat = Math.Abs(RaceMath.FlatCross(g.Dir, rel));
+                    float gateAlong = RaceMath.FlatDot(rel, g.Dir);
+                    if (gateLat > g.HalfWidthM + 3.5f || gateAlong < -7f)
+                        continuityActive = false;
+                }
             }
 
             pool.Clear();
@@ -314,7 +335,8 @@ namespace StreetRacing
             LastPoolCount = pool.Count;
             LastPlanMs = (float)((Stopwatch.GetTimestamp() - perfStart) * 1000.0 / Stopwatch.Frequency);
             result.Detail = $"intent={intent};score={chosen.Score:F1};meanV={chosen.MeanSpeed:F1};"
-                + $"motionK={motionRootCurvature:F3};kStep={motionCurvatureStep:F3};commitW={continuityWeight:F2};"
+                + $"motionK={motionRootCurvature:F3};kStep={motionCurvatureStep:F3};"
+                + $"commitW={continuityWeight:F2};commitActive={(continuityActive ? 1 : 0)};"
                 + $"minV={chosen.MinSpeed:F1};clear={chosen.MinPredClearance:F1};"
                 + $"constr={(chosen.ConstrainHandle != -1 ? chosen.ConstrainKind + "#" + chosen.ConstrainHandle : "none")};"
                 + $"opp={chosen.OpposingFraction:F2};unknown={chosen.UnknownFraction:F2};"
@@ -517,6 +539,13 @@ namespace StreetRacing
             ReconstructPath(leafIndex, world, searchSpeed, aLat, out path, out headings);
 
             SearchNode leaf = pool[leafIndex];
+            int requiredGateProgress = Math.Min(2, routeGates.Count);
+            string routeReject = "";
+            if (leaf.GateMissed)
+                routeReject = "missed-route-gate";
+            else if (leaf.GateIndex < requiredGateProgress)
+                routeReject = "insufficient-route-gate-progress";
+
             var c = new TrajectoryCandidate
             {
                 CandidateIndex = index,
@@ -524,7 +553,7 @@ namespace StreetRacing
                 Path = path,
                 StationS = BuildStationS(path),
                 AimPoint = path[path.Count - 1],
-                RejectReason = leaf.GateMissed ? "missed-route-gate" : "",
+                RejectReason = routeReject,
                 ConstrainHandle = -1,
                 ConstrainKind = "",
                 ConstrainS = -1f,
