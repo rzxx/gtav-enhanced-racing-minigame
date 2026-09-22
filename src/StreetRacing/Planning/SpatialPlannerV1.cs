@@ -114,6 +114,7 @@ namespace StreetRacing
 
         public Result Plan(
             LocalWorldModel world,
+            PhysicalSurfaceMap physicalSurface,
             RaceRoute route,
             VehicleCapability capability,
             DriverProfile profile,
@@ -121,6 +122,7 @@ namespace StreetRacing
             float egoHeading,
             float egoSpeed,
             float egoYawRateRadS,
+            float egoHalfWidth,
             float cruise,
             int nowMs,
             Vector3 finishTarget)
@@ -287,21 +289,64 @@ namespace StreetRacing
                 LastCandidates.Add(c);
             }
 
-            int best = -1;
-            float bestScore = float.MinValue;
+            // Score first, then physically validate only the few choices
+            // that could actually win. This keeps collision natives bounded:
+            // the broad map handles free-space understanding, while a small
+            // exact sweep vetoes walls, trees and guardrails on the final line.
+            var order = new List<int>(LastCandidates.Count);
             for (int i = 0; i < LastCandidates.Count; i++)
+                if (string.IsNullOrEmpty(LastCandidates[i].RejectReason))
+                    order.Add(i);
+            order.Sort((a, b) =>
+                LastCandidates[b].Score.CompareTo(LastCandidates[a].Score));
+
+            int best = -1;
+            int physicalChecks = 0;
+            int physicalBlocks = 0;
+            string physicalDetail = "none";
+            const int maxPhysicalChecks = 3;
+
+            for (int oi = 0; oi < order.Count; oi++)
             {
-                var c = LastCandidates[i];
-                if (!string.IsNullOrEmpty(c.RejectReason)) continue;
-                if (c.Score > bestScore)
+                int ci = order[oi];
+                var c = LastCandidates[ci];
+
+                if (physicalSurface != null)
                 {
-                    bestScore = c.Score;
-                    best = i;
+                    if (physicalChecks >= maxPhysicalChecks)
+                        break;
+
+                    var pc = physicalSurface.CheckTrajectory(
+                        c.Path, c.StationS, egoHalfWidth);
+                    physicalChecks++;
+
+                    if (pc.Available)
+                    {
+                        physicalDetail = pc.Detail ?? "";
+                        if (pc.Blocked)
+                        {
+                            physicalBlocks++;
+                            c.RejectReason =
+                                $"physical-static@{pc.BlockedS:F0}";
+                            LastCandidates[ci] = c;
+                            continue;
+                        }
+                    }
                 }
+
+                best = ci;
+                break;
             }
+
             if (best < 0)
             {
-                result.Detail = "no-final-candidate";
+                LastPlanMs = (float)((Stopwatch.GetTimestamp() - perfStart)
+                    * 1000.0 / Stopwatch.Frequency);
+                result.Detail =
+                    $"no-final-candidate;physicalChecks={physicalChecks};"
+                    + $"physicalBlocks={physicalBlocks};physical={physicalDetail};"
+                    + $"planMs={LastPlanMs:F1}";
+                LastDecision = result.Detail;
                 return result;
             }
 
@@ -343,6 +388,7 @@ namespace StreetRacing
                 + $"flow={chosen.MeanFlowCost:F2};dz={chosen.ElevationDeltaM:F1};"
                 + $"gates={chosen.RouteGatesPassed}/{routeGates.Count};surf={chosen.SurfaceComponentId};"
                 + $"gateMiss={chosen.GateMissCost:F1};"
+                + $"physicalChecks={physicalChecks};physicalBlocks={physicalBlocks};physical={physicalDetail};"
                 + $"{world.Detail};planMs={LastPlanMs:F1};pool={pool.Count};beam={beam.Count};cand={LastCandidates.Count};"
                 + $"top={Summarize(LastCandidates)}";
 
