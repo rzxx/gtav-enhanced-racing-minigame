@@ -161,7 +161,6 @@ namespace StreetRacing
         private int lastGraphMs = -100000;
         private int lastEvictMs = -100000;
         private bool graphDirty = true;
-        private Vector3 lastEgoPos;
 
         private const float GridM = 2.5f;
         private const float LayerBucketM = 4.0f;
@@ -213,8 +212,6 @@ namespace StreetRacing
             float egoHeading,
             int nowMs)
         {
-            lastEgoPos = egoPos;
-
             PollGroundResults(nowMs);
             PollEdgeResults(nowMs);
 
@@ -446,19 +443,30 @@ namespace StreetRacing
                     continue;
                 }
 
-                var hitArg = new OutputArgument();
-                var endArg = new OutputArgument();
-                var normalArg = new OutputArgument();
-                var entityArg = new OutputArgument();
-
                 int status = 0;
-                try
+                bool hit = false;
+                Vector3 hitPos = cell.SamplePosition;
+                Vector3 normal = new Vector3(0f, 0f, 1f);
+
+                using (var hitArg = new OutputArgument())
+                using (var endArg = new OutputArgument())
+                using (var normalArg = new OutputArgument())
+                using (var entityArg = new OutputArgument())
                 {
-                    status = Function.Call<int>(
-                        Hash.GET_SHAPE_TEST_RESULT,
-                        p.Handle, hitArg, endArg, normalArg, entityArg);
+                    try
+                    {
+                        status = Function.Call<int>(
+                            Hash.GET_SHAPE_TEST_RESULT,
+                            p.Handle, hitArg, endArg, normalArg, entityArg);
+                        if (status == 2)
+                        {
+                            hit = hitArg.GetResult<bool>();
+                            hitPos = endArg.GetResult<Vector3>();
+                            normal = normalArg.GetResult<Vector3>();
+                        }
+                    }
+                    catch { status = 0; hit = false; }
                 }
-                catch { status = 0; }
 
                 if (status == 1) continue;
 
@@ -471,17 +479,6 @@ namespace StreetRacing
                     cell.State = SurfaceState.Unknown;
                     continue;
                 }
-
-                bool hit = false;
-                Vector3 hitPos = cell.SamplePosition;
-                Vector3 normal = new Vector3(0f, 0f, 1f);
-                try
-                {
-                    hit = hitArg.GetResult<bool>();
-                    hitPos = endArg.GetResult<Vector3>();
-                    normal = normalArg.GetResult<Vector3>();
-                }
-                catch { hit = false; }
 
                 if (!hit)
                 {
@@ -558,10 +555,10 @@ namespace StreetRacing
 
                     Vector3 start = new Vector3(
                         a.Position.X, a.Position.Y,
-                        Math.Max(a.Position.Z, b.Position.Z) + EdgeCapsuleHeightM);
+                        a.Position.Z + EdgeCapsuleHeightM);
                     Vector3 end = new Vector3(
                         b.Position.X, b.Position.Y,
-                        Math.Max(a.Position.Z, b.Position.Z) + EdgeCapsuleHeightM);
+                        b.Position.Z + EdgeCapsuleHeightM);
 
                     int ignore = 0;
                     try { if (egoVehicle != null && egoVehicle.Exists()) ignore = egoVehicle.Handle; }
@@ -613,19 +610,23 @@ namespace StreetRacing
                     continue;
                 }
 
-                var hitArg = new OutputArgument();
-                var endArg = new OutputArgument();
-                var normalArg = new OutputArgument();
-                var entityArg = new OutputArgument();
-
                 int status = 0;
-                try
+                bool hit = true;
+                using (var hitArg = new OutputArgument())
+                using (var endArg = new OutputArgument())
+                using (var normalArg = new OutputArgument())
+                using (var entityArg = new OutputArgument())
                 {
-                    status = Function.Call<int>(
-                        Hash.GET_SHAPE_TEST_RESULT,
-                        p.Handle, hitArg, endArg, normalArg, entityArg);
+                    try
+                    {
+                        status = Function.Call<int>(
+                            Hash.GET_SHAPE_TEST_RESULT,
+                            p.Handle, hitArg, endArg, normalArg, entityArg);
+                        if (status == 2)
+                            hit = hitArg.GetResult<bool>();
+                    }
+                    catch { status = 0; hit = true; }
                 }
-                catch { status = 0; }
 
                 if (status == 1) continue;
 
@@ -637,10 +638,6 @@ namespace StreetRacing
                     edge.Known = false;
                     continue;
                 }
-
-                bool hit = true;
-                try { hit = hitArg.GetResult<bool>(); }
-                catch { hit = true; }
 
                 edge.Known = true;
                 edge.Open = !hit;
