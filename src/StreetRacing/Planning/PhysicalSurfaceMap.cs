@@ -197,8 +197,8 @@ namespace StreetRacing
         private const float ObstacleRayRangeM = 32f;
         private const int ObstaclePersistenceMs = 3000;
 
-        private const int TrajectorySweepMaxRays = 8;
-        private const double TrajectorySweepBudgetMs = 0.80;
+        private const int TrajectorySweepMaxRays = 6;
+        private const double TrajectorySweepBudgetMs = 0.55;
         private const float TrajectorySweepHeightM = 0.85f;
         private const float TrajectorySweepDistanceM = 42f;
 
