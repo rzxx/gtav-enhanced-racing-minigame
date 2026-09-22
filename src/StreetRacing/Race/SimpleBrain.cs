@@ -181,7 +181,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "physical-traversability-observer-v4";
+        private const string SpatialBuildTag = "reachable-future-surface-v1";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -895,16 +895,17 @@ namespace StreetRacing.Race
             }
             catch { }
 
-            // PhysicalSurfaceMap is deliberately observer-only in this pass.
-            // Keeping it off the control path lets us judge the representation
-            // visually before it can change race behavior.
-            if (viz.Enabled)
+            // Physical free-space perception is part of planning now, not a
+            // DebugViz feature. Keep it running even when visualization is off;
+            // the planner consumes its previous-frame world evidence and uses
+            // its bounded exact sweep as a final static-collision veto.
+            if (IsGpsSource())
             {
                 try
                 {
                     physicalSurface.Tick(
                         vehicle, lastRoadReference, route,
-                        egoPos, egoHeading, now);
+                        egoPos, egoHeading, forwardPlanSpeed, now);
 
                     if (now - lastPhysicalSurfaceEventMs > 2000)
                     {
@@ -1094,8 +1095,8 @@ namespace StreetRacing.Race
                 // Do not also build the legacy LocalWorld debug grid every plan;
                 // road supports themselves remain visible in RaceDebugViz.
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, false);
-                sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                sp = spatialPlanner.Plan(localWorld, physicalSurface, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate, egoHalfWidth,
                     cruise, Game.GameTime, finish);
             }
             catch { sp = null; }
@@ -1248,8 +1249,8 @@ namespace StreetRacing.Race
                 // the final local search.
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
                     egoHalfLength, egoHalfWidth, false);
-                var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                var sp = spatialPlanner.Plan(localWorld, physicalSurface, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate, egoHalfWidth,
                     cruise, Game.GameTime, finish);
                 if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
                 {
