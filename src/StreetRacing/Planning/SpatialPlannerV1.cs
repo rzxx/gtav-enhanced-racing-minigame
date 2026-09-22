@@ -522,7 +522,12 @@ namespace StreetRacing
                             // Connected physical ground overrides the legacy
                             // model's "unknown/narrow road support" penalty, but
                             // does NOT erase flow direction or actor costs.
-                            surfaceCost = Math.Min(surfaceCost, 0.35f);
+                            // Non-road physical ground remains usable but mildly
+                            // undesirable (grass/shoulder/island vs asphalt).
+                            float physicalCost = pq.RoadSemantic
+                                ? 0.30f
+                                : 1.80f;
+                            surfaceCost = Math.Min(surfaceCost, physicalCost);
                         }
                     }
                 }
