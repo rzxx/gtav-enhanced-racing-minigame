@@ -57,6 +57,16 @@ namespace StreetRacing
             public Vector3 Normal;
         }
 
+        internal struct PointQuery
+        {
+            public bool Known;
+            public bool Reachable;
+            public bool StaticObstacle;
+            public bool RoadSemantic;
+            public float SurfaceZ;
+            public float ClearanceM;
+        }
+
         internal struct TrajectoryCheck
         {
             public bool Available;
@@ -327,6 +337,56 @@ namespace StreetRacing
                 lastDetailMs = nowMs;
                 UpdateDetail();
             }
+        }
+
+        /// Positive physical evidence lookup. Unknown / no-ground cells are
+        /// deliberately NOT returned as negative evidence: only a sampled
+        /// traversable surface may override the legacy road model.
+        public bool TryQueryPoint(Vector3 p, out PointQuery query)
+        {
+            query = new PointQuery
+            {
+                Known = false,
+                Reachable = false,
+                StaticObstacle = false,
+                RoadSemantic = false,
+                SurfaceZ = p.Z,
+                ClearanceM = 0f,
+            };
+
+            int x = (int)Math.Round(p.X / GridM);
+            int y = (int)Math.Round(p.Y / GridM);
+            int layer = (int)Math.Round(p.Z / LayerBucketM);
+            Cell best = null;
+            float bestDz = float.MaxValue;
+
+            for (int dl = -1; dl <= 1; dl++)
+            {
+                CellKey key = new CellKey
+                {
+                    X = x,
+                    Y = y,
+                    Layer = layer + dl,
+                };
+                Cell c;
+                if (!cells.TryGetValue(key, out c)) continue;
+                if (c.State != SurfaceState.Traversable) continue;
+
+                float dz = Math.Abs(c.Position.Z - p.Z);
+                if (dz > 2.8f || dz >= bestDz) continue;
+                bestDz = dz;
+                best = c;
+            }
+
+            if (best == null) return false;
+
+            query.Known = true;
+            query.Reachable = best.Reachable && !best.StaticObstacle;
+            query.StaticObstacle = best.StaticObstacle;
+            query.RoadSemantic = best.RoadSemantic;
+            query.SurfaceZ = best.Position.Z;
+            query.ClearanceM = best.ClearanceM;
+            return true;
         }
 
         /// Conservative physical veto for a final trajectory candidate.
