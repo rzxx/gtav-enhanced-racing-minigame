@@ -1119,7 +1119,7 @@ namespace StreetRacing.Race
                 // road nodes + ordered route/finish gates are sufficient for
                 // the final local search.
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
-                    egoHalfLength, egoHalfWidth, viz.Enabled);
+                    egoHalfLength, egoHalfWidth, false);
                 var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, lastYawRate,
                     cruise, Game.GameTime, finish);
