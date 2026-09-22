@@ -492,6 +492,7 @@ namespace StreetRacing
 
                 int bestSeg = -1;
                 float bestDist = float.MaxValue;
+                float bestScore = float.MaxValue;
                 RaceMath.Projection bestPr = new RaceMath.Projection();
                 Vector3 bestDir = new Vector3(0f, 1f, 0f);
 
@@ -515,8 +516,15 @@ namespace StreetRacing
 
                         RaceMath.Projection pr =
                             RaceMath.ProjectOnSegment(egoPos, a, b);
-                        if (pr.Dist >= bestDist) continue;
+                        float segHeading =
+                            RaceMath.HeadingFromVector(dir);
+                        float headErr = Math.Abs(
+                            RaceMath.HeadingDiffDeg(
+                                segHeading, egoHeadingDeg));
+                        float score = pr.Dist + headErr * 0.20f;
+                        if (score >= bestScore) continue;
 
+                        bestScore = score;
                         bestSeg = i;
                         bestDist = pr.Dist;
                         bestPr = pr;
@@ -528,12 +536,15 @@ namespace StreetRacing
                     {
                         bestSeg = -1;
                         bestDist = float.MaxValue;
+                        bestScore = float.MaxValue;
                     }
                 }
 
-                if (bestSeg < 0 || bestDist > 45f)
+                float maxProjectionDist = RaceMath.Clamp(
+                    corridorHalfWidth + 20f, 25f, 45f);
+                if (bestSeg < 0 || bestDist > maxProjectionDist)
                 {
-                    rebuildLog = $"snapshot-not-near;dist={bestDist:F1};{acquire}";
+                    rebuildLog = $"snapshot-not-near;dist={bestDist:F1};limit={maxProjectionDist:F1};{acquire}";
                     return false;
                 }
 
@@ -541,7 +552,7 @@ namespace StreetRacing
                     RaceMath.HeadingFromVector(bestDir);
                 float newHeadErr = RaceMath.HeadingDiffDeg(
                     newHeading, egoHeadingDeg);
-                if (Math.Abs(newHeadErr) > 65f)
+                if (Math.Abs(newHeadErr) > PlanInvalidHeadErrDeg)
                 {
                     rebuildLog = $"snapshot-heading-incompatible;dist={bestDist:F1};headErr={newHeadErr:F0};{acquire}";
                     return false;
