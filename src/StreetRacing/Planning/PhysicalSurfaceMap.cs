@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using GTA;
 using GTA.Math;
 using GTA.Native;
@@ -8,26 +9,16 @@ namespace StreetRacing
 {
     /// Debug-only physical traversability observer.
     ///
-    /// This is intentionally NOT consumed by SpatialPlannerV1 yet. The purpose
-    /// of the first pass is to establish whether we can reconstruct useful local
-    /// drivable space from the physical world before replacing LocalWorldModel.
-    ///
-    /// Geometry comes from collision shape tests:
-    ///   - downward LOS probes discover a local surface, Z and normal
-    ///   - capsule probes between neighboring cells discover walls/barriers
-    ///   - a graph over confirmed-open edges gives physical connectivity
-    ///   - flood fill from the ego surface gives the currently reachable patch
-    ///
-    /// GTA road classification is stored only as semantic annotation. A cell can
-    /// be physically reachable even when IS_POINT_ON_ROAD says false.
+    /// V3 deliberately avoids long-lived asynchronous shape tests. Ground
+    /// geometry comes from GTA's direct ground-height query under a strict
+    /// local Z-layer gate. Static obstacles are sampled sparsely with a small
+    /// synchronous LOS fan. SpatialPlannerV1 does NOT consume this map yet.
     internal sealed class PhysicalSurfaceMap
     {
         internal enum SurfaceState
         {
             Unknown,
-            Pending,
             NoSurface,
-            TooSteep,
             Traversable,
         }
 
@@ -36,19 +27,17 @@ namespace StreetRacing
             public CellKey Key;
             public Vector3 SamplePosition;
             public Vector3 Position;
-            public Vector3 Normal;
             public SurfaceState State;
             public bool RoadSemantic;
             public bool Reachable;
+            public bool StaticObstacle;
             public int ComponentId = -1;
             public float ClearanceM;
             public int LastWantedMs;
             public int LastSampleMs;
-            public bool GroundPending;
+            public int LastObstacleMs;
 
-            public bool HasSurface =>
-                State == SurfaceState.Traversable || State == SurfaceState.TooSteep;
-            public bool Traversable => State == SurfaceState.Traversable;
+            public bool Traversable => State == SurfaceState.Traversable && !StaticObstacle;
         }
 
         internal struct DebugEdge
@@ -56,6 +45,12 @@ namespace StreetRacing
             public Vector3 A;
             public Vector3 B;
             public bool Open;
+        }
+
+        internal struct DebugObstacle
+        {
+            public Vector3 Position;
+            public Vector3 Normal;
         }
 
         internal struct CellKey : IEquatable<CellKey>
@@ -86,35 +81,6 @@ namespace StreetRacing
             }
         }
 
-        private struct EdgeKey : IEquatable<EdgeKey>
-        {
-            public CellKey A;
-            public CellKey B;
-
-            public bool Equals(EdgeKey other)
-            {
-                return A.Equals(other.A) && B.Equals(other.B);
-            }
-
-            public override bool Equals(object obj)
-            {
-                return obj is EdgeKey && Equals((EdgeKey)obj);
-            }
-
-            public override int GetHashCode()
-            {
-                unchecked { return A.GetHashCode() * 397 ^ B.GetHashCode(); }
-            }
-        }
-
-        private sealed class EdgeInfo
-        {
-            public bool Known;
-            public bool Open;
-            public bool Pending;
-            public int LastSampleMs;
-        }
-
         private struct ProbeRequest
         {
             public CellKey Key;
@@ -123,100 +89,96 @@ namespace StreetRacing
             public float Priority;
         }
 
-        private struct PendingGround
-        {
-            public ShapeTestHandle Handle;
-            public CellKey Key;
-            public int StartedMs;
-        }
-
-        private struct PendingEdge
-        {
-            public ShapeTestHandle Handle;
-            public EdgeKey Key;
-            public int StartedMs;
-        }
-
-        public readonly List<Cell> DebugCells = new List<Cell>(700);
-        public readonly List<DebugEdge> DebugEdges = new List<DebugEdge>(900);
+        public readonly List<Cell> DebugCells = new List<Cell>(260);
+        public readonly List<DebugEdge> DebugEdges = new List<DebugEdge>(80);
+        public readonly List<DebugObstacle> DebugObstacles = new List<DebugObstacle>(20);
         public string Detail { get; private set; } = "";
 
         private readonly Dictionary<CellKey, Cell> cells =
             new Dictionary<CellKey, Cell>();
-        private readonly Dictionary<EdgeKey, EdgeInfo> edges =
-            new Dictionary<EdgeKey, EdgeInfo>();
         private readonly List<ProbeRequest> desired =
-            new List<ProbeRequest>(900);
+            new List<ProbeRequest>(300);
         private readonly HashSet<CellKey> desiredKeys =
             new HashSet<CellKey>();
-        private readonly List<PendingGround> pendingGround =
-            new List<PendingGround>(64);
-        private readonly List<PendingEdge> pendingEdge =
-            new List<PendingEdge>(64);
-        private readonly Queue<Cell> flood = new Queue<Cell>(900);
-        private readonly Queue<Cell> distanceFlood = new Queue<Cell>(900);
+        private readonly Queue<Cell> flood = new Queue<Cell>(320);
+        private readonly Queue<Cell> distanceFlood = new Queue<Cell>(320);
 
         private int desiredCursor;
         private int lastDesiredRefreshMs = -100000;
+        private int lastGroundBatchMs = -100000;
+        private int lastObstacleScanMs = -100000;
         private int lastGraphMs = -100000;
         private int lastEvictMs = -100000;
         private bool graphDirty = true;
+        private int obstaclePhase;
 
-        private const float GridM = 2.5f;
+        private int groundOk;
+        private int groundMiss;
+        private int groundLayerReject;
+        private int obstacleRays;
+        private int obstacleHits;
+        private int obstacleNotReady;
+        private int obstacleFailed;
+        private float lastTickMs;
+        private float peakTickMs;
+
+        private const float GridM = 3.0f;
         private const float LayerBucketM = 4.0f;
-        private const float GroundProbeUpM = 2.5f;
-        private const float GroundProbeDownM = 5.5f;
-        private const float TraversableNormalZ = 0.68f;
-        private const float MaxStepM = 0.65f;
-        private const float EdgeCapsuleHeightM = 0.85f;
-        private const float EdgeCapsuleRadiusM = 0.40f;
-        private const int GroundStartsPerTick = 10;
-        private const int EdgeStartsPerTick = 8;
-        private const int MaxPendingGround = 48;
-        private const int MaxPendingEdges = 48;
-        private const int ProbeTimeoutMs = 900;
-        private const int CellFreshMs = 12000;
-        private const int EdgeFreshMs = 15000;
-
-        // Ground sampling should discover the actual terrain/road surface,
-        // not the tops of props. Obstacles use map + props + foliage; vehicles
-        // and peds remain in the dynamic Perception layer.
-        private static readonly IntersectFlags GroundIntersectFlags =
-            IntersectFlags.Map;
-        private static readonly IntersectFlags ObstacleIntersectFlags =
-            IntersectFlags.Map | IntersectFlags.Objects | IntersectFlags.Foliage;
-
-        private int groundStartFailed;
-        private int groundReady;
-        private int groundNonExistent;
-        private int edgeStartFailed;
-        private int edgeReady;
-        private int edgeNonExistent;
+        private const float LayerAcceptanceM = 2.8f;
+        private const float MaxNeighborStepM = 0.95f;
+        private const float NearFieldRadiusM = 15f;
+        private const float SampleAheadM = 65f;
+        private const float SampleHalfWidthM = 15f;
+        private const int MaxDesiredCells = 260;
+        private const int GroundBatchIntervalMs = 75;
+        private const int GroundSamplesPerBatch = 3;
+        private const int CellFreshMs = 7000;
+        private const int ObstacleScanIntervalMs = 350;
+        private const float ObstacleRayHeightM = 1.25f;
+        private const float ObstacleRayRangeM = 30f;
+        private const int ObstaclePersistenceMs = 2500;
 
         private static readonly int[] DirX = { 1, -1, 0, 0 };
         private static readonly int[] DirY = { 0, 0, 1, -1 };
 
+        private static readonly float[] ObstacleAnglesDeg =
+        {
+            -90f, -72f, -54f, -36f, -18f,
+             0f,   18f,  36f,  54f,  72f, 90f
+        };
+
+        private static readonly IntersectFlags ObstacleIntersectFlags =
+            IntersectFlags.Map | IntersectFlags.Objects | IntersectFlags.Foliage;
+
         public void Reset()
         {
             cells.Clear();
-            edges.Clear();
             desired.Clear();
             desiredKeys.Clear();
-            pendingGround.Clear();
-            pendingEdge.Clear();
+            flood.Clear();
+            distanceFlood.Clear();
             DebugCells.Clear();
             DebugEdges.Clear();
+            DebugObstacles.Clear();
+
             desiredCursor = 0;
             lastDesiredRefreshMs = -100000;
+            lastGroundBatchMs = -100000;
+            lastObstacleScanMs = -100000;
             lastGraphMs = -100000;
             lastEvictMs = -100000;
             graphDirty = true;
-            groundStartFailed = 0;
-            groundReady = 0;
-            groundNonExistent = 0;
-            edgeStartFailed = 0;
-            edgeReady = 0;
-            edgeNonExistent = 0;
+            obstaclePhase = 0;
+
+            groundOk = 0;
+            groundMiss = 0;
+            groundLayerReject = 0;
+            obstacleRays = 0;
+            obstacleHits = 0;
+            obstacleNotReady = 0;
+            obstacleFailed = 0;
+            lastTickMs = 0f;
+            peakTickMs = 0f;
             Detail = "";
         }
 
@@ -228,23 +190,31 @@ namespace StreetRacing
             float egoHeading,
             int nowMs)
         {
-            PollGroundResults(nowMs);
-            PollEdgeResults(nowMs);
+            long perfStart = Stopwatch.GetTimestamp();
 
-            if (nowMs - lastDesiredRefreshMs >= 250)
+            if (nowMs - lastDesiredRefreshMs >= 350)
             {
                 lastDesiredRefreshMs = nowMs;
-                RebuildDesired(reference, route, egoPos, egoHeading, nowMs);
+                RebuildDesired(reference, route, egoPos, nowMs);
             }
 
-            StartGroundProbes(egoVehicle, nowMs);
-            StartEdgeProbes(egoVehicle, egoPos, nowMs);
+            if (nowMs - lastGroundBatchMs >= GroundBatchIntervalMs)
+            {
+                lastGroundBatchMs = nowMs;
+                SampleGround(nowMs);
+            }
 
-            if (graphDirty || nowMs - lastGraphMs >= 350)
+            if (nowMs - lastObstacleScanMs >= ObstacleScanIntervalMs)
+            {
+                lastObstacleScanMs = nowMs;
+                ScanObstacleFan(egoVehicle, egoPos, egoHeading, nowMs);
+            }
+
+            if (graphDirty || nowMs - lastGraphMs >= 300)
             {
                 lastGraphMs = nowMs;
-                RebuildConnectivity(egoPos);
-                BuildDebugSnapshot(egoPos);
+                RebuildConnectivity(egoPos, nowMs);
+                BuildDebugSnapshot(egoPos, nowMs);
                 graphDirty = false;
             }
 
@@ -254,6 +224,9 @@ namespace StreetRacing
                 EvictFarAndStale(egoPos, nowMs);
             }
 
+            lastTickMs = (float)((Stopwatch.GetTimestamp() - perfStart)
+                * 1000.0 / Stopwatch.Frequency);
+            if (lastTickMs > peakTickMs) peakTickMs = lastTickMs;
             UpdateDetail();
         }
 
@@ -261,84 +234,100 @@ namespace StreetRacing
             DrivingReference.Result reference,
             RaceRoute route,
             Vector3 egoPos,
-            float egoHeading,
             int nowMs)
         {
             desired.Clear();
             desiredKeys.Clear();
 
-            // Independent near-field disk. This is deliberately NOT road/node
-            // derived: it discovers whatever physical surface actually exists
-            // around the vehicle.
-            int halo = (int)Math.Ceiling(25f / GridM);
+            // Small local disk, independent of road semantics.
+            int halo = (int)Math.Ceiling(NearFieldRadiusM / GridM);
             for (int dx = -halo; dx <= halo; dx++)
             {
                 for (int dy = -halo; dy <= halo; dy++)
                 {
                     float mx = dx * GridM;
                     float my = dy * GridM;
-                    if (mx * mx + my * my > 25f * 25f) continue;
+                    if (mx * mx + my * my > NearFieldRadiusM * NearFieldRadiusM)
+                        continue;
+
+                    Vector3 p = new Vector3(
+                        egoPos.X + mx,
+                        egoPos.Y + my,
+                        egoPos.Z);
                     AddDesired(
-                        new Vector3(egoPos.X + mx, egoPos.Y + my, egoPos.Z),
-                        egoPos.Z,
-                        RaceMath.FlatDistance(
-                            egoPos,
-                            new Vector3(egoPos.X + mx, egoPos.Y + my, egoPos.Z)),
+                        p, egoPos.Z,
+                        RaceMath.FlatDistance(egoPos, p),
                         nowMs);
                 }
             }
 
-            // Wide strips around the executable reference tell us about the
-            // physical width of the road, junction apron and nearby branches.
-            // The reference is ONLY a sampling scaffold; it cannot mark a cell
-            // traversable.
+            // Wide, sparse sampling scaffold around the executable reference.
+            // The reference decides where to LOOK, never what is traversable.
             if (reference != null
                 && reference.Path != null
                 && reference.Path.Count >= 2)
             {
-                for (int i = 0; i < reference.Path.Count; i += 2)
+                for (int i = 0; i < reference.Path.Count; i += 3)
                 {
                     Vector3 center = reference.Path[i];
+                    if (RaceMath.FlatDistance(egoPos, center) > SampleAheadM + 20f)
+                        continue;
+
                     Vector3 dir = ReferenceDirection(reference.Path, i);
                     Vector3 left = new Vector3(-dir.Y, dir.X, 0f);
 
-                    for (float lat = -20f; lat <= 20.01f; lat += GridM)
+                    for (float lat = -SampleHalfWidthM;
+                        lat <= SampleHalfWidthM + 0.01f;
+                        lat += GridM)
                     {
                         Vector3 p = new Vector3(
                             center.X + left.X * lat,
                             center.Y + left.Y * lat,
                             center.Z);
-                        float priority = RaceMath.FlatDistance(egoPos, p);
-                        AddDesired(p, center.Z, priority, nowMs);
+                        AddDesired(
+                            p, center.Z,
+                            RaceMath.FlatDistance(egoPos, p),
+                            nowMs);
                     }
                 }
             }
             else if (route != null && route.Built)
             {
-                // Reference can temporarily disappear near terminal route
-                // geometry. Keep observing a wide strip along route samples.
-                for (float s = 0f; s <= 65f; s += 7.5f)
+                for (float ds = 0f; ds <= SampleAheadM; ds += 9f)
                 {
-                    Vector3 center = route.PointAtS(route.AlongS + s);
-                    float h = route.HeadingAtS(route.AlongS + s);
-                    Vector3 f = RaceMath.FlatNormalize(RaceMath.VectorFromHeading(h));
+                    Vector3 center = route.PointAtS(route.AlongS + ds);
+                    float h = route.HeadingAtS(route.AlongS + ds);
+                    Vector3 f = RaceMath.FlatNormalize(
+                        RaceMath.VectorFromHeading(h));
                     Vector3 left = new Vector3(-f.Y, f.X, 0f);
-                    for (float lat = -18f; lat <= 18.01f; lat += GridM)
+
+                    for (float lat = -SampleHalfWidthM;
+                        lat <= SampleHalfWidthM + 0.01f;
+                        lat += GridM)
                     {
                         Vector3 p = new Vector3(
                             center.X + left.X * lat,
                             center.Y + left.Y * lat,
                             center.Z);
-                        AddDesired(p, center.Z, RaceMath.FlatDistance(egoPos, p), nowMs);
+                        AddDesired(
+                            p, center.Z,
+                            RaceMath.FlatDistance(egoPos, p),
+                            nowMs);
                     }
                 }
             }
 
             desired.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+            if (desired.Count > MaxDesiredCells)
+                desired.RemoveRange(MaxDesiredCells, desired.Count - MaxDesiredCells);
             if (desiredCursor >= desired.Count) desiredCursor = 0;
         }
 
-        private void AddDesired(Vector3 world, float hintZ, float priority, int nowMs)
+        private void AddDesired(
+            Vector3 world,
+            float hintZ,
+            float priority,
+            int nowMs)
         {
             CellKey key = KeyFor(world.X, world.Y, hintZ);
             if (!desiredKeys.Add(key))
@@ -366,10 +355,10 @@ namespace StreetRacing
                     Key = key,
                     SamplePosition = center,
                     Position = center,
-                    Normal = new Vector3(0f, 0f, 1f),
                     State = SurfaceState.Unknown,
                     LastWantedMs = nowMs,
                     LastSampleMs = -100000,
+                    LastObstacleMs = -100000,
                 };
                 cells.Add(key, cell);
             }
@@ -380,15 +369,14 @@ namespace StreetRacing
             }
         }
 
-        private void StartGroundProbes(Vehicle egoVehicle, int nowMs)
+        private void SampleGround(int nowMs)
         {
-            if (desired.Count == 0 || pendingGround.Count >= MaxPendingGround) return;
+            if (desired.Count == 0) return;
 
-            int started = 0;
+            int sampled = 0;
             int scanned = 0;
-            while (started < GroundStartsPerTick
-                && scanned < desired.Count
-                && pendingGround.Count < MaxPendingGround)
+            while (sampled < GroundSamplesPerBatch
+                && scanned < desired.Count)
             {
                 if (desiredCursor >= desired.Count) desiredCursor = 0;
                 ProbeRequest req = desired[desiredCursor++];
@@ -396,110 +384,65 @@ namespace StreetRacing
 
                 Cell cell;
                 if (!cells.TryGetValue(req.Key, out cell)) continue;
-                if (cell.GroundPending) continue;
                 if (nowMs - cell.LastSampleMs < CellFreshMs
                     && cell.State != SurfaceState.Unknown)
                     continue;
 
-                Vector3 start = new Vector3(
-                    req.Position.X, req.Position.Y, req.HintZ + GroundProbeUpM);
-                Vector3 end = new Vector3(
-                    req.Position.X, req.Position.Y, req.HintZ - GroundProbeDownM);
-
-                ShapeTestHandle handle = default(ShapeTestHandle);
+                float groundZ = 0f;
+                bool found = false;
                 try
                 {
-                    handle = ShapeTest.StartTestLOSProbe(
-                        start, end,
-                        GroundIntersectFlags,
-                        egoVehicle != null && egoVehicle.Exists() ? egoVehicle : null,
-                        ShapeTestOptions.Default);
+                    found = World.GetGroundHeight(
+                        new Vector3(
+                            req.Position.X,
+                            req.Position.Y,
+                            req.HintZ + 4f),
+                        out groundZ);
                 }
-                catch { }
+                catch { found = false; }
 
-                if (handle.IsRequestFailed)
-                {
-                    groundStartFailed++;
-                    cell.LastSampleMs = nowMs;
-                    continue;
-                }
-
-                cell.GroundPending = true;
-                cell.State = SurfaceState.Pending;
-                pendingGround.Add(new PendingGround
-                {
-                    Handle = handle,
-                    Key = req.Key,
-                    StartedMs = nowMs,
-                });
-                started++;
-            }
-        }
-
-        private void PollGroundResults(int nowMs)
-        {
-            for (int i = pendingGround.Count - 1; i >= 0; i--)
-            {
-                PendingGround p = pendingGround[i];
-                Cell cell;
-                if (!cells.TryGetValue(p.Key, out cell))
-                {
-                    pendingGround.RemoveAt(i);
-                    continue;
-                }
-
-                if (nowMs - p.StartedMs > ProbeTimeoutMs)
-                {
-                    cell.GroundPending = false;
-                    cell.State = SurfaceState.Unknown;
-                    pendingGround.RemoveAt(i);
-                    continue;
-                }
-
-                ShapeTestStatus status = ShapeTestStatus.NonExistent;
-                ShapeTestResult shapeResult = default(ShapeTestResult);
-                try { status = p.Handle.GetResult(out shapeResult); }
-                catch { status = ShapeTestStatus.NonExistent; }
-
-                if (status == ShapeTestStatus.NotReady) continue;
-
-                cell.GroundPending = false;
                 cell.LastSampleMs = nowMs;
-                pendingGround.RemoveAt(i);
+                sampled++;
 
-                if (status != ShapeTestStatus.Ready)
+                if (!found)
                 {
-                    groundNonExistent++;
-                    cell.State = SurfaceState.Unknown;
-                    continue;
-                }
-
-                groundReady++;
-                if (!shapeResult.DidHit)
-                {
+                    groundMiss++;
                     cell.State = SurfaceState.NoSurface;
-                    cell.RoadSemantic = false;
                     cell.Reachable = false;
                     cell.ComponentId = -1;
-                    cell.ClearanceM = 0f;
                     graphDirty = true;
                     continue;
                 }
 
-                Vector3 hitPos = shapeResult.HitPosition;
-                Vector3 normal = shapeResult.SurfaceNormal;
-                cell.Position = hitPos;
-                cell.Normal = normal;
-                cell.State = normal.Z >= TraversableNormalZ
-                    ? SurfaceState.Traversable
-                    : SurfaceState.TooSteep;
+                float dzLayer = Math.Abs(groundZ - req.HintZ);
+                if (dzLayer > LayerAcceptanceM)
+                {
+                    // Most importantly: do not collapse an overpass onto the
+                    // terrain/road several metres below it.
+                    groundLayerReject++;
+                    cell.State = SurfaceState.NoSurface;
+                    cell.Reachable = false;
+                    cell.ComponentId = -1;
+                    graphDirty = true;
+                    continue;
+                }
+
+                groundOk++;
+                cell.Position = new Vector3(
+                    req.Position.X,
+                    req.Position.Y,
+                    groundZ);
+                cell.State = SurfaceState.Traversable;
 
                 bool road = false;
                 try
                 {
                     road = Function.Call<bool>(
                         Hash.IS_POINT_ON_ROAD,
-                        hitPos.X, hitPos.Y, hitPos.Z + 0.15f, 0);
+                        cell.Position.X,
+                        cell.Position.Y,
+                        cell.Position.Z + 0.15f,
+                        0);
                 }
                 catch { road = false; }
                 cell.RoadSemantic = road;
@@ -507,134 +450,108 @@ namespace StreetRacing
             }
         }
 
-        private void StartEdgeProbes(Vehicle egoVehicle, Vector3 egoPos, int nowMs)
+        private void ScanObstacleFan(
+            Vehicle egoVehicle,
+            Vector3 egoPos,
+            float egoHeading,
+            int nowMs)
         {
-            if (pendingEdge.Count >= MaxPendingEdges) return;
+            DebugObstacles.Clear();
 
-            int started = 0;
-            foreach (Cell a in cells.Values)
+            Vector3 startBase = new Vector3(
+                egoPos.X,
+                egoPos.Y,
+                egoPos.Z + ObstacleRayHeightM);
+
+            // Alternate even/odd rays so a full fan is covered over two scans,
+            // while each scan stays cheap.
+            int phase = obstaclePhase++ & 1;
+            for (int i = phase; i < ObstacleAnglesDeg.Length; i += 2)
             {
-                if (started >= EdgeStartsPerTick || pendingEdge.Count >= MaxPendingEdges)
-                    break;
-                if (!a.Traversable) continue;
-                if (RaceMath.FlatDistance(a.Position, egoPos) > 70f) continue;
+                float h = egoHeading + ObstacleAnglesDeg[i];
+                Vector3 dir = RaceMath.FlatNormalize(
+                    RaceMath.VectorFromHeading(h));
+                Vector3 end = new Vector3(
+                    startBase.X + dir.X * ObstacleRayRangeM,
+                    startBase.Y + dir.Y * ObstacleRayRangeM,
+                    startBase.Z);
 
-                for (int d = 0; d < 4; d++)
+                ShapeTestHandle handle = default(ShapeTestHandle);
+                try
                 {
-                    if (started >= EdgeStartsPerTick || pendingEdge.Count >= MaxPendingEdges)
-                        break;
-
-                    Cell b;
-                    if (!TryFindNeighbor(a, d, out b)) continue;
-
-                    EdgeKey key = MakeEdgeKey(a.Key, b.Key);
-                    EdgeInfo edge;
-                    if (!edges.TryGetValue(key, out edge))
-                    {
-                        edge = new EdgeInfo();
-                        edges.Add(key, edge);
-                    }
-
-                    if (edge.Pending) continue;
-                    if (edge.Known && nowMs - edge.LastSampleMs < EdgeFreshMs)
-                        continue;
-
-                    float dz = Math.Abs(a.Position.Z - b.Position.Z);
-                    if (dz > MaxStepM)
-                    {
-                        edge.Known = true;
-                        edge.Open = false;
-                        edge.Pending = false;
-                        edge.LastSampleMs = nowMs;
-                        graphDirty = true;
-                        continue;
-                    }
-
-                    Vector3 start = new Vector3(
-                        a.Position.X, a.Position.Y,
-                        a.Position.Z + EdgeCapsuleHeightM);
-                    Vector3 end = new Vector3(
-                        b.Position.X, b.Position.Y,
-                        b.Position.Z + EdgeCapsuleHeightM);
-
-                    ShapeTestHandle handle = default(ShapeTestHandle);
-                    try
-                    {
-                        handle = ShapeTest.StartTestCapsule(
-                            start, end, EdgeCapsuleRadiusM,
-                            ObstacleIntersectFlags,
-                            egoVehicle != null && egoVehicle.Exists() ? egoVehicle : null,
-                            ShapeTestOptions.Default);
-                    }
-                    catch { }
-
-                    if (handle.IsRequestFailed)
-                    {
-                        edgeStartFailed++;
-                        continue;
-                    }
-
-                    edge.Pending = true;
-                    pendingEdge.Add(new PendingEdge
-                    {
-                        Handle = handle,
-                        Key = key,
-                        StartedMs = nowMs,
-                    });
-                    started++;
+                    handle = ShapeTest.StartExpensiveSyncTestLOSProbe(
+                        startBase,
+                        end,
+                        ObstacleIntersectFlags,
+                        egoVehicle != null && egoVehicle.Exists()
+                            ? egoVehicle
+                            : null,
+                        ShapeTestOptions.Default);
                 }
-            }
-        }
+                catch { }
 
-        private void PollEdgeResults(int nowMs)
-        {
-            for (int i = pendingEdge.Count - 1; i >= 0; i--)
-            {
-                PendingEdge p = pendingEdge[i];
-                EdgeInfo edge;
-                if (!edges.TryGetValue(p.Key, out edge))
+                obstacleRays++;
+                if (handle.IsRequestFailed)
                 {
-                    pendingEdge.RemoveAt(i);
-                    continue;
-                }
-
-                if (nowMs - p.StartedMs > ProbeTimeoutMs)
-                {
-                    edge.Pending = false;
-                    edge.Known = false;
-                    pendingEdge.RemoveAt(i);
+                    obstacleFailed++;
                     continue;
                 }
 
                 ShapeTestStatus status = ShapeTestStatus.NonExistent;
-                ShapeTestResult shapeResult = default(ShapeTestResult);
-                try { status = p.Handle.GetResult(out shapeResult); }
+                ShapeTestResult result = default(ShapeTestResult);
+                try { status = handle.GetResult(out result); }
                 catch { status = ShapeTestStatus.NonExistent; }
-
-                if (status == ShapeTestStatus.NotReady) continue;
-
-                edge.Pending = false;
-                pendingEdge.RemoveAt(i);
 
                 if (status != ShapeTestStatus.Ready)
                 {
-                    edgeNonExistent++;
-                    edge.Known = false;
+                    obstacleNotReady++;
                     continue;
                 }
+                if (!result.DidHit) continue;
 
-                edgeReady++;
-                edge.Known = true;
-                edge.Open = !shapeResult.DidHit;
-                edge.LastSampleMs = nowMs;
-                graphDirty = true;
+                obstacleHits++;
+                DebugObstacles.Add(new DebugObstacle
+                {
+                    Position = result.HitPosition,
+                    Normal = result.SurfaceNormal,
+                });
+
+                MarkObstacle(result.HitPosition, nowMs);
             }
         }
 
-        private void RebuildConnectivity(Vector3 egoPos)
+        private void MarkObstacle(Vector3 hit, int nowMs)
+        {
+            Cell best = null;
+            float bestScore = float.MaxValue;
+
+            foreach (Cell c in cells.Values)
+            {
+                if (c.State != SurfaceState.Traversable) continue;
+                float d = RaceMath.FlatDistance(c.Position, hit);
+                if (d > GridM * 1.1f) continue;
+                float dz = Math.Abs(c.Position.Z - hit.Z);
+                if (dz > 2.5f) continue;
+                float score = d + dz * 0.35f;
+                if (score >= bestScore) continue;
+                bestScore = score;
+                best = c;
+            }
+
+            if (best == null) return;
+            best.StaticObstacle = true;
+            best.LastObstacleMs = nowMs;
+            graphDirty = true;
+        }
+
+        private void RebuildConnectivity(Vector3 egoPos, int nowMs)
         {
             foreach (Cell c in cells.Values)
             {
+                if (c.StaticObstacle
+                    && nowMs - c.LastObstacleMs > ObstaclePersistenceMs)
+                    c.StaticObstacle = false;
+
                 c.Reachable = false;
                 c.ComponentId = -1;
                 c.ClearanceM = 0f;
@@ -687,7 +604,7 @@ namespace StreetRacing
                     Cell n;
                     if (!TryFindNeighbor(c, d, out n)) continue;
                     if (n.ComponentId >= 0) continue;
-                    if (!IsOpen(c, n)) continue;
+                    if (!ConnectionOpen(c, n)) continue;
                     n.ComponentId = componentId;
                     flood.Enqueue(n);
                 }
@@ -697,7 +614,7 @@ namespace StreetRacing
         private void ComputeClearance()
         {
             distanceFlood.Clear();
-            float inf = 9999f;
+            const float inf = 9999f;
 
             foreach (Cell c in cells.Values)
             {
@@ -714,7 +631,7 @@ namespace StreetRacing
                     Cell n;
                     if (!TryFindNeighbor(c, d, out n)
                         || !n.Reachable
-                        || !IsOpen(c, n))
+                        || !ConnectionOpen(c, n))
                     {
                         boundary = true;
                         break;
@@ -735,7 +652,7 @@ namespace StreetRacing
                 {
                     Cell n;
                     if (!TryFindNeighbor(c, d, out n)) continue;
-                    if (!n.Reachable || !IsOpen(c, n)) continue;
+                    if (!n.Reachable || !ConnectionOpen(c, n)) continue;
 
                     float nd = c.ClearanceM + GridM;
                     if (nd + 0.01f >= n.ClearanceM) continue;
@@ -756,9 +673,7 @@ namespace StreetRacing
             int ny = c.Key.Y + DirY[dir];
             float bestDz = float.MaxValue;
 
-            // Layer bucket is an identity aid, not connectivity. Search nearby
-            // buckets and choose the physically closest surface in Z.
-            for (int dl = -2; dl <= 2; dl++)
+            for (int dl = -1; dl <= 1; dl++)
             {
                 CellKey key = new CellKey
                 {
@@ -771,7 +686,7 @@ namespace StreetRacing
                 if (!candidate.Traversable) continue;
 
                 float dz = Math.Abs(candidate.Position.Z - c.Position.Z);
-                if (dz > MaxStepM || dz >= bestDz) continue;
+                if (dz > MaxNeighborStepM || dz >= bestDz) continue;
                 bestDz = dz;
                 neighbor = candidate;
             }
@@ -779,76 +694,101 @@ namespace StreetRacing
             return neighbor != null;
         }
 
-        private bool IsOpen(Cell a, Cell b)
+        private static bool ConnectionOpen(Cell a, Cell b)
         {
-            EdgeInfo e;
-            return edges.TryGetValue(MakeEdgeKey(a.Key, b.Key), out e)
-                && e.Known
-                && e.Open;
+            if (a == null || b == null) return false;
+            if (!a.Traversable || !b.Traversable) return false;
+            return Math.Abs(a.Position.Z - b.Position.Z) <= MaxNeighborStepM;
         }
 
-        private void BuildDebugSnapshot(Vector3 egoPos)
+        private void BuildDebugSnapshot(Vector3 egoPos, int nowMs)
         {
             DebugCells.Clear();
             DebugEdges.Clear();
 
+            int cellsAdded = 0;
             foreach (Cell c in cells.Values)
             {
-                if (RaceMath.FlatDistance(c.SamplePosition, egoPos) > 82f) continue;
+                if (RaceMath.FlatDistance(c.SamplePosition, egoPos) > 70f)
+                    continue;
                 DebugCells.Add(c);
+                cellsAdded++;
+                if (cellsAdded >= 240) break;
             }
 
-            foreach (KeyValuePair<EdgeKey, EdgeInfo> pair in edges)
+            // Only show BLOCKED local connections. Hundreds of open-edge draw
+            // calls added clutter and measurable frame cost; cell reachability
+            // already shows the connected free region.
+            foreach (Cell c in cells.Values)
             {
-                EdgeInfo e = pair.Value;
-                if (!e.Known) continue;
+                if (DebugEdges.Count >= 80) break;
+                if (c.State != SurfaceState.Traversable) continue;
+                if (RaceMath.FlatDistance(c.Position, egoPos) > 42f) continue;
 
-                Cell a;
-                Cell b;
-                if (!cells.TryGetValue(pair.Key.A, out a)
-                    || !cells.TryGetValue(pair.Key.B, out b))
-                    continue;
-                if (RaceMath.FlatDistance(a.Position, egoPos) > 70f
-                    && RaceMath.FlatDistance(b.Position, egoPos) > 70f)
-                    continue;
-
-                DebugEdges.Add(new DebugEdge
+                for (int d = 0; d < 4 && DebugEdges.Count < 80; d += 2)
                 {
-                    A = a.Position,
-                    B = b.Position,
-                    Open = e.Open,
-                });
+                    Cell n;
+                    if (!TryFindAnySurfaceNeighbor(c, d, out n)) continue;
+                    if (ConnectionOpen(c, n)) continue;
+
+                    DebugEdges.Add(new DebugEdge
+                    {
+                        A = c.Position,
+                        B = n.Position,
+                        Open = false,
+                    });
+                }
             }
+        }
+
+        private bool TryFindAnySurfaceNeighbor(
+            Cell c,
+            int dir,
+            out Cell neighbor)
+        {
+            neighbor = null;
+            int nx = c.Key.X + DirX[dir];
+            int ny = c.Key.Y + DirY[dir];
+            float bestDz = float.MaxValue;
+
+            for (int dl = -1; dl <= 1; dl++)
+            {
+                CellKey key = new CellKey
+                {
+                    X = nx,
+                    Y = ny,
+                    Layer = c.Key.Layer + dl,
+                };
+                Cell candidate;
+                if (!cells.TryGetValue(key, out candidate)) continue;
+                if (candidate.State != SurfaceState.Traversable) continue;
+
+                float dz = Math.Abs(candidate.Position.Z - c.Position.Z);
+                if (dz >= bestDz) continue;
+                bestDz = dz;
+                neighbor = candidate;
+            }
+
+            return neighbor != null;
         }
 
         private void EvictFarAndStale(Vector3 egoPos, int nowMs)
         {
-            var removeCells = new List<CellKey>();
+            var remove = new List<CellKey>();
             foreach (KeyValuePair<CellKey, Cell> pair in cells)
             {
                 Cell c = pair.Value;
                 float d = RaceMath.FlatDistance(c.SamplePosition, egoPos);
-                bool unwanted = nowMs - c.LastWantedMs > 7000;
-                bool stale = nowMs - c.LastSampleMs > 30000;
-                if ((unwanted && d > 90f) || (stale && d > 45f))
-                    removeCells.Add(pair.Key);
+                bool unwanted = nowMs - c.LastWantedMs > 6000;
+                bool stale = nowMs - c.LastSampleMs > 20000;
+                if ((unwanted && d > 75f) || (stale && d > 40f))
+                    remove.Add(pair.Key);
             }
 
-            if (removeCells.Count == 0) return;
+            for (int i = 0; i < remove.Count; i++)
+                cells.Remove(remove[i]);
 
-            for (int i = 0; i < removeCells.Count; i++)
-                cells.Remove(removeCells[i]);
-
-            var removeEdges = new List<EdgeKey>();
-            foreach (EdgeKey key in edges.Keys)
-            {
-                if (!cells.ContainsKey(key.A) || !cells.ContainsKey(key.B))
-                    removeEdges.Add(key);
-            }
-            for (int i = 0; i < removeEdges.Count; i++)
-                edges.Remove(removeEdges[i]);
-
-            graphDirty = true;
+            if (remove.Count > 0) graphDirty = true;
         }
 
         private void UpdateDetail()
@@ -856,21 +796,25 @@ namespace StreetRacing
             int traversable = 0;
             int reachable = 0;
             int reachableOffRoad = 0;
-            int tooSteep = 0;
+            int staticBlocked = 0;
             int noSurface = 0;
             int components = 0;
             float maxClear = 0f;
 
             foreach (Cell c in cells.Values)
             {
-                if (c.Traversable)
+                if (c.State == SurfaceState.Traversable)
                 {
-                    traversable++;
+                    if (c.StaticObstacle) staticBlocked++;
+                    else traversable++;
+
                     if (c.ComponentId + 1 > components)
                         components = c.ComponentId + 1;
                 }
-                else if (c.State == SurfaceState.TooSteep) tooSteep++;
-                else if (c.State == SurfaceState.NoSurface) noSurface++;
+                else if (c.State == SurfaceState.NoSurface)
+                {
+                    noSurface++;
+                }
 
                 if (c.Reachable)
                 {
@@ -880,23 +824,15 @@ namespace StreetRacing
                 }
             }
 
-            int openEdges = 0;
-            int blockedEdges = 0;
-            foreach (EdgeInfo e in edges.Values)
-            {
-                if (!e.Known) continue;
-                if (e.Open) openEdges++;
-                else blockedEdges++;
-            }
-
-            Detail = $"cells={cells.Count};trav={traversable};reach={reachable};"
+            Detail = $"cells={cells.Count};desired={desired.Count};"
+                + $"trav={traversable};reach={reachable};"
                 + $"reachOffRoad={reachableOffRoad};components={components};"
-                + $"openEdges={openEdges};blockedEdges={blockedEdges};"
-                + $"noSurface={noSurface};steep={tooSteep};"
-                + $"pendingG={pendingGround.Count};pendingE={pendingEdge.Count};"
-                + $"gReady={groundReady};gGone={groundNonExistent};gFail={groundStartFailed};"
-                + $"eReady={edgeReady};eGone={edgeNonExistent};eFail={edgeStartFailed};"
-                + $"maxClear={maxClear:F1}";
+                + $"staticBlocked={staticBlocked};noSurface={noSurface};"
+                + $"gOk={groundOk};gMiss={groundMiss};gLayer={groundLayerReject};"
+                + $"obsRays={obstacleRays};obsHits={obstacleHits};"
+                + $"obsWait={obstacleNotReady};obsFail={obstacleFailed};"
+                + $"maxClear={maxClear:F1};"
+                + $"tickMs={lastTickMs:F2};peakMs={peakTickMs:F2}";
         }
 
         private static CellKey KeyFor(float x, float y, float hintZ)
@@ -911,38 +847,32 @@ namespace StreetRacing
 
         private static Vector3 CenterFor(CellKey key, float hintZ)
         {
-            return new Vector3(key.X * GridM, key.Y * GridM, hintZ);
+            return new Vector3(
+                key.X * GridM,
+                key.Y * GridM,
+                hintZ);
         }
 
-        private static EdgeKey MakeEdgeKey(CellKey a, CellKey b)
-        {
-            if (CompareKey(a, b) <= 0)
-                return new EdgeKey { A = a, B = b };
-            return new EdgeKey { A = b, B = a };
-        }
-
-        private static int CompareKey(CellKey a, CellKey b)
-        {
-            if (a.X != b.X) return a.X.CompareTo(b.X);
-            if (a.Y != b.Y) return a.Y.CompareTo(b.Y);
-            return a.Layer.CompareTo(b.Layer);
-        }
-
-        private static Vector3 ReferenceDirection(IList<Vector3> path, int i)
+        private static Vector3 ReferenceDirection(
+            IList<Vector3> path,
+            int i)
         {
             Vector3 d;
             if (i <= 0)
                 d = new Vector3(
                     path[1].X - path[0].X,
-                    path[1].Y - path[0].Y, 0f);
+                    path[1].Y - path[0].Y,
+                    0f);
             else if (i >= path.Count - 1)
                 d = new Vector3(
                     path[i].X - path[i - 1].X,
-                    path[i].Y - path[i - 1].Y, 0f);
+                    path[i].Y - path[i - 1].Y,
+                    0f);
             else
                 d = new Vector3(
                     path[i + 1].X - path[i - 1].X,
-                    path[i + 1].Y - path[i - 1].Y, 0f);
+                    path[i + 1].Y - path[i - 1].Y,
+                    0f);
 
             return RaceMath.FlatNormalize(d);
         }
