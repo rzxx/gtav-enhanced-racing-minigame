@@ -563,6 +563,23 @@ namespace StreetRacing
                 float oldDist = DistToRoute;
                 float oldHeadErr = HeadingErrorDeg;
 
+                // Sampling the active GPS route from a different validation
+                // origin does not necessarily create a new route. Reject
+                // "successful" rebuilds that do not materially improve the
+                // local pose relationship; otherwise the brain can reset all
+                // planning state around effectively identical geometry.
+                float oldAbsHead = Math.Abs(oldHeadErr);
+                float newAbsHead = Math.Abs(newHeadErr);
+                bool improvesHeading = newAbsHead <= oldAbsHead - 8f;
+                bool improvesDistance = bestDist <= oldDist - 4f;
+                if (!improvesHeading && !improvesDistance)
+                {
+                    rebuildLog =
+                        $"no-local-improvement;oldDist={oldDist:F1};newDist={bestDist:F1};"
+                        + $"oldHeadErr={oldHeadErr:F0};newHeadErr={newHeadErr:F0};{acquire}";
+                    return false;
+                }
+
                 ImportSnapshot(snap);
 
                 NearestIndex = bestSeg;

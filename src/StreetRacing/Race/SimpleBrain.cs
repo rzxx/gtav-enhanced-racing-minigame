@@ -181,7 +181,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "physical-traversability-observer-v4";
+        private const string SpatialBuildTag = "reachable-future-surface-v1";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -895,16 +895,17 @@ namespace StreetRacing.Race
             }
             catch { }
 
-            // PhysicalSurfaceMap is deliberately observer-only in this pass.
-            // Keeping it off the control path lets us judge the representation
-            // visually before it can change race behavior.
-            if (viz.Enabled)
+            // Physical free-space perception is part of planning now, not a
+            // DebugViz feature. Keep it running even when visualization is off;
+            // the planner consumes its previous-frame world evidence and uses
+            // its bounded exact sweep as a final static-collision veto.
+            if (IsGpsSource())
             {
                 try
                 {
                     physicalSurface.Tick(
                         vehicle, lastRoadReference, route,
-                        egoPos, egoHeading, now);
+                        egoPos, egoHeading, forwardPlanSpeed, now);
 
                     if (now - lastPhysicalSurfaceEventMs > 2000)
                     {
@@ -1094,8 +1095,8 @@ namespace StreetRacing.Race
                 // Do not also build the legacy LocalWorld debug grid every plan;
                 // road supports themselves remain visible in RaceDebugViz.
                 localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, false);
-                sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                sp = spatialPlanner.Plan(localWorld, physicalSurface, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate, egoHalfWidth,
                     cruise, Game.GameTime, finish);
             }
             catch { sp = null; }
@@ -1134,17 +1135,16 @@ namespace StreetRacing.Race
                     || absHead >= spatialUncertainLastHeadErr + 6f;
                 bool routeDiverging = route.IsLost
                     || route.PlanInvalid
-                    || absHead >= 35f
-                    || (uncertainAge >= 350 && absHead >= 24f && headGrowing)
-                    || (uncertainAge >= 1200 && absHead >= 18f);
+                    || absHead >= 45f
+                    || (uncertainAge >= 650 && absHead >= 35f && headGrowing);
                 spatialUncertainLastHeadErr = absHead;
 
                 // Once the old topology is visibly diverging, acquire a fresh
                 // GPS route from the CURRENT rival pose. The route object
                 // validates the candidate before mutating itself.
                 bool shouldReroute = routeDiverging
-                    && (route.PlanInvalid || uncertainAge >= 350)
-                    && now - lastLiveRerouteAttemptMs >= 1200;
+                    && (route.IsLost || route.PlanInvalid || absHead >= 45f)
+                    && now - lastLiveRerouteAttemptMs >= 2500;
                 if (shouldReroute)
                 {
                     lastLiveRerouteAttemptMs = now;
@@ -1180,6 +1180,8 @@ namespace StreetRacing.Race
                         spatialUncertainSinceMs = -1;
                         spatialUncertainStartHeadErr = 0f;
                         spatialUncertainLastHeadErr = 0f;
+                        liveRerouteAttempts = 0;
+                        lastLiveRerouteAttemptMs = -100000;
                         hasCurrent = false;
                         joined = true;
                         joinState = "RouteRebuilt";
@@ -1212,6 +1214,23 @@ namespace StreetRacing.Race
                 {
                     joinState = "SpatialRerouteWait";
                     hasCurrent = false;
+
+                    // Do not park forever after a failed/no-op GPS rebuild.
+                    // A severe pose divergence is now a physical recovery
+                    // problem once route reacquisition has had a fair chance.
+                    if (uncertainAge >= 1800
+                        && liveRerouteAttempts > 0
+                        && !recovery.Active)
+                    {
+                        try
+                        {
+                            EnterRecovery(
+                                "spatial-route-divergence",
+                                now);
+                        }
+                        catch { }
+                    }
+
                     return BuildPlannerStop(
                         egoPos,
                         shouldReroute ? "ReroutePending" : "SpatialDiverging");
@@ -1234,6 +1253,8 @@ namespace StreetRacing.Race
             spatialUncertainSinceMs = -1;
             spatialUncertainStartHeadErr = 0f;
             spatialUncertainLastHeadErr = 0f;
+            liveRerouteAttempts = 0;
+            lastLiveRerouteAttemptMs = -100000;
             joinState = sp.Intent;
             return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
         }
@@ -1248,8 +1269,8 @@ namespace StreetRacing.Race
                 // the final local search.
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
                     egoHalfLength, egoHalfWidth, false);
-                var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
-                    egoPos, lastEgoHeading, egoSpeed, lastYawRate,
+                var sp = spatialPlanner.Plan(localWorld, physicalSurface, route, capability, profile,
+                    egoPos, lastEgoHeading, egoSpeed, lastYawRate, egoHalfWidth,
                     cruise, Game.GameTime, finish);
                 if (sp != null && sp.Valid && sp.Chosen.Path != null && sp.Chosen.Path.Count >= 3)
                 {
