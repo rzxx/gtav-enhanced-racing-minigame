@@ -304,7 +304,7 @@ namespace StreetRacing
             int physicalChecks = 0;
             int physicalBlocks = 0;
             string physicalDetail = "none";
-            const int maxPhysicalChecks = 3;
+            const int maxPhysicalChecks = 2;
 
             for (int oi = 0; oi < order.Count; oi++)
             {
