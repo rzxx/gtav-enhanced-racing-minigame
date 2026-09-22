@@ -457,6 +457,147 @@ namespace StreetRacing
             catch { return false; }
         }
 
+        /// Re-acquire the active GPS geometry using the rival's CURRENT
+        /// pose as the validation origin. This is used only after local
+        /// trajectory planning has been unable to produce a route-valid path
+        /// and the heading error is diverging.
+        ///
+        /// The replacement is atomic: a candidate snapshot is fully validated
+        /// against the current pose/heading before this route is mutated.
+        public bool TryRebuildFromCurrentGps(
+            Vector3 egoPos,
+            float egoHeadingDeg,
+            float egoSpeed,
+            int nowMs,
+            float corridorHalfWidth,
+            out string rebuildLog)
+        {
+            rebuildLog = "";
+            try
+            {
+                RouteSnapshot snap;
+                string acquire;
+                if (!TryAcquireGpsSnapshot(
+                    egoPos, finish, out snap, out acquire)
+                    || snap == null
+                    || snap.Points == null
+                    || snap.Points.Count < 2)
+                {
+                    rebuildLog = "acquire-fail;" + acquire;
+                    return false;
+                }
+
+                Vector3 egoFwd = RaceMath.FlatNormalize(
+                    RaceMath.VectorFromHeading(egoHeadingDeg));
+
+                int bestSeg = -1;
+                float bestDist = float.MaxValue;
+                RaceMath.Projection bestPr = new RaceMath.Projection();
+                Vector3 bestDir = new Vector3(0f, 1f, 0f);
+
+                // First require the normal >0.5 heading compatibility. A second
+                // pass allows any forward-facing segment, but we still reject
+                // the snapshot below if the resulting heading is too severe.
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    for (int i = 0; i < snap.Points.Count - 1; i++)
+                    {
+                        Vector3 a = snap.Points[i];
+                        Vector3 b = snap.Points[i + 1];
+                        Vector3 dir = RaceMath.FlatNormalize(
+                            new Vector3(
+                                b.X - a.X,
+                                b.Y - a.Y,
+                                0f));
+                        float dot = RaceMath.FlatDot(dir, egoFwd);
+                        if (pass == 0 && dot <= SameDirDotMin) continue;
+                        if (pass == 1 && dot <= 0f) continue;
+
+                        RaceMath.Projection pr =
+                            RaceMath.ProjectOnSegment(egoPos, a, b);
+                        if (pr.Dist >= bestDist) continue;
+
+                        bestSeg = i;
+                        bestDist = pr.Dist;
+                        bestPr = pr;
+                        bestDir = dir;
+                    }
+
+                    if (bestSeg >= 0 && bestDist <= 45f) break;
+                    if (pass == 0)
+                    {
+                        bestSeg = -1;
+                        bestDist = float.MaxValue;
+                    }
+                }
+
+                if (bestSeg < 0 || bestDist > 45f)
+                {
+                    rebuildLog = $"snapshot-not-near;dist={bestDist:F1};{acquire}";
+                    return false;
+                }
+
+                float newHeading =
+                    RaceMath.HeadingFromVector(bestDir);
+                float newHeadErr = RaceMath.HeadingDiffDeg(
+                    newHeading, egoHeadingDeg);
+                if (Math.Abs(newHeadErr) > 65f)
+                {
+                    rebuildLog = $"snapshot-heading-incompatible;dist={bestDist:F1};headErr={newHeadErr:F0};{acquire}";
+                    return false;
+                }
+
+                string oldSource = Source ?? "?";
+                float oldS = AlongS;
+                float oldDist = DistToRoute;
+                float oldHeadErr = HeadingErrorDeg;
+
+                ImportSnapshot(snap);
+
+                NearestIndex = bestSeg;
+                AlongS = CumulativeS[bestSeg] + bestPr.Along;
+                PrevAlongS = AlongS;
+                ExpectedS = AlongS;
+                MaxS = AlongS;
+                DistToRoute = bestDist;
+                Lateral = RaceMath.FlatCross(
+                    bestDir,
+                    new Vector3(
+                        egoPos.X - bestPr.Closest.X,
+                        egoPos.Y - bestPr.Closest.Y,
+                        0f));
+                HeadingErrorDeg = newHeadErr;
+                RouteHeadingDeg = newHeading;
+                RouteTangentDir = bestDir;
+                LocBestScore = bestDist;
+                LocSecondScore = 999f;
+                LocAmbiguous = false;
+                LocJumpM = 0f;
+                LocDetail = $"rebuild seg={bestSeg} s={AlongS:F1} dist={bestDist:F1} headErr={newHeadErr:F0}";
+                LastProgressMs = nowMs;
+                LastUpdateMs = nowMs;
+                FinishGapEuclid = RaceMath.FlatDistance(
+                    egoPos, finish);
+                IsLost = false;
+                LossReason = "";
+                LostSinceMs = 0;
+                hasLastHeading = false;
+                circleAccumDeg = 0f;
+                headingInvalidSinceMs = -100000;
+
+                rebuildLog =
+                    $"old={oldSource};oldS={oldS:F0};oldDist={oldDist:F1};oldHeadErr={oldHeadErr:F0};"
+                    + $"new={Source};newS={AlongS:F0};newDist={DistToRoute:F1};newHeadErr={HeadingErrorDeg:F0};"
+                    + $"pts={Points.Count};len={TotalLength:F0};egoSpd={egoSpeed:F1};{acquire}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { rebuildLog = "exc:" + ex.Message; } catch { }
+                return false;
+            }
+        }
+
         private void FinalizeGeometry()
         {
             CumulativeS.Clear();
