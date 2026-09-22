@@ -960,7 +960,7 @@ namespace StreetRacing
 
             // Far future remains coarse. Near + mid future requires physical
             // boundary verification so fences/guardrails split components.
-            if (RaceMath.FlatDistance(mid, lastEgoPos) > midM + GridM)
+            if (RaceMath.FlatDistance(mid, lastEgoPos) > VerifiedEdgeRadius())
             {
                 open = true;
                 return true;
@@ -1082,6 +1082,16 @@ namespace StreetRacing
             // ego-heading cone, so guide proximity is an alternate admission.
             return lateral <= halfWidth
                 || guideDist <= halfWidth + 5f;
+        }
+
+        private float VerifiedEdgeRadius()
+        {
+            // Verify slightly beyond the mid-field boundary so increasing
+            // speed does not turn today's coarse far cells into tomorrow's
+            // suddenly disconnected near cells before the edge checker catches
+            // up. The lead grows with speed but remains budgeted.
+            float lead = RaceMath.Clamp(lastEgoSpeed * 0.80f, 8f, 18f);
+            return Math.Min(horizonM, midM + lead);
         }
 
         private float FrontierPriority(Vector3 p)
@@ -1379,7 +1389,7 @@ namespace StreetRacing
 
             // Far future is intentionally coarse. Near/mid connectivity must
             // have an explicit physical edge result.
-            if (RaceMath.FlatDistance(mid, lastEgoPos) > midM + GridM)
+            if (RaceMath.FlatDistance(mid, lastEgoPos) > VerifiedEdgeRadius())
                 return true;
 
             EdgeInfo info;
