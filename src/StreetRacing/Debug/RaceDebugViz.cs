@@ -280,9 +280,9 @@ namespace StreetRacing.Debug
                 // Bright physical mesh over the older road-support model:
                 //   green = reachable + GTA road semantic
                 //   cyan  = reachable physical surface GTA does NOT call road
-                //   violet = traversable but physically disconnected from ego
-                //   red = sampled surface too steep for the car
-                //   dark gray = sampled location with no surface in the layer
+                //   violet = traversable but disconnected from ego
+                //   red = static obstacle cell / obstacle ray hit
+                //   dark gray = no ground accepted in this Z layer
                 for (int i = 0; i < map.DebugCells.Count; i++)
                 {
                     var c = map.DebugCells[i];
@@ -292,7 +292,11 @@ namespace StreetRacing.Debug
                     if (c.State == PhysicalSurfaceMap.SurfaceState.Traversable)
                     {
                         p = c.Position;
-                        if (c.Reachable)
+                        if (c.StaticObstacle)
+                        {
+                            col = System.Drawing.Color.FromArgb(235, 255, 35, 35);
+                        }
+                        else if (c.Reachable)
                         {
                             col = c.RoadSemantic
                                 ? System.Drawing.Color.FromArgb(210, 40, 255, 90)
@@ -302,11 +306,6 @@ namespace StreetRacing.Debug
                         {
                             col = System.Drawing.Color.FromArgb(175, 185, 80, 255);
                         }
-                    }
-                    else if (c.State == PhysicalSurfaceMap.SurfaceState.TooSteep)
-                    {
-                        p = c.Position;
-                        col = System.Drawing.Color.FromArgb(220, 255, 45, 35);
                     }
                     else if (c.State == PhysicalSurfaceMap.SurfaceState.NoSurface)
                     {
@@ -327,20 +326,28 @@ namespace StreetRacing.Debug
                         col);
                 }
 
-                // Connectivity is the important part: surface points on opposite
-                // sides of a guardrail must not look connected merely because
-                // both downward rays hit flat ground.
+                // Only blocked local connections are retained in V3. Open-edge
+                // rendering was both noisy and one of the largest debug costs.
                 for (int i = 0; i < map.DebugEdges.Count; i++)
                 {
                     var e = map.DebugEdges[i];
-                    var col = e.Open
-                        ? System.Drawing.Color.FromArgb(80, 60, 255, 140)
-                        : System.Drawing.Color.FromArgb(235, 255, 35, 35);
-                    float z = Math.Max(e.A.Z, e.B.Z) + (e.Open ? 0.18f : 0.55f);
+                    float z = Math.Max(e.A.Z, e.B.Z) + 0.55f;
                     World.DrawLine(
                         new Vector3(e.A.X, e.A.Y, z),
                         new Vector3(e.B.X, e.B.Y, z),
-                        col);
+                        System.Drawing.Color.FromArgb(235, 255, 35, 35));
+                }
+
+                // Sparse synchronous LOS fan hits: actual map/object/foliage
+                // collision in front of the car. These should light up tree
+                // trunks, guardrails and walls even on non-road ground.
+                for (int i = 0; i < map.DebugObstacles.Count; i++)
+                {
+                    var o = map.DebugObstacles[i];
+                    World.DrawLine(
+                        new Vector3(o.Position.X, o.Position.Y, o.Position.Z + 0.1f),
+                        new Vector3(o.Position.X, o.Position.Y, o.Position.Z + 2.2f),
+                        System.Drawing.Color.FromArgb(245, 255, 20, 20));
                 }
             }
             catch { }

@@ -176,7 +176,7 @@ namespace StreetRacing.Race
         private const float JoinHeadThreshDeg = 15f;
         private const float JoinedLatM = 1.5f;
         private const float JoinedHeadDeg = 10f;
-        private const string SpatialBuildTag = "physical-traversability-observer-v2";
+        private const string SpatialBuildTag = "physical-traversability-observer-v3";
 
         public void Start(Ped driver, Vehicle vehicle, Vector3 finish, float cruise,
             int style, DriverProfile profile, RaceTelemetry telemetry,
@@ -1075,7 +1075,10 @@ namespace StreetRacing.Race
             SpatialPlannerV1.Result sp = null;
             try
             {
-                localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, viz.Enabled);
+                // The physical observer owns the cell visualization now.
+                // Do not also build the legacy LocalWorld debug grid every plan;
+                // road supports themselves remain visible in RaceDebugViz.
+                localWorld.Build(rr, perception, egoPos, lastEgoHeading, egoHalfLength, egoHalfWidth, false);
                 sp = spatialPlanner.Plan(localWorld, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, lastYawRate,
                     cruise, Game.GameTime, finish);
@@ -1116,7 +1119,7 @@ namespace StreetRacing.Race
                 // road nodes + ordered route/finish gates are sufficient for
                 // the final local search.
                 localWorld.Build(null, perception, egoPos, lastEgoHeading,
-                    egoHalfLength, egoHalfWidth, viz.Enabled);
+                    egoHalfLength, egoHalfWidth, false);
                 var sp = spatialPlanner.Plan(localWorld, route, capability, profile,
                     egoPos, lastEgoHeading, egoSpeed, lastYawRate,
                     cruise, Game.GameTime, finish);
