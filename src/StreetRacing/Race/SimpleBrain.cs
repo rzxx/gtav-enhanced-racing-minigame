@@ -1180,6 +1180,8 @@ namespace StreetRacing.Race
                         spatialUncertainSinceMs = -1;
                         spatialUncertainStartHeadErr = 0f;
                         spatialUncertainLastHeadErr = 0f;
+                        liveRerouteAttempts = 0;
+                        lastLiveRerouteAttemptMs = -100000;
                         hasCurrent = false;
                         joined = true;
                         joinState = "RouteRebuilt";
@@ -1251,6 +1253,8 @@ namespace StreetRacing.Race
             spatialUncertainSinceMs = -1;
             spatialUncertainStartHeadErr = 0f;
             spatialUncertainLastHeadErr = 0f;
+            liveRerouteAttempts = 0;
+            lastLiveRerouteAttemptMs = -100000;
             joinState = sp.Intent;
             return BuildCommandFromCandidate(sp.Chosen, egoSpeed, dtPlan, cruise, sp.RoadDesired);
         }
